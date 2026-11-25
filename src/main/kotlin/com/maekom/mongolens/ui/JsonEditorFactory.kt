@@ -31,12 +31,14 @@ import java.awt.event.MouseEvent
 import javax.swing.DefaultListModel
 import javax.swing.JList
 import javax.swing.ListSelectionModel
+import javax.swing.ScrollPaneConstants
 
 class MongoJsonEditor(
     private val projectRef: Project,
     initialText: String = "",
     private val multiLine: Boolean = false,
     private val autoGrow: Boolean = false,
+    private val maxVisibleLines: Int = 6,
     private val unifiedInputStyle: Boolean = false,
     private val placeholderText: String? = null,
     private val completionMode: CompletionMode = CompletionMode.GENERIC,
@@ -53,6 +55,7 @@ class MongoJsonEditor(
     enum class CompletionMode {
         FILTER,
         SORT,
+        PROJECT,
         GENERIC
     }
 
@@ -83,53 +86,113 @@ class MongoJsonEditor(
 
     private var suppressAutoPopup = false
     private val baseSingleLineHeight: Int = JBUI.scale(32)
-    private var lastAutoHeightPx: Int = baseSingleLineHeight
+    private var currentHeightPx: Int = baseSingleLineHeight
 
     init {
         if (multiLine || autoGrow) {
             setOneLineMode(false)
         }
         if (unifiedInputStyle || autoGrow) {
-            setFixedHeight(baseSingleLineHeight)
+            applyUnifiedFixedDimensions(baseSingleLineHeight)
         }
 
-        // Apply unified padding, vertical centering, and gray placeholder via IntelliJ's official SettingsProvider
+        // Apply unified padding, vertical alignment, scrollbar rules, and gray placeholder via SettingsProvider
         addSettingsProvider { ed ->
-            if (!placeholderText.isNullOrEmpty()) {
-                ed.setPlaceholder(placeholderText)
-                ed.setShowPlaceholderWhenFocused(true)
+            applyUnifiedEditorSettings(ed)
+        }
+    }
+
+    /**
+     * Common EditorEx configuration shared by Filter, Sort, and Project inputs so all three
+     * have pixel-identical padding, 1-line height, vertical centering, and zero horizontal scrollbar intrusion.
+     */
+    private fun applyUnifiedEditorSettings(ed: EditorEx) {
+        if (!placeholderText.isNullOrEmpty()) {
+            ed.setPlaceholder(placeholderText)
+            ed.setShowPlaceholderWhenFocused(true)
+        }
+        if (unifiedInputStyle || autoGrow) {
+            ed.scrollPane.viewportBorder = JBUI.Borders.empty(5, 8)
+            ed.setHorizontalScrollbarVisible(false)
+            ed.scrollPane.horizontalScrollBarPolicy = ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
+            ed.settings.apply {
+                isLineNumbersShown = false
+                isFoldingOutlineShown = false
+                isAutoCodeFoldingEnabled = false
+                additionalLinesCount = 0
+                additionalColumnsCount = 0
+                isRightMarginShown = false
+                isUseSoftWraps = false
+                isHighlightSelectionOccurrences = true
             }
-            if (unifiedInputStyle || autoGrow) {
-                ed.scrollPane.viewportBorder = JBUI.Borders.empty(5, 8)
-                ed.settings.apply {
-                    isLineNumbersShown = false
-                    isFoldingOutlineShown = false
-                    isAutoCodeFoldingEnabled = false
-                    additionalLinesCount = 0
-                    additionalColumnsCount = 0
-                    isRightMarginShown = false
-                    isUseSoftWraps = true
+        }
+    }
+
+    override fun getMinimumSize(): Dimension {
+        if (unifiedInputStyle) {
+            return Dimension(0, currentHeightPx)
+        }
+        return super.getMinimumSize()
+    }
+
+    override fun getPreferredSize(): Dimension {
+        if (unifiedInputStyle) {
+            return Dimension(0, currentHeightPx)
+        }
+        return super.getPreferredSize()
+    }
+
+    override fun getMaximumSize(): Dimension {
+        if (unifiedInputStyle) {
+            return Dimension(Int.MAX_VALUE, currentHeightPx)
+        }
+        return super.getMaximumSize()
+    }
+
+    fun safeText(): String = (text as String?)?.trim().orEmpty()
+
+    fun refreshAutoHeightNow() {
+        val ed = editor as? EditorEx
+        if (ed != null && !ed.isDisposed) {
+            updateAutoGrowHeight(ed)
+        } else {
+            val lines = document.lineCount.coerceAtLeast(1)
+            val clamped = lines.coerceAtMost(maxVisibleLines.coerceAtLeast(1))
+            val target = if (clamped <= 1) {
+                baseSingleLineHeight
+            } else {
+                baseSingleLineHeight + (clamped - 1) * JBUI.scale(20)
+            }
+            applyUnifiedFixedDimensions(target)
+            ApplicationManager.getApplication().invokeLater {
+                val realized = editor as? EditorEx
+                if (realized != null && !realized.isDisposed) {
+                    applyUnifiedEditorSettings(realized)
+                    updateAutoGrowHeight(realized)
                 }
             }
         }
     }
 
-    fun safeText(): String = (text as String?)?.trim().orEmpty()
-
     override fun createEditor(): EditorEx {
         val editor = super.createEditor()
-        editor.settings.apply {
-            isLineNumbersShown = multiLine && !autoGrow && !unifiedInputStyle
-            isFoldingOutlineShown = multiLine && !autoGrow && !unifiedInputStyle
-            isAutoCodeFoldingEnabled = multiLine && !autoGrow && !unifiedInputStyle
-            isUseSoftWraps = true
-            isRightMarginShown = false
-            isHighlightSelectionOccurrences = true
-            additionalLinesCount = if (multiLine && !autoGrow && !unifiedInputStyle) 1 else 0
-            additionalColumnsCount = if (autoGrow || unifiedInputStyle) 0 else 2
+        if (unifiedInputStyle || autoGrow) {
+            applyUnifiedEditorSettings(editor)
+        } else {
+            editor.settings.apply {
+                isLineNumbersShown = multiLine
+                isFoldingOutlineShown = multiLine
+                isAutoCodeFoldingEnabled = multiLine
+                isUseSoftWraps = true
+                isRightMarginShown = false
+                isHighlightSelectionOccurrences = true
+                additionalLinesCount = if (multiLine) 1 else 0
+                additionalColumnsCount = 2
+            }
         }
         if (autoGrow) {
             editor.setVerticalScrollbarVisible(false)
+            editor.scrollPane.verticalScrollBarPolicy = ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER
             updateAutoGrowHeight(editor)
         }
 
@@ -243,29 +306,44 @@ class MongoJsonEditor(
     }
 
     private fun updateAutoGrowHeight(editor: EditorEx) {
+        val maxLines = maxVisibleLines.coerceAtLeast(1)
         val lines = editor.document.lineCount.coerceAtLeast(1)
-        val clampedLines = lines.coerceAtMost(6)
+        val clampedLines = lines.coerceAtMost(maxLines)
         val lineH = editor.lineHeight.coerceIn(18, 24)
-        val maxHeight = JBUI.scale(140)
         val targetHeight = if (clampedLines <= 1) {
             baseSingleLineHeight
         } else {
-            (baseSingleLineHeight + (clampedLines - 1) * lineH).coerceIn(baseSingleLineHeight, maxHeight)
+            baseSingleLineHeight + (clampedLines - 1) * lineH
         }
-        val needScrollbar = lines >= 7
+        val needScrollbar = lines > maxLines
         editor.setVerticalScrollbarVisible(needScrollbar)
+        editor.scrollPane.verticalScrollBarPolicy = if (needScrollbar) {
+            ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED
+        } else {
+            ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER
+        }
+        if (unifiedInputStyle) {
+            editor.setHorizontalScrollbarVisible(false)
+            editor.scrollPane.horizontalScrollBarPolicy = ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
+        }
 
-        if (targetHeight != lastAutoHeightPx) {
-            lastAutoHeightPx = targetHeight
-            setFixedHeight(targetHeight)
+        if (targetHeight != currentHeightPx) {
+            applyUnifiedFixedDimensions(targetHeight)
             onAutoHeightChanged?.invoke()
         }
     }
 
-    private fun setFixedHeight(heightPx: Int) {
-        preferredSize = Dimension(preferredSize.width.coerceAtLeast(140), heightPx)
-        minimumSize = Dimension(100, heightPx)
-        maximumSize = Dimension(Int.MAX_VALUE, heightPx)
+    private fun applyUnifiedFixedDimensions(heightPx: Int) {
+        currentHeightPx = heightPx
+        if (unifiedInputStyle) {
+            minimumSize = Dimension(0, heightPx)
+            preferredSize = Dimension(0, heightPx)
+            maximumSize = Dimension(Int.MAX_VALUE, heightPx)
+        } else {
+            minimumSize = Dimension(100, heightPx)
+            preferredSize = Dimension(preferredSize.width.coerceAtLeast(140), heightPx)
+            maximumSize = Dimension(Int.MAX_VALUE, heightPx)
+        }
         revalidate()
         repaint()
     }
@@ -353,7 +431,7 @@ class MongoJsonEditor(
         val p = prefix.trim()
 
         val allFields = fields.map { CompletionCandidate(it, "field") }
-        val allOps = if (completionMode == CompletionMode.SORT) {
+        val allOps = if (completionMode == CompletionMode.SORT || completionMode == CompletionMode.PROJECT) {
             emptyList()
         } else {
             MONGO_OPERATORS.map { CompletionCandidate(it, "operator") }
@@ -393,27 +471,19 @@ class MongoJsonEditor(
 
         val hasColonAfter = text.substring(replaceEnd).trimStart().startsWith(":")
         val trimmedAll = text.trim()
-        val needsOuterBraces = (completionMode == CompletionMode.FILTER || completionMode == CompletionMode.SORT) &&
-            !trimmedAll.startsWith("{")
+        val isQueryBarMode = completionMode == CompletionMode.FILTER ||
+            completionMode == CompletionMode.SORT ||
+            completionMode == CompletionMode.PROJECT
+        val needsOuterBraces = isQueryBarMode && !trimmedAll.startsWith("{")
 
         if (needsOuterBraces) {
-            val (wrapped, caretPos, selStart, selEnd) = if (completionMode == CompletionMode.SORT && selected.kind == "field") {
-                val ins = "{ \"${selected.text}\": -1 }"
-                val minusOneStart = ins.indexOf("-1")
-                Quad(ins, minusOneStart + 2, minusOneStart, minusOneStart + 2)
-            } else {
-                val ins = "{ \"${selected.text}\":  }"
-                val caretIdx = ins.length - 2
-                Quad(ins, caretIdx, -1, -1)
-            }
+            val ins = "{ \"${selected.text}\":  }"
+            val caretIdx = ins.length - 2
             suppressAutoPopup = true
             try {
                 WriteCommandAction.runWriteCommandAction(projectRef) {
-                    doc.replaceString(0, doc.textLength, wrapped)
-                    editor.caretModel.moveToOffset(caretPos)
-                    if (selStart >= 0 && selEnd > selStart) {
-                        editor.selectionModel.setSelection(selStart, selEnd)
-                    }
+                    doc.replaceString(0, doc.textLength, ins)
+                    editor.caretModel.moveToOffset(caretIdx)
                 }
             } finally {
                 suppressAutoPopup = false
@@ -423,11 +493,7 @@ class MongoJsonEditor(
 
         val (insertion, caretDelta, selectStartDelta, selectEndDelta) = when {
             hasColonAfter -> Quad("\"${selected.text}\"", selected.text.length + 2, -1, -1)
-            completionMode == CompletionMode.SORT && selected.kind == "field" -> {
-                val ins = "\"${selected.text}\": -1"
-                Quad(ins, ins.length, ins.length - 2, ins.length)
-            }
-            completionMode == CompletionMode.FILTER && selected.kind == "field" -> {
+            isQueryBarMode && selected.kind == "field" -> {
                 val ins = "\"${selected.text}\": "
                 Quad(ins, ins.length, -1, -1)
             }

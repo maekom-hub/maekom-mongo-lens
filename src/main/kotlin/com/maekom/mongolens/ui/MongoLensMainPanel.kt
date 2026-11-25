@@ -38,6 +38,7 @@ import java.awt.Font
 import java.awt.GridBagLayout
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.JComponent
@@ -66,8 +67,7 @@ class MongoLensMainPanel(
     @Volatile
     private var availableUpdate: ReleaseInfo? = null
 
-    @Volatile
-    private var checkingUpdate: Boolean = false
+    private val isCheckingUpdate = AtomicBoolean(false)
 
     @Volatile
     private var currentStatusText: String = I18n.t("header.status.idle")
@@ -176,7 +176,7 @@ class MongoLensMainPanel(
 
     /**
      * Simplified native ToolWindow title bar actions: ONLY 2 items:
-     * 1. Version & Connection Status ("v0.1.6 · 연결됨 (126ms)")
+     * 1. Version & Connection Status ("v0.1.7 · 연결됨 (126ms)")
      * 2. [⚙ 설정 / Settings] popup group (Decrypt Config, Check/Install Update, Language Switch)
      */
     fun createTitleActions(): List<AnAction> {
@@ -243,7 +243,7 @@ class MongoLensMainPanel(
 
                 val pending = availableUpdate
                 val updateLabel = when {
-                    checkingUpdate -> I18n.t("header.update.checking")
+                    isCheckingUpdate.get() -> I18n.t("header.update.checking")
                     pending != null -> I18n.t("header.settings.updateInstall", pending.tagName)
                     else -> I18n.t("header.settings.updateCheck")
                 }
@@ -254,7 +254,7 @@ class MongoLensMainPanel(
                 ), DumbAware {
                     override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
                     override fun update(ev: AnActionEvent) {
-                        ev.presentation.isEnabled = !checkingUpdate
+                        ev.presentation.isEnabled = !isCheckingUpdate.get()
                     }
                     override fun actionPerformed(ev: AnActionEvent) {
                         val rel = availableUpdate
@@ -289,7 +289,14 @@ class MongoLensMainPanel(
             ?: discoveredProfiles.firstOrNull { it.id == selectedProfileFilterId }?.profileName
             ?: discoveredProfiles.firstOrNull()?.profileName
             ?: "default"
-        DecryptConfigDialog(project, projectBasePath, cryptoStore, targetProfileName).show()
+        val allProfileNames = discoveredProfiles.map { it.profileName }.distinct()
+        DecryptConfigDialog(
+            project = project,
+            projectBasePath = projectBasePath,
+            cryptoStore = cryptoStore,
+            initialProfileName = targetProfileName,
+            availableProfiles = allProfileNames
+        ).show()
     }
 
     fun reloadProfilesAsync() {
@@ -302,6 +309,7 @@ class MongoLensMainPanel(
                 ApplicationManager.getApplication().invokeLater {
                     if (project.isDisposed) return@invokeLater
                     discoveredProfiles = merged
+                    cryptoStore.setKnownProfileNames(merged.map { it.profileName })
                     if (selectedProfileFilterId != null && merged.none { it.id == selectedProfileFilterId }) {
                         selectedProfileFilterId = null
                     }
@@ -323,30 +331,40 @@ class MongoLensMainPanel(
     }
 
     private fun triggerUpdateCheck(silent: Boolean) {
+        if (!isCheckingUpdate.compareAndSet(false, true)) return
         if (!silent) {
-            checkingUpdate = true
             refreshTitleToolbar()
         }
-        PluginUpdateChecker.checkLatestReleaseAsync(project, silent) { result ->
-            checkingUpdate = false
-            result.onSuccess { release ->
-                availableUpdate = release
-                if (release == null && !silent) {
-                    UiHelpers.notify(
-                        project,
-                        I18n.t("header.update.upToDate", "v${PluginUpdateChecker.currentVersionString()}")
-                    )
-                }
-            }.onFailure { err ->
-                if (!silent) {
-                    UiHelpers.notify(
-                        project,
-                        I18n.t("header.update.failed", err.message ?: err.javaClass.simpleName),
-                        com.intellij.notification.NotificationType.WARNING
-                    )
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val result = PluginUpdateChecker.fetchLatestRelease()
+            ApplicationManager.getApplication().invokeLater {
+                isCheckingUpdate.set(false)
+                if (project.isDisposed) return@invokeLater
+                result.onSuccess { release ->
+                    availableUpdate = release
+                    refreshTitleToolbar()
+                    if (!silent) {
+                        if (release != null) {
+                            // One-click flow: immediately prompt for download & install instead of asking user to re-open menu
+                            PluginUpdateChecker.promptAndInstallUpdate(project, release)
+                        } else {
+                            UiHelpers.notify(
+                                project,
+                                I18n.t("header.update.upToDate", "v${PluginUpdateChecker.currentVersionString()}")
+                            )
+                        }
+                    }
+                }.onFailure { err ->
+                    refreshTitleToolbar()
+                    if (!silent) {
+                        UiHelpers.notify(
+                            project,
+                            I18n.t("header.update.failed", err.message ?: err.javaClass.simpleName),
+                            com.intellij.notification.NotificationType.WARNING
+                        )
+                    }
                 }
             }
-            refreshTitleToolbar()
         }
     }
 

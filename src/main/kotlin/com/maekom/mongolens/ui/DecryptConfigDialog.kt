@@ -33,11 +33,32 @@ class DecryptConfigDialog(
     private val project: Project,
     private val projectBasePath: Path?,
     private val cryptoStore: CryptoConfigStore,
-    private val profileName: String
+    initialProfileName: String,
+    availableProfiles: List<String> = emptyList()
 ) : DialogWrapper(project) {
 
-    private val initialConfig = cryptoStore.getConfig(profileName)
-    private val initialSecret = cryptoStore.getSecretKey(profileName)
+    private val profileOptions: List<String> = buildList {
+        availableProfiles.forEach { name ->
+            val trimmed = name.trim()
+            if (trimmed.isNotEmpty()) add(trimmed)
+        }
+        addAll(cryptoStore.getAllProfileNames(initialProfileName))
+        val initTrimmed = initialProfileName.trim()
+        if (initTrimmed.isNotEmpty()) add(initTrimmed)
+    }.distinct().ifEmpty { listOf("default") }
+
+    private var selectedProfileName: String =
+        initialProfileName.trim().takeIf { it in profileOptions } ?: profileOptions.first()
+
+    private val drafts = linkedMapOf<String, Pair<ProfileCryptoConfig, String>>()
+    private var loadingProfileFields = false
+
+    private val profileCombo = ComboBox(profileOptions.toTypedArray()).apply {
+        selectedItem = selectedProfileName
+    }
+
+    private val initialConfig = cryptoStore.getConfig(selectedProfileName)
+    private val initialSecret = cryptoStore.getSecretKey(selectedProfileName)
 
     private val prefixField = JBTextField(initialConfig.prefix)
     private val modeCombo = ComboBox(DecryptMode.values()).apply {
@@ -78,12 +99,22 @@ class DecryptConfigDialog(
     }
 
     init {
-        title = "${I18n.t("crypto.dialog.title")} — $profileName"
+        title = "${I18n.t("crypto.dialog.title")} — $selectedProfileName"
         wireListeners()
         init()
     }
 
     private fun wireListeners() {
+        profileCombo.addActionListener {
+            if (loadingProfileFields) return@addActionListener
+            val nextProfile = profileCombo.selectedItem?.toString()?.trim().orEmpty()
+            if (nextProfile.isEmpty() || nextProfile == selectedProfileName) return@addActionListener
+            // Preserve current unsaved edits for the previous profile
+            drafts[selectedProfileName] = buildConfig() to String(secretKeyField.password)
+            selectedProfileName = nextProfile
+            loadProfileIntoFields(selectedProfileName)
+        }
+
         eyeToggleBtn.addActionListener {
             secretKeyField.echoChar = if (eyeToggleBtn.isSelected) 0.toChar() else defaultEchoChar
         }
@@ -132,6 +163,26 @@ class DecryptConfigDialog(
         }
     }
 
+    private fun loadProfileIntoFields(profileName: String) {
+        loadingProfileFields = true
+        try {
+            val draft = drafts[profileName]
+            val cfg = draft?.first ?: cryptoStore.getConfig(profileName)
+            val key = draft?.second ?: cryptoStore.getSecretKey(profileName)
+            title = "${I18n.t("crypto.dialog.title")} — $profileName"
+            prefixField.text = cfg.prefix
+            modeCombo.selectedItem = cfg.mode
+            encodingCombo.selectedItem = cfg.keyEncoding
+            secretKeyField.text = key
+            fixedIvField.text = cfg.fixedIv
+            fixedIvField.isEnabled = cfg.mode == DecryptMode.AES_CBC_FIXED_IV
+            revealSecondsSpinner.value = cfg.clampedRevealSeconds()
+            testResultLabel.text = " "
+        } finally {
+            loadingProfileFields = false
+        }
+    }
+
     override fun createCenterPanel(): JComponent {
         val keyRow = JPanel(BorderLayout(4, 0)).apply {
             add(secretKeyField, BorderLayout.CENTER)
@@ -141,8 +192,6 @@ class DecryptConfigDialog(
             }
             add(rightBtns, BorderLayout.EAST)
         }
-
-        val profileBadge = UiHelpers.createBadgeLabel(profileName, UiHelpers.COLOR_BLUE_BG, UiHelpers.COLOR_BLUE_FG)
 
         val testPanel = JPanel(BorderLayout(4, 4)).apply {
             border = BorderFactory.createCompoundBorder(
@@ -158,7 +207,7 @@ class DecryptConfigDialog(
         }
 
         val form = FormBuilder.createFormBuilder()
-            .addLabeledComponent(JBLabel(I18n.t("crypto.dialog.profile")), profileBadge, 1, false)
+            .addLabeledComponent(JBLabel(I18n.t("crypto.dialog.profile")), profileCombo, 1, false)
             .addLabeledComponent(JBLabel(I18n.t("crypto.dialog.prefix")), prefixField, 1, false)
             .addLabeledComponent(JBLabel(I18n.t("crypto.dialog.mode")), modeCombo, 1, false)
             .addLabeledComponent(JBLabel(I18n.t("crypto.dialog.keyEncoding")), encodingCombo, 1, false)
@@ -168,7 +217,7 @@ class DecryptConfigDialog(
             .addComponent(testPanel, 8)
             .panel
 
-        form.preferredSize = Dimension(560, 355)
+        form.preferredSize = Dimension(560, 360)
         form.border = JBUI.Borders.empty(6)
         return form
     }
@@ -210,13 +259,16 @@ class DecryptConfigDialog(
     }
 
     override fun doOKAction() {
-        cryptoStore.saveConfig(buildConfig(), String(secretKeyField.password))
+        drafts[selectedProfileName] = buildConfig() to String(secretKeyField.password)
+        drafts.forEach { (_, pair) ->
+            cryptoStore.saveConfig(pair.first, pair.second)
+        }
         super.doOKAction()
     }
 
     private fun buildConfig(): ProfileCryptoConfig {
         return ProfileCryptoConfig(
-            profileName = profileName,
+            profileName = selectedProfileName,
             prefix = (prefixField.text as String?)?.trim().orEmpty(),
             mode = (modeCombo.selectedItem as? DecryptMode) ?: DecryptMode.AES_CBC_IV_PREFIX,
             keyEncoding = (encodingCombo.selectedItem as? KeyEncoding) ?: KeyEncoding.UTF8,

@@ -52,62 +52,77 @@ class FindQueryPanel(
 
     private val limitPresets = arrayOf(20, 50, 100, 500, 1000)
     private val unifiedInputHeight = JBUI.scale(32)
+    private val unifiedLabelSize = Dimension(JBUI.scale(48), unifiedInputHeight)
 
-    private val filterLabel = JBLabel(I18n.t("find.filter")).apply {
-        preferredSize = Dimension(JBUI.scale(42), unifiedInputHeight)
+    private fun createUnifiedFieldLabel(text: String): JBLabel = JBLabel(text).apply {
+        preferredSize = unifiedLabelSize
+        minimumSize = unifiedLabelSize
+        maximumSize = unifiedLabelSize
     }
-    private val projectLabel = JBLabel(I18n.t("find.project")).apply {
-        preferredSize = Dimension(JBUI.scale(42), unifiedInputHeight)
+
+    private val filterLabel = createUnifiedFieldLabel(I18n.t("find.filter"))
+    private val sortLabel = createUnifiedFieldLabel(I18n.t("find.sort"))
+    private val projectLabel = createUnifiedFieldLabel(I18n.t("find.project")).apply {
+        isVisible = false
     }
+
     private val projectToggleBtn = JButton(I18n.t("find.projectAdd")).apply {
         margin = JBUI.insets(2, 6)
-        preferredSize = Dimension(preferredSize.width.coerceAtLeast(JBUI.scale(72)), unifiedInputHeight)
-    }
-    private val sortLabel = JBLabel(I18n.t("find.sort")).apply {
-        preferredSize = Dimension(JBUI.scale(42), unifiedInputHeight)
+        preferredSize = Dimension(preferredSize.width.coerceAtLeast(JBUI.scale(76)), unifiedInputHeight)
     }
     private val limitLabel = JBLabel(I18n.t("find.limit"))
     private val skipLabel = JBLabel(I18n.t("find.skip"))
 
     /**
      * Common Query Input Factory:
-     * Filter (1-line default), Sort, and Project share identical 32px height, JBUI.insets(5, 8) padding,
-     * vertical alignment, and gray placeholder hints (empty text safely resolves to "{}" on execute).
+     * Filter (max 6 lines), Sort (max 4 lines), and Project (max 4 lines) share identical
+     * 32px 1-line height, JBUI.insets(5, 8) padding, auto-grow/shrink, vertical scrollbar on overflow,
+     * zero width inflation (minimumSize/preferredSize width = 0), {} auto-wrapping completion, and gray placeholders.
      */
     private fun createUnifiedQueryEditor(
-        autoGrow: Boolean,
+        maxVisibleLines: Int,
         placeholder: String,
         completionMode: MongoJsonEditor.CompletionMode
     ): MongoJsonEditor = MongoJsonEditor(
         projectRef = project,
         initialText = "",
         multiLine = false,
-        autoGrow = autoGrow,
+        autoGrow = true,
+        maxVisibleLines = maxVisibleLines,
         unifiedInputStyle = true,
         placeholderText = placeholder,
         completionMode = completionMode,
         fieldSuggestionsSupplier = fieldSuggestionsSupplier,
         onExecuteShortcut = { executeFind() },
-        onAutoHeightChanged = if (autoGrow) ({ revalidateHierarchy() }) else null
+        onAutoHeightChanged = { revalidateHierarchy() }
     )
 
     private val filterEditor = createUnifiedQueryEditor(
-        autoGrow = true,
+        maxVisibleLines = 6,
         placeholder = "Type a Query: { field: 'value' }",
         completionMode = MongoJsonEditor.CompletionMode.FILTER
     )
 
-    private val projectEditor = createUnifiedQueryEditor(
-        autoGrow = false,
-        placeholder = "{ field: 1 }",
-        completionMode = MongoJsonEditor.CompletionMode.FILTER
-    )
-
     private val sortEditor = createUnifiedQueryEditor(
-        autoGrow = false,
+        maxVisibleLines = 4,
         placeholder = "{ field: -1 }",
         completionMode = MongoJsonEditor.CompletionMode.SORT
     )
+
+    private val projectEditor = createUnifiedQueryEditor(
+        maxVisibleLines = 4,
+        placeholder = "{ field: 1, _id: 0 }",
+        completionMode = MongoJsonEditor.CompletionMode.PROJECT
+    ).apply {
+        isVisible = false
+    }
+
+    private val projectRowSpacer = JPanel().apply {
+        isOpaque = false
+        preferredSize = Dimension(0, 0)
+        minimumSize = Dimension(0, 0)
+        isVisible = false
+    }
 
     private val limitDecreaseBtn = JButton("-").apply {
         preferredSize = Dimension(26, JBUI.scale(28))
@@ -151,11 +166,9 @@ class FindQueryPanel(
         margin = JBUI.insets(2, 6)
     }
 
-    private val projectRowContainer = JPanel(BorderLayout(4, 0)).apply {
-        border = JBUI.Borders.empty(2, 0, 2, 0)
-        add(projectLabel, BorderLayout.WEST)
-        add(projectEditor, BorderLayout.CENTER)
-        isVisible = false
+    private val queryGridLayout = GridBagLayout()
+    private val queryGridPanel = JPanel(queryGridLayout).apply {
+        border = JBUI.Borders.empty(4, 6, 4, 6)
     }
     private var projectExpanded = false
 
@@ -192,77 +205,99 @@ class FindQueryPanel(
     }
 
     private fun buildCompactQueryBar() {
-        val grid = JPanel(GridBagLayout()).apply {
-            border = JBUI.Borders.empty(4, 6, 4, 6)
-        }
+        val rowInsets = JBUI.insets(2, 2, 2, 2)
+        val hiddenInsets = JBUI.emptyInsets()
 
-        val gbc = GridBagConstraints().apply {
-            fill = GridBagConstraints.HORIZONTAL
-            insets = JBUI.insets(2, 2)
-        }
-
-        // Row 0 Left: [Filter label] + [Unified 32px Auto-Grow Filter Editor] + [+ Project]
-        val filterLabelWrap = JPanel(BorderLayout()).apply {
-            add(filterLabel, BorderLayout.NORTH)
-        }
-        val projectToggleWrap = JPanel(BorderLayout()).apply {
-            add(projectToggleBtn, BorderLayout.NORTH)
-        }
-        val row1Left = JPanel(BorderLayout(4, 0)).apply {
-            add(filterLabelWrap, BorderLayout.WEST)
-            add(filterEditor, BorderLayout.CENTER)
-            add(projectToggleWrap, BorderLayout.EAST)
-        }
-
-        // Row 0 Right: [▶ 조회] [초기화] top-aligned
-        val row1Right = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 2)).apply {
+        // Column 2 Row 0 Right: [+ Project / - Project] [▶ 조회] [초기화]
+        val row0Right = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
+            isOpaque = false
+            add(projectToggleBtn)
             add(runBtn)
             add(resetBtn)
         }
 
-        gbc.gridx = 0; gbc.gridy = 0; gbc.weightx = 1.0; gbc.anchor = GridBagConstraints.NORTH
-        grid.add(row1Left, gbc)
-        gbc.gridx = 1; gbc.gridy = 0; gbc.weightx = 0.0; gbc.anchor = GridBagConstraints.NORTH
-        grid.add(row1Right, gbc)
-
-        // Row 1 (Collapsible): Unified 32px Project input row
-        gbc.gridx = 0; gbc.gridy = 1; gbc.weightx = 1.0; gbc.gridwidth = 2; gbc.anchor = GridBagConstraints.CENTER
-        grid.add(projectRowContainer, gbc)
-        gbc.gridwidth = 1
-
-        // Row 2 Left: Unified 32px Sort + inline Limit/Skip
-        val inlinePaging = JPanel(FlowLayout(FlowLayout.LEFT, 3, 2)).apply {
+        // Column 2 Row 1 Right: Limit [-] [50] [+] Skip [0] [📋 Smart $in] [Shell] [⭐ 저장/기록]
+        val row1Right = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
+            isOpaque = false
             add(limitLabel)
             add(limitDecreaseBtn)
             add(limitCombo)
             add(limitIncreaseBtn)
             add(skipLabel)
             add(skipSpinner)
-        }
-        val row2Left = JPanel(BorderLayout(4, 0)).apply {
-            add(sortLabel, BorderLayout.WEST)
-            add(sortEditor, BorderLayout.CENTER)
-            add(inlinePaging, BorderLayout.EAST)
-        }
-        // Row 2 Right: [📋 Smart $in] [Shell] [⭐ 저장/기록]
-        val row2Right = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 2)).apply {
             add(smartInBtn)
             add(toShellBtn)
             add(savedQueriesBtn)
         }
 
-        gbc.gridx = 0; gbc.gridy = 2; gbc.weightx = 1.0
-        grid.add(row2Left, gbc)
-        gbc.gridx = 1; gbc.gridy = 2; gbc.weightx = 0.0
-        grid.add(row2Right, gbc)
+        // Unified 3-column GridBagLayout:
+        // Col 0 (fixed label width) | Col 1 (weightx=1.0, HORIZONTAL: Filter / Sort / Project) | Col 2 (right actions)
+
+        // Row 0: Filter
+        queryGridPanel.add(filterLabel, GridBagConstraints().apply {
+            gridx = 0; gridy = 0; weightx = 0.0
+            fill = GridBagConstraints.NONE; anchor = GridBagConstraints.NORTHWEST; insets = rowInsets
+        })
+        queryGridPanel.add(filterEditor, GridBagConstraints().apply {
+            gridx = 1; gridy = 0; weightx = 1.0
+            fill = GridBagConstraints.HORIZONTAL; anchor = GridBagConstraints.NORTH; insets = rowInsets
+        })
+        queryGridPanel.add(row0Right, GridBagConstraints().apply {
+            gridx = 2; gridy = 0; weightx = 0.0
+            fill = GridBagConstraints.HORIZONTAL; anchor = GridBagConstraints.NORTH; insets = rowInsets
+        })
+
+        // Row 1: Sort
+        queryGridPanel.add(sortLabel, GridBagConstraints().apply {
+            gridx = 0; gridy = 1; weightx = 0.0
+            fill = GridBagConstraints.NONE; anchor = GridBagConstraints.NORTHWEST; insets = rowInsets
+        })
+        queryGridPanel.add(sortEditor, GridBagConstraints().apply {
+            gridx = 1; gridy = 1; weightx = 1.0
+            fill = GridBagConstraints.HORIZONTAL; anchor = GridBagConstraints.NORTH; insets = rowInsets
+        })
+        queryGridPanel.add(row1Right, GridBagConstraints().apply {
+            gridx = 2; gridy = 1; weightx = 0.0
+            fill = GridBagConstraints.HORIZONTAL; anchor = GridBagConstraints.NORTH; insets = rowInsets
+        })
+
+        // Row 2: Project (collapsible with zero leftover insets when hidden)
+        queryGridPanel.add(projectLabel, GridBagConstraints().apply {
+            gridx = 0; gridy = 2; weightx = 0.0
+            fill = GridBagConstraints.NONE; anchor = GridBagConstraints.NORTHWEST; insets = hiddenInsets
+        })
+        queryGridPanel.add(projectEditor, GridBagConstraints().apply {
+            gridx = 1; gridy = 2; weightx = 1.0
+            fill = GridBagConstraints.HORIZONTAL; anchor = GridBagConstraints.NORTH; insets = hiddenInsets
+        })
+        queryGridPanel.add(projectRowSpacer, GridBagConstraints().apply {
+            gridx = 2; gridy = 2; weightx = 0.0
+            fill = GridBagConstraints.HORIZONTAL; anchor = GridBagConstraints.NORTH; insets = hiddenInsets
+        })
 
         wireListeners()
 
         queryBarWrapper.apply {
             border = BorderFactory.createMatteBorder(0, 0, 1, 0, JBUI.CurrentTheme.ToolWindow.borderColor())
-            add(grid, BorderLayout.CENTER)
+            add(queryGridPanel, BorderLayout.CENTER)
         }
         add(queryBarWrapper, BorderLayout.NORTH)
+    }
+
+    private fun setProjectRowVisible(visible: Boolean) {
+        projectExpanded = visible
+        val row2Insets = if (visible) JBUI.insets(2, 2, 2, 2) else JBUI.emptyInsets()
+        for (comp in listOf(projectLabel, projectEditor, projectRowSpacer)) {
+            val c = queryGridLayout.getConstraints(comp)
+            c.insets = row2Insets
+            queryGridLayout.setConstraints(comp, c)
+            comp.isVisible = visible
+        }
+        updateProjectToggleText()
+        if (visible) {
+            projectEditor.refreshAutoHeightNow()
+        }
+        revalidateHierarchy()
     }
 
     private fun revalidateHierarchy() {
@@ -282,10 +317,7 @@ class FindQueryPanel(
 
     private fun wireListeners() {
         projectToggleBtn.addActionListener {
-            projectExpanded = !projectExpanded
-            projectRowContainer.isVisible = projectExpanded
-            updateProjectToggleText()
-            revalidateHierarchy()
+            setProjectRowVisible(!projectExpanded)
         }
 
         limitCombo.addActionListener {
@@ -499,9 +531,7 @@ class FindQueryPanel(
         limitCombo.selectedItem = if (q.limit in limitPresets) q.limit else 50
         skipSpinner.value = q.skip.coerceAtLeast(0)
         if (p.isNotEmpty() && p != "{}") {
-            projectExpanded = true
-            projectRowContainer.isVisible = true
-            updateProjectToggleText()
+            setProjectRowVisible(true)
         }
         executeFind()
     }

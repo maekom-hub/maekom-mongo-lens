@@ -1,6 +1,7 @@
 package com.maekom.mongolens.update
 
 import com.google.gson.JsonParser
+import com.intellij.ide.plugins.PluginInstaller
 import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.ide.startup.StartupActionScriptManager
 import com.intellij.openapi.application.ApplicationManager
@@ -36,7 +37,7 @@ data class ReleaseInfo(
 object PluginUpdateChecker {
     const val PLUGIN_ID = "com.maekom.mongolens"
     const val RELEASES_API_URL = "https://api.github.com/repos/maekom-hub/maekom-mongo-lens/releases/latest"
-    private const val FALLBACK_VERSION = "0.1.6"
+    private const val FALLBACK_VERSION = "0.1.7"
 
     private val httpClient: HttpClient by lazy {
         HttpClient.newBuilder()
@@ -143,10 +144,18 @@ object PluginUpdateChecker {
 
     fun promptAndInstallUpdate(project: Project, release: ReleaseInfo) {
         val current = currentVersionString()
+        val notesSummary = summarizeReleaseNotes(release.releaseNotes)
+        val confirmMessage = if (notesSummary.isNotEmpty()) {
+            I18n.t("update.dialog.confirmWithNotes", release.tagName, current, notesSummary)
+        } else {
+            I18n.t("update.dialog.confirmDownload", release.tagName, current)
+        }
         val confirm = Messages.showYesNoDialog(
             project,
-            I18n.t("update.dialog.confirmDownload", release.tagName, current),
+            confirmMessage,
             I18n.t("update.dialog.title"),
+            I18n.t("update.dialog.updateNow"),
+            Messages.getCancelButton(),
             Messages.getQuestionIcon()
         )
         if (confirm != Messages.YES) return
@@ -286,6 +295,18 @@ object PluginUpdateChecker {
         }
     }
 
+    private fun summarizeReleaseNotes(rawNotes: String): String {
+        val cleaned = rawNotes.trim()
+        if (cleaned.isEmpty()) return ""
+        val lines = cleaned.lines().map { it.trimEnd() }.filter { it.isNotBlank() }
+        val joined = lines.take(10).joinToString("\n")
+        return if (joined.length > 500 || lines.size > 10) {
+            joined.take(500).trimEnd() + "\n..."
+        } else {
+            joined
+        }
+    }
+
     private fun schedulePluginInstall(stagedZip: Path) {
         val pluginsDir = Paths.get(PathManager.getPluginsPath())
         val commands = mutableListOf<StartupActionScriptManager.ActionCommand>()
@@ -294,11 +315,29 @@ object PluginUpdateChecker {
         val defaultPluginDir = pluginsDir.resolve("maekom-mongo-lens")
         val targetDeleteDir = installedPath ?: defaultPluginDir
 
+        // Validate & unpack via official PluginInstaller.unpackPlugin into a clean staging directory first
+        val unpackStagingRoot = stagedZip.parent.resolve("unpacked-${System.currentTimeMillis()}")
+        var unpackedPluginDir: Path? = null
+        try {
+            Files.createDirectories(unpackStagingRoot)
+            unpackedPluginDir = PluginInstaller.unpackPlugin(stagedZip, unpackStagingRoot)
+        } catch (_: Throwable) {
+            // Fall back directly to StartupActionScriptManager UnzipCommand below
+            unpackedPluginDir = null
+        }
+
         if (Files.exists(targetDeleteDir) && targetDeleteDir.normalize().startsWith(pluginsDir.normalize())) {
             commands.add(StartupActionScriptManager.DeleteCommand(targetDeleteDir))
         }
-        commands.add(StartupActionScriptManager.UnzipCommand(stagedZip, pluginsDir))
-        commands.add(StartupActionScriptManager.DeleteCommand(stagedZip))
+        if (unpackedPluginDir != null && Files.exists(unpackedPluginDir)) {
+            val destDir = pluginsDir.resolve(unpackedPluginDir.fileName)
+            commands.add(StartupActionScriptManager.CopyCommand(unpackedPluginDir, destDir))
+            commands.add(StartupActionScriptManager.DeleteCommand(unpackStagingRoot))
+            commands.add(StartupActionScriptManager.DeleteCommand(stagedZip))
+        } else {
+            commands.add(StartupActionScriptManager.UnzipCommand(stagedZip, pluginsDir))
+            commands.add(StartupActionScriptManager.DeleteCommand(stagedZip))
+        }
 
         StartupActionScriptManager.addActionCommands(commands)
     }

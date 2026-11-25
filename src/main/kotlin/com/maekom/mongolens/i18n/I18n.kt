@@ -81,7 +81,7 @@ object I18n {
         "header.update.check" to "↻ 업데이트 확인",
         "header.update.checking" to "확인 중...",
         "header.update.available" to "⬆ {0} 업데이트",
-        "header.update.upToDate" to "최신 버전입니다 ({0}).",
+        "header.update.upToDate" to "현재 최신 버전({0})을 사용 중입니다.",
         "header.update.failed" to "업데이트 확인 실패: {0}",
         "header.update.tooltip" to "GitHub Releases에서 최신 버전을 확인합니다.",
         "header.update.availableTooltip" to "클릭하여 {0} 버전을 다운로드하고 설치합니다.",
@@ -126,7 +126,9 @@ object I18n {
 
         // Update Dialog
         "update.dialog.title" to "Maekom Mongo Lens 업데이트",
-        "update.dialog.confirmDownload" to "새 버전 {0}이(가) 출시되었습니다. (현재: v{1})\n지금 다운로드하여 설치를 예약하시겠습니까?",
+        "update.dialog.confirmDownload" to "새 버전 {0}가 출시되었습니다. (현재: v{1})\n지금 다운로드하고 업데이트하시겠습니까?",
+        "update.dialog.confirmWithNotes" to "새 버전 {0}가 출시되었습니다. (현재: v{1})\n지금 다운로드하고 업데이트하시겠습니까?\n\n[릴리즈 노트]\n{2}",
+        "update.dialog.updateNow" to "지금 업데이트",
         "update.dialog.progressTitle" to "Maekom Mongo Lens {0} 다운로드 중...",
         "update.dialog.verifying" to "다운로드 파일 무결성 검증 중...",
         "update.dialog.scheduling" to "플러그인 설치 예약 중...",
@@ -396,7 +398,7 @@ object I18n {
         "header.update.check" to "↻ Check Updates",
         "header.update.checking" to "Checking...",
         "header.update.available" to "⬆ Update {0}",
-        "header.update.upToDate" to "You are on the latest version ({0}).",
+        "header.update.upToDate" to "You are already on the latest version ({0}).",
         "header.update.failed" to "Update check failed: {0}",
         "header.update.tooltip" to "Check GitHub Releases for a newer version.",
         "header.update.availableTooltip" to "Click to download and install version {0}.",
@@ -441,7 +443,9 @@ object I18n {
 
         // Update Dialog
         "update.dialog.title" to "Maekom Mongo Lens Update",
-        "update.dialog.confirmDownload" to "A new version {0} is available (Current: v{1}).\nDownload and schedule installation now?",
+        "update.dialog.confirmDownload" to "A new version {0} is available (Current: v{1}).\nDownload and update now?",
+        "update.dialog.confirmWithNotes" to "A new version {0} is available (Current: v{1}).\nDownload and update now?\n\n[Release Notes]\n{2}",
+        "update.dialog.updateNow" to "Update Now",
         "update.dialog.progressTitle" to "Downloading Maekom Mongo Lens {0}...",
         "update.dialog.verifying" to "Verifying downloaded archive integrity...",
         "update.dialog.scheduling" to "Scheduling plugin installation...",

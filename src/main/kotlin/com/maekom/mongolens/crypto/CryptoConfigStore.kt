@@ -18,6 +18,7 @@ class CryptoConfigStore(private val projectBasePath: Path?) {
     private val configCache = ConcurrentHashMap<String, ProfileCryptoConfig>()
     private val memoryKeyFallback = ConcurrentHashMap<String, String>()
     private val changeListeners = CopyOnWriteArrayList<() -> Unit>()
+    private val knownProfileNames = CopyOnWriteArrayList<String>()
 
     @Volatile
     private var cacheLoaded = false
@@ -65,6 +66,23 @@ class CryptoConfigStore(private val projectBasePath: Path?) {
         Disposer.register(parentDisposable) {
             changeListeners.remove(listener)
         }
+    }
+
+    fun setKnownProfileNames(names: Collection<String>) {
+        val cleaned = names.mapNotNull { it.trim().takeIf { s -> s.isNotEmpty() } }.distinct()
+        knownProfileNames.clear()
+        knownProfileNames.addAll(cleaned)
+    }
+
+    fun getAllProfileNames(includeProfile: String? = null): List<String> {
+        ensureCacheLoaded()
+        val ordered = linkedSetOf<String>()
+        knownProfileNames.forEach { if (it.isNotBlank()) ordered.add(it) }
+        configCache.keys.forEach { if (it.isNotBlank()) ordered.add(it) }
+        memoryKeyFallback.keys.forEach { if (it.isNotBlank()) ordered.add(it) }
+        includeProfile?.trim()?.takeIf { it.isNotEmpty() }?.let { ordered.add(it) }
+        if (ordered.isEmpty()) ordered.add("default")
+        return ordered.toList()
     }
 
     fun getConfig(profileName: String): ProfileCryptoConfig {
