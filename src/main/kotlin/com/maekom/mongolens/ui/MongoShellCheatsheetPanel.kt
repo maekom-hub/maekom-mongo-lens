@@ -130,7 +130,7 @@ class MongoShellCheatsheetPanel(
     }
 
     private fun rebuildCards() {
-        val query = searchField.text.trim().lowercase()
+        val query = (searchField.text as String?)?.trim().orEmpty().lowercase()
         cardsContainer.removeAll()
 
         val filtered = items.filter { item ->

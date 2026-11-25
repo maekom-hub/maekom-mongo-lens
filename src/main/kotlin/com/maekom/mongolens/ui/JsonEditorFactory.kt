@@ -12,6 +12,7 @@ import com.intellij.openapi.fileTypes.PlainTextFileType
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.popup.JBPopup
 import com.intellij.openapi.ui.popup.JBPopupFactory
+import com.intellij.openapi.util.text.StringUtil
 import com.intellij.ui.ColoredListCellRenderer
 import com.intellij.ui.EditorTextField
 import com.intellij.ui.SimpleTextAttributes
@@ -33,15 +34,17 @@ import javax.swing.ListSelectionModel
 
 class MongoJsonEditor(
     private val projectRef: Project,
-    initialText: String = "{}",
+    initialText: String = "",
     private val multiLine: Boolean = false,
     private val autoGrow: Boolean = false,
+    private val unifiedInputStyle: Boolean = false,
+    private val placeholderText: String? = null,
     private val completionMode: CompletionMode = CompletionMode.GENERIC,
     private val fieldSuggestionsSupplier: () -> List<String> = { emptyList() },
     private val onExecuteShortcut: (() -> Unit)? = null,
     private val onAutoHeightChanged: (() -> Unit)? = null
 ) : EditorTextField(
-    EditorFactory.getInstance().createDocument(com.intellij.openapi.util.text.StringUtil.convertLineSeparators(initialText)),
+    EditorFactory.getInstance().createDocument(StringUtil.convertLineSeparators(initialText)),
     projectRef,
     resolveJsonFileType(),
     false,
@@ -79,28 +82,51 @@ class MongoJsonEditor(
     }
 
     private var suppressAutoPopup = false
-    private var lastAutoHeightPx = 28
+    private val baseSingleLineHeight: Int = JBUI.scale(32)
+    private var lastAutoHeightPx: Int = baseSingleLineHeight
 
     init {
         if (multiLine || autoGrow) {
             setOneLineMode(false)
         }
-        if (autoGrow) {
-            setFixedHeight(28)
+        if (unifiedInputStyle || autoGrow) {
+            setFixedHeight(baseSingleLineHeight)
+        }
+
+        // Apply unified padding, vertical centering, and gray placeholder via IntelliJ's official SettingsProvider
+        addSettingsProvider { ed ->
+            if (!placeholderText.isNullOrEmpty()) {
+                ed.setPlaceholder(placeholderText)
+                ed.setShowPlaceholderWhenFocused(true)
+            }
+            if (unifiedInputStyle || autoGrow) {
+                ed.scrollPane.viewportBorder = JBUI.Borders.empty(5, 8)
+                ed.settings.apply {
+                    isLineNumbersShown = false
+                    isFoldingOutlineShown = false
+                    isAutoCodeFoldingEnabled = false
+                    additionalLinesCount = 0
+                    additionalColumnsCount = 0
+                    isRightMarginShown = false
+                    isUseSoftWraps = true
+                }
+            }
         }
     }
+
+    fun safeText(): String = (text as String?)?.trim().orEmpty()
 
     override fun createEditor(): EditorEx {
         val editor = super.createEditor()
         editor.settings.apply {
-            isLineNumbersShown = multiLine && !autoGrow
-            isFoldingOutlineShown = multiLine && !autoGrow
-            isAutoCodeFoldingEnabled = multiLine && !autoGrow
+            isLineNumbersShown = multiLine && !autoGrow && !unifiedInputStyle
+            isFoldingOutlineShown = multiLine && !autoGrow && !unifiedInputStyle
+            isAutoCodeFoldingEnabled = multiLine && !autoGrow && !unifiedInputStyle
             isUseSoftWraps = true
             isRightMarginShown = false
             isHighlightSelectionOccurrences = true
-            additionalLinesCount = if (multiLine && !autoGrow) 1 else 0
-            additionalColumnsCount = if (autoGrow) 0 else 2
+            additionalLinesCount = if (multiLine && !autoGrow && !unifiedInputStyle) 1 else 0
+            additionalColumnsCount = if (autoGrow || unifiedInputStyle) 0 else 2
         }
         if (autoGrow) {
             editor.setVerticalScrollbarVisible(false)
@@ -162,7 +188,7 @@ class MongoJsonEditor(
                     triggerCompletionPopup(editor, forceShow = true)
                     return
                 }
-                // Single-line Filter/Sort: plain Enter executes query when popup is NOT open and in oneLineMode
+                // Single-line Sort/Project: plain Enter executes query when popup is NOT open and in oneLineMode
                 if (isOneLineMode && e.keyCode == KeyEvent.VK_ENTER && !isCtrlOrMeta && onExecuteShortcut != null) {
                     e.consume()
                     onExecuteShortcut.invoke()
@@ -176,7 +202,7 @@ class MongoJsonEditor(
                     '[' -> autoClosePair(editor, ']')
                     '"' -> {
                         val offset = editor.caretModel.offset
-                        val text = editor.document.text
+                        val text = (editor.document.text as String?).orEmpty()
                         if (text.getOrNull(offset) != '"') {
                             autoClosePair(editor, '"')
                         }
@@ -187,7 +213,6 @@ class MongoJsonEditor(
 
         editor.contentComponent.addFocusListener(object : FocusAdapter() {
             override fun focusLost(e: FocusEvent?) {
-                // Keep popup alive briefly if mouse clicked popup itself
                 ApplicationManager.getApplication().invokeLater {
                     if (!editor.contentComponent.isFocusOwner) {
                         dismissPopup()
@@ -221,7 +246,12 @@ class MongoJsonEditor(
         val lines = editor.document.lineCount.coerceAtLeast(1)
         val clampedLines = lines.coerceAtMost(6)
         val lineH = editor.lineHeight.coerceIn(18, 24)
-        val targetHeight = if (clampedLines <= 1) 28 else (10 + clampedLines * lineH).coerceIn(28, 140)
+        val maxHeight = JBUI.scale(140)
+        val targetHeight = if (clampedLines <= 1) {
+            baseSingleLineHeight
+        } else {
+            (baseSingleLineHeight + (clampedLines - 1) * lineH).coerceIn(baseSingleLineHeight, maxHeight)
+        }
         val needScrollbar = lines >= 7
         editor.setVerticalScrollbarVisible(needScrollbar)
 
@@ -245,7 +275,7 @@ class MongoJsonEditor(
             if (editor.isDisposed || projectRef.isDisposed) return@invokeLater
             val offset = editor.caretModel.offset
             val doc = editor.document
-            val nextChar = doc.text.getOrNull(offset)
+            val nextChar = (doc.text as String?).orEmpty().getOrNull(offset)
             if (nextChar == null || nextChar.isWhitespace() || nextChar == ',' || nextChar == '}' || nextChar == ']') {
                 suppressAutoPopup = true
                 try {
@@ -262,12 +292,11 @@ class MongoJsonEditor(
 
     private fun triggerCompletionPopup(editor: EditorEx, forceShow: Boolean) {
         if (projectRef.isDisposed || editor.isDisposed) return
-        val text = editor.document.text
+        val text = (editor.document.text as String?).orEmpty()
         val offset = editor.caretModel.offset.coerceIn(0, text.length)
         val tokenInfo = extractCurrentToken(text, offset)
         val prefix = tokenInfo.token
 
-        // Auto-show on typing at least 1 character (or '$') when in FILTER/SORT mode, or on Ctrl+Space
         if (!forceShow) {
             if (prefix.isEmpty()) {
                 dismissPopup()
@@ -334,7 +363,6 @@ class MongoJsonEditor(
             return allFields + allOps
         }
 
-        // Prefix matches first, then contains matches (fields prioritized over operators unless starts with '$')
         val pool = if (p.startsWith("$")) allOps + allFields else allFields + allOps
         val startsWithMatches = pool.filter { it.text.startsWith(p, ignoreCase = true) }
         val containsMatches = pool.filter {
@@ -349,14 +377,13 @@ class MongoJsonEditor(
 
         if (projectRef.isDisposed || editor.isDisposed) return
         val doc = editor.document
-        val text = doc.text
+        val text = (doc.text as String?).orEmpty()
         val offset = editor.caretModel.offset.coerceIn(0, text.length)
         val info = extractCurrentToken(text, offset)
 
         var replaceStart = info.tokenStart
         var replaceEnd = offset
 
-        // Consume surrounding quotes if user already typed `"sta` or `"sta"`
         if (replaceStart > 0 && text[replaceStart - 1] == '"') {
             replaceStart--
         }
@@ -376,7 +403,7 @@ class MongoJsonEditor(
                 Quad(ins, minusOneStart + 2, minusOneStart, minusOneStart + 2)
             } else {
                 val ins = "{ \"${selected.text}\":  }"
-                val caretIdx = ins.length - 2 // right after ": " before " }"
+                val caretIdx = ins.length - 2
                 Quad(ins, caretIdx, -1, -1)
             }
             suppressAutoPopup = true
@@ -461,7 +488,7 @@ class MongoJsonEditor(
 
     fun setPreferredSizeHeight(height: Int) {
         preferredSize = Dimension(preferredSize.width.coerceAtLeast(140), height)
-        minimumSize = Dimension(100, height.coerceAtMost(28))
+        minimumSize = Dimension(100, height.coerceAtMost(32))
     }
 
     companion object {

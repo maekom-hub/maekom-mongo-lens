@@ -61,10 +61,10 @@ class CustomUriDialog(
     }
 
     override fun doValidate(): ValidationInfo? {
-        if (nameField.text.trim().isEmpty()) {
+        if ((nameField.text as String?)?.trim().orEmpty().isEmpty()) {
             return ValidationInfo(I18n.t("custom.dialog.validationName"), nameField)
         }
-        val uri = uriField.text.trim()
+        val uri = (uriField.text as String?)?.trim().orEmpty()
         if (!uri.startsWith("mongodb://") && !uri.startsWith("mongodb+srv://")) {
             return ValidationInfo(I18n.t("custom.dialog.validationUri"), uriField)
         }
@@ -72,7 +72,7 @@ class CustomUriDialog(
     }
 
     private fun runConnectionTest() {
-        val uri = uriField.text.trim()
+        val uri = (uriField.text as String?)?.trim().orEmpty()
         if (!uri.startsWith("mongodb://") && !uri.startsWith("mongodb+srv://")) {
             testStatusLabel.text = I18n.t("custom.dialog.validationUri")
             testStatusLabel.foreground = UiHelpers.COLOR_RED_FG
@@ -82,7 +82,7 @@ class CustomUriDialog(
         testStatusLabel.text = I18n.t("custom.dialog.testing")
         testStatusLabel.foreground = UiHelpers.COLOR_BLUE_FG
 
-        val db = dbField.text.trim().takeIf { it.isNotEmpty() }
+        val db = (dbField.text as String?)?.trim()?.takeIf { it.isNotEmpty() }
         object : Task.Backgroundable(project, I18n.t("custom.dialog.testing"), true) {
             override fun run(indicator: ProgressIndicator) {
                 try {
@@ -104,9 +104,9 @@ class CustomUriDialog(
     }
 
     fun buildProfile(): MongoConnectionProfile {
-        val name = nameField.text.trim()
-        val uri = uriField.text.trim()
-        val db = dbField.text.trim().takeIf { it.isNotEmpty() }
+        val name = (nameField.text as String?)?.trim().orEmpty()
+        val uri = (uriField.text as String?)?.trim().orEmpty()
+        val db = (dbField.text as String?)?.trim()?.takeIf { it.isNotEmpty() }
         val isPrd = readOnlyCheck.isSelected || MongoConnectionProfile.isProductionProfile(name, null)
         return MongoConnectionProfile(
             id = existing?.id ?: "custom:${UUID.randomUUID()}",

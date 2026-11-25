@@ -1,5 +1,7 @@
 package com.maekom.mongolens.ui
 
+import com.intellij.icons.AllIcons
+import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.editor.EditorFactory
@@ -117,6 +119,10 @@ class ResultViewerPanel(
     private val decryptedFields = linkedMapOf<String, DecryptedEntry>()
     private val decryptCountdownTimer: Timer = Timer(1000) { onDecryptTimerTick() }
 
+    private var isTableBatchDecrypted: Boolean = false
+    private var tableBatchRemainingSeconds: Int = 0
+    private val tableBatchDecryptTimer: Timer = Timer(1000) { onTableBatchTimerTick() }
+
     private var currentDocs: MutableList<BsonDocument> = mutableListOf()
     private var currentResult: QueryExecutionResult? = null
     private var currentSkip: Int = 0
@@ -125,9 +131,23 @@ class ResultViewerPanel(
     private var activeCopyOverlayPopup: JBPopup? = null
     private var isTreeFullyExpanded: Boolean = false
 
+    private val headerLeftBar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
     private val summaryLabel = JBLabel(" ")
     private val indexBadge = UiHelpers.createBadgeLabel("", UiHelpers.COLOR_GREEN_BG, UiHelpers.COLOR_GREEN_FG).apply {
         isVisible = false
+    }
+    private val batchDecryptBtn = JButton(I18n.t("crypto.table.decryptPage"), AllIcons.Nodes.Padlock).apply {
+        margin = JBUI.insets(1, 6)
+        toolTipText = I18n.t("crypto.table.decryptPageTooltip")
+    }
+    private val batchCountdownBadge = UiHelpers.createBadgeLabel("", UiHelpers.COLOR_ORANGE_BG, UiHelpers.COLOR_ORANGE_FG).apply {
+        isVisible = false
+    }
+    private val tableBatchDecryptPanel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0)).apply {
+        isOpaque = false
+        isVisible = false
+        add(batchDecryptBtn)
+        add(batchCountdownBadge)
     }
     private val previewBannerLabel = UiHelpers.createBadgeLabel("", UiHelpers.COLOR_BLUE_BG, UiHelpers.COLOR_BLUE_FG).apply {
         isVisible = false
@@ -189,7 +209,7 @@ class ResultViewerPanel(
             if (row < 0 || col < 0) return null
             val modelRow = convertRowIndexToModel(row)
             val modelCol = convertColumnIndexToModel(col)
-            val bsonVal = tableModel.getBsonValueAt(modelRow, modelCol)
+            val bsonVal = tableModel.getEffectiveBsonValueAt(modelRow, modelCol)
             return if (bsonVal is BsonDateTime) {
                 I18n.t("result.date.kstTooltip", UiHelpers.formatKst(bsonVal.value))
             } else {
@@ -211,11 +231,17 @@ class ResultViewerPanel(
         cardsPanel.add(tableScrollPane, "TABLE")
 
         add(cardsPanel, BorderLayout.CENTER)
-        com.intellij.openapi.util.Disposer.register(this) { clearAllDecryptedPlaintext() }
+        com.intellij.openapi.util.Disposer.register(this) { clearAllDecryptedPlaintext(repaintTable = false) }
         cryptoStore.addChangeListener(this) {
-            SwingUtilities.invokeLater {
-                clearAllDecryptedPlaintext()
+            val refresh = Runnable {
+                clearAllDecryptedPlaintext(repaintTable = true)
                 resultTree.repaint()
+                updateBatchDecryptControls()
+            }
+            if (SwingUtilities.isEventDispatchThread()) {
+                refresh.run()
+            } else {
+                SwingUtilities.invokeLater(refresh)
             }
         }
         I18n.addListener(this) { refreshTexts() }
@@ -226,13 +252,16 @@ class ResultViewerPanel(
             border = BorderFactory.createMatteBorder(1, 0, 1, 0, JBUI.CurrentTheme.ToolWindow.borderColor())
         }
 
-        val leftBar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2)).apply {
+        headerLeftBar.apply {
             summaryLabel.font = summaryLabel.font.deriveFont(Font.BOLD)
             add(summaryLabel)
             add(indexBadge)
+            add(tableBatchDecryptPanel)
             add(previewBannerLabel)
             add(expandCollapseToggleBtn)
         }
+
+        batchDecryptBtn.addActionListener { handleTableBatchDecryptClick() }
 
         expandCollapseToggleBtn.addActionListener {
             if (isTreeFullyExpanded) {
@@ -246,8 +275,14 @@ class ResultViewerPanel(
             if (onPrevPage != null && onNextPage != null) {
                 prevBtn.isEnabled = false
                 nextBtn.isEnabled = false
-                prevBtn.addActionListener { onPrevPage.invoke() }
-                nextBtn.addActionListener { onNextPage.invoke() }
+                prevBtn.addActionListener {
+                    resetTableBatchDecryption()
+                    onPrevPage.invoke()
+                }
+                nextBtn.addActionListener {
+                    resetTableBatchDecryption()
+                    onNextPage.invoke()
+                }
                 add(prevBtn)
                 add(nextBtn)
             }
@@ -260,7 +295,7 @@ class ResultViewerPanel(
             add(tableViewBtn)
         }
 
-        headerBar.add(leftBar, BorderLayout.WEST)
+        headerBar.add(headerLeftBar, BorderLayout.WEST)
         headerBar.add(rightBar, BorderLayout.EAST)
         add(headerBar, BorderLayout.NORTH)
     }
@@ -552,8 +587,12 @@ class ResultViewerPanel(
                 if (!isSelected) {
                     val modelRow = resultTable.convertRowIndexToModel(row)
                     val modelCol = resultTable.convertColumnIndexToModel(column)
-                    val bsonVal = tableModel.getBsonValueAt(modelRow, modelCol)
-                    comp.foreground = if (bsonVal != null) UiHelpers.bsonTypeColor(bsonVal) else UiHelpers.BSON_NULL_COLOR
+                    if (tableModel.isCellDecrypted(modelRow, modelCol)) {
+                        comp.foreground = UiHelpers.COLOR_GREEN_FG
+                    } else {
+                        val bsonVal = tableModel.getBsonValueAt(modelRow, modelCol)
+                        comp.foreground = if (bsonVal != null) UiHelpers.bsonTypeColor(bsonVal) else UiHelpers.BSON_NULL_COLOR
+                    }
                 }
                 return comp
             }
@@ -605,7 +644,8 @@ class ResultViewerPanel(
                     targetBsonDoc = bsonDoc,
                     targetRawDoc = rawDoc,
                     focusFieldPath = colName,
-                    copyKeyValueText = pureVal
+                    copyKeyValueText = pureVal,
+                    copyLabelKey = "result.table.copyCell"
                 )
             }
         })
@@ -619,7 +659,8 @@ class ResultViewerPanel(
         targetBsonDoc: BsonDocument,
         targetRawDoc: Document,
         focusFieldPath: String?,
-        copyKeyValueText: String
+        copyKeyValueText: String,
+        copyLabelKey: String = "result.doc.copyKeyValue"
     ) {
         val menu = JPopupMenu()
 
@@ -632,7 +673,7 @@ class ResultViewerPanel(
             }
         })
         menu.addSeparator()
-        menu.add(JMenuItem(I18n.t("result.doc.copyKeyValue")).apply {
+        menu.add(JMenuItem(I18n.t(copyLabelKey)).apply {
             addActionListener {
                 UiHelpers.copyToClipboard(copyKeyValueText)
                 UiHelpers.notify(project, I18n.t("result.copied"))
@@ -749,9 +790,139 @@ class ResultViewerPanel(
         }
     }
 
-    private fun clearAllDecryptedPlaintext() {
+    private fun clearAllDecryptedPlaintext(repaintTable: Boolean = false) {
         decryptCountdownTimer.stop()
         decryptedFields.clear()
+        clearTableBatchDecryption(repaintTable = repaintTable)
+    }
+
+    fun resetTableBatchDecryption() {
+        val action = Runnable { clearTableBatchDecryption(repaintTable = true) }
+        if (SwingUtilities.isEventDispatchThread()) {
+            action.run()
+        } else {
+            SwingUtilities.invokeLater(action)
+        }
+    }
+
+    private fun clearTableBatchDecryption(repaintTable: Boolean) {
+        tableBatchDecryptTimer.stop()
+        tableBatchRemainingSeconds = 0
+        val hadDecrypted = isTableBatchDecrypted || tableModel.hasDecryptedCells()
+        isTableBatchDecrypted = false
+        if (hadDecrypted) {
+            activeCopyOverlayPopup?.let { if (!it.isDisposed) it.cancel() }
+        }
+        tableModel.clearDecryptedCells(fireRowsUpdated = repaintTable && hadDecrypted)
+        updateBatchDecryptControls()
+    }
+
+    private fun updateBatchDecryptControls() {
+        val config = cryptoStore.getConfig(profile.profileName)
+        val hasEncryptedOnPage = currentDocs.any { CryptoService.containsEncryptedCandidate(it, config) }
+        val shouldShow = activeView == "TABLE" && hasEncryptedOnPage
+
+        if (!shouldShow) {
+            tableBatchDecryptPanel.isVisible = false
+            batchCountdownBadge.isVisible = false
+        } else {
+            tableBatchDecryptPanel.isVisible = true
+            if (isTableBatchDecrypted) {
+                batchDecryptBtn.icon = AllIcons.Actions.ToggleVisibility
+                batchDecryptBtn.text = I18n.t("crypto.table.maskAll")
+                batchDecryptBtn.toolTipText = I18n.t("crypto.table.maskAllTooltip")
+                batchCountdownBadge.text = "${tableBatchRemainingSeconds}s"
+                batchCountdownBadge.isVisible = true
+            } else {
+                batchDecryptBtn.icon = AllIcons.Nodes.Padlock
+                batchDecryptBtn.text = I18n.t("crypto.table.decryptPage")
+                batchDecryptBtn.toolTipText = I18n.t("crypto.table.decryptPageTooltip")
+                batchCountdownBadge.isVisible = false
+            }
+        }
+        headerLeftBar.revalidate()
+        headerLeftBar.repaint()
+    }
+
+    private fun handleTableBatchDecryptClick() {
+        if (isTableBatchDecrypted) {
+            clearTableBatchDecryption(repaintTable = true)
+            return
+        }
+
+        var secretKey = cryptoStore.getSecretKey(profile.profileName)
+        if (secretKey.isBlank()) {
+            val dlg = DecryptConfigDialog(project, projectBasePath, cryptoStore, profile.profileName)
+            if (!dlg.showAndGet()) return
+            secretKey = cryptoStore.getSecretKey(profile.profileName)
+            if (secretKey.isBlank()) return
+        }
+
+        val config = cryptoStore.getConfig(profile.profileName)
+        val decryptedMap = linkedMapOf<Pair<Int, Int>, MongoResultTableModel.DecryptedCellValue>()
+        var totalSuccess = 0
+        var totalFail = 0
+        var firstError: Throwable? = null
+
+        val rowCount = tableModel.rowCount
+        val colCount = tableModel.columnCount
+        for (rowIdx in 0 until rowCount) {
+            for (colIdx in 0 until colCount) {
+                val rawValue = tableModel.getBsonValueAt(rowIdx, colIdx) ?: continue
+                if (!CryptoService.containsEncryptedCandidate(rawValue, config)) continue
+                val res = CryptoService.decryptBsonValueRecursively(rawValue, config, secretKey)
+                totalSuccess += res.decryptedCount
+                totalFail += res.failedCount
+                if (firstError == null && res.firstError != null) {
+                    firstError = res.firstError
+                }
+                if (res.decryptedCount > 0) {
+                    decryptedMap[rowIdx to colIdx] = MongoResultTableModel.DecryptedCellValue(
+                        decryptedValue = res.value,
+                        displayText = formatDecryptedTableCell(res.value),
+                        copyText = UiHelpers.bsonPureTextValue(res.value)
+                    )
+                }
+            }
+        }
+
+        if (totalSuccess > 0) {
+            tableModel.setDecryptedCells(decryptedMap)
+            isTableBatchDecrypted = true
+            tableBatchRemainingSeconds = config.clampedRevealSeconds()
+            updateBatchDecryptControls()
+            tableBatchDecryptTimer.restart()
+        } else if (totalFail > 0) {
+            UiHelpers.notify(
+                project,
+                I18n.t("crypto.decryptFailed", firstError?.message ?: firstError?.javaClass?.simpleName ?: "Unknown error"),
+                NotificationType.WARNING
+            )
+            updateBatchDecryptControls()
+        } else {
+            updateBatchDecryptControls()
+        }
+    }
+
+    private fun onTableBatchTimerTick() {
+        if (!isTableBatchDecrypted) {
+            tableBatchDecryptTimer.stop()
+            return
+        }
+        tableBatchRemainingSeconds -= 1
+        if (tableBatchRemainingSeconds <= 0) {
+            clearTableBatchDecryption(repaintTable = true)
+        } else {
+            batchCountdownBadge.text = "${tableBatchRemainingSeconds}s"
+        }
+    }
+
+    private fun formatDecryptedTableCell(value: BsonValue): String {
+        return when (value) {
+            is BsonString -> value.value
+            is BsonDocument, is BsonArray -> UiHelpers.bsonPureTextValue(value)
+            else -> UiHelpers.bsonTableDisplayValue(value)
+        }
     }
 
     private fun openDocumentEditDialog(
@@ -825,7 +996,9 @@ class ResultViewerPanel(
         }
 
         populateRawJson(currentDocs)
+        clearTableBatchDecryption(repaintTable = false)
         tableModel.updateDocumentInPlace(docIndex, updatedDoc)
+        updateBatchDecryptControls()
 
         SwingUtilities.invokeLater {
             treeScrollPane.viewport.viewPosition = savedTreePos
@@ -835,7 +1008,7 @@ class ResultViewerPanel(
 
     private fun removeDocumentInPlace(docIndex: Int) {
         if (docIndex !in currentDocs.indices) return
-        clearAllDecryptedPlaintext()
+        clearAllDecryptedPlaintext(repaintTable = false)
         val savedTreePos = treeScrollPane.viewport.viewPosition
         val savedTablePos = tableScrollPane.viewport.viewPosition
 
@@ -868,6 +1041,7 @@ class ResultViewerPanel(
         updateSummaryAndBadges()
         populateRawJson(currentDocs)
         populateTable(currentDocs)
+        updateBatchDecryptControls()
 
         SwingUtilities.invokeLater {
             treeScrollPane.viewport.viewPosition = savedTreePos
@@ -876,6 +1050,9 @@ class ResultViewerPanel(
     }
 
     private fun switchView(viewName: String) {
+        if (viewName != "TABLE") {
+            clearTableBatchDecryption(repaintTable = true)
+        }
         activeView = viewName
         treeViewBtn.isSelected = viewName == "TREE"
         jsonViewBtn.isSelected = viewName == "JSON"
@@ -883,6 +1060,7 @@ class ResultViewerPanel(
         val isTree = viewName == "TREE"
         expandCollapseToggleBtn.isVisible = isTree
         cardLayout.show(cardsPanel, viewName)
+        updateBatchDecryptControls()
     }
 
     fun updateResults(
@@ -891,7 +1069,7 @@ class ResultViewerPanel(
         limit: Int = result.documents.size.coerceAtLeast(1),
         previewBanner: String? = null
     ) {
-        clearAllDecryptedPlaintext()
+        clearAllDecryptedPlaintext(repaintTable = false)
         this.currentDocs = result.documents.toMutableList()
         this.currentResult = result
         this.currentSkip = skip
@@ -902,6 +1080,7 @@ class ResultViewerPanel(
         populateTree(currentDocs)
         populateRawJson(currentDocs)
         populateTable(currentDocs)
+        updateBatchDecryptControls()
     }
 
     private fun updateSummaryAndBadges() {
@@ -1096,11 +1275,12 @@ class ResultViewerPanel(
             nextBtn.text = I18n.t("result.next")
             updateExpandCollapseToggleButton()
             updateSummaryAndBadges()
+            updateBatchDecryptControls()
         }
     }
 
     override fun dispose() {
-        clearAllDecryptedPlaintext()
+        clearAllDecryptedPlaintext(repaintTable = false)
         activeCopyOverlayPopup?.let { if (!it.isDisposed) it.cancel() }
         if (!rawJsonEditor.isDisposed) {
             EditorFactory.getInstance().releaseEditor(rawJsonEditor)
@@ -1108,10 +1288,18 @@ class ResultViewerPanel(
     }
 
     private class MongoResultTableModel : AbstractTableModel() {
+        data class DecryptedCellValue(
+            val decryptedValue: BsonValue,
+            val displayText: String,
+            val copyText: String
+        )
+
         private var columns: List<String> = emptyList()
         private var docs: MutableList<BsonDocument> = mutableListOf()
+        private val decryptedCells: MutableMap<Pair<Int, Int>, DecryptedCellValue> = linkedMapOf()
 
         fun setDocuments(documents: List<BsonDocument>) {
+            decryptedCells.clear()
             this.docs = documents.toMutableList()
             recomputeColumns()
             fireTableStructureChanged()
@@ -1119,6 +1307,7 @@ class ResultViewerPanel(
 
         fun updateDocumentInPlace(rowIndex: Int, updatedDoc: BsonDocument) {
             if (rowIndex !in docs.indices) return
+            decryptedCells.clear()
             docs[rowIndex] = updatedDoc
             val oldColumns = columns
             recomputeColumns()
@@ -1126,6 +1315,26 @@ class ResultViewerPanel(
                 fireTableRowsUpdated(rowIndex, rowIndex)
             } else {
                 fireTableStructureChanged()
+            }
+        }
+
+        fun hasDecryptedCells(): Boolean = decryptedCells.isNotEmpty()
+
+        fun isCellDecrypted(rowIndex: Int, columnIndex: Int): Boolean =
+            decryptedCells.containsKey(rowIndex to columnIndex)
+
+        fun setDecryptedCells(cells: Map<Pair<Int, Int>, DecryptedCellValue>) {
+            decryptedCells.clear()
+            decryptedCells.putAll(cells)
+            if (docs.isNotEmpty()) {
+                fireTableRowsUpdated(0, docs.size - 1)
+            }
+        }
+
+        fun clearDecryptedCells(fireRowsUpdated: Boolean) {
+            decryptedCells.clear()
+            if (fireRowsUpdated && docs.isNotEmpty()) {
+                fireTableRowsUpdated(0, docs.size - 1)
             }
         }
 
@@ -1147,13 +1356,20 @@ class ResultViewerPanel(
         override fun getColumnName(column: Int): String = columns[column]
 
         override fun getValueAt(rowIndex: Int, columnIndex: Int): Any {
+            decryptedCells[rowIndex to columnIndex]?.let { return it.displayText }
             val v = getBsonValueAt(rowIndex, columnIndex) ?: return ""
             return UiHelpers.bsonTableDisplayValue(v)
         }
 
         fun getPureCopyValueAt(rowIndex: Int, columnIndex: Int): String {
+            decryptedCells[rowIndex to columnIndex]?.let { return it.copyText }
             val v = getBsonValueAt(rowIndex, columnIndex) ?: return ""
             return UiHelpers.bsonPureTextValue(v)
+        }
+
+        fun getEffectiveBsonValueAt(rowIndex: Int, columnIndex: Int): BsonValue? {
+            decryptedCells[rowIndex to columnIndex]?.let { return it.decryptedValue }
+            return getBsonValueAt(rowIndex, columnIndex)
         }
 
         fun getBsonValueAt(rowIndex: Int, columnIndex: Int): BsonValue? {

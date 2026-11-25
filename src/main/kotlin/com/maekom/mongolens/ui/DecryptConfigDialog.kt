@@ -118,7 +118,7 @@ class DecryptConfigDialog(
         }
 
         testBtn.addActionListener {
-            val sample = testInputField.text.trim()
+            val sample = (testInputField.text as String?)?.trim().orEmpty()
             if (sample.isEmpty()) return@addActionListener
             try {
                 val cfg = buildConfig()
@@ -185,7 +185,7 @@ class DecryptConfigDialog(
         }
         val mode = (modeCombo.selectedItem as? DecryptMode) ?: DecryptMode.AES_CBC_IV_PREFIX
         if (mode == DecryptMode.AES_CBC_FIXED_IV && rawKey.isNotBlank()) {
-            val ivRaw = fixedIvField.text.trim()
+            val ivRaw = (fixedIvField.text as String?)?.trim().orEmpty()
             if (ivRaw.isEmpty()) {
                 return ValidationInfo("Fixed IV (16 bytes) is required for AES/CBC Fixed IV mode.", fixedIvField)
             }
@@ -217,10 +217,10 @@ class DecryptConfigDialog(
     private fun buildConfig(): ProfileCryptoConfig {
         return ProfileCryptoConfig(
             profileName = profileName,
-            prefix = prefixField.text.trim(),
+            prefix = (prefixField.text as String?)?.trim().orEmpty(),
             mode = (modeCombo.selectedItem as? DecryptMode) ?: DecryptMode.AES_CBC_IV_PREFIX,
             keyEncoding = (encodingCombo.selectedItem as? KeyEncoding) ?: KeyEncoding.UTF8,
-            fixedIv = fixedIvField.text.trim(),
+            fixedIv = (fixedIvField.text as String?)?.trim().orEmpty(),
             revealSeconds = ((revealSecondsSpinner.value as? Int) ?: 10).coerceIn(5, 60)
         )
     }

@@ -9,7 +9,6 @@ import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.actionSystem.Presentation
-import com.intellij.openapi.actionSystem.Separator
 import com.intellij.openapi.actionSystem.ex.CustomComponentAction
 import com.intellij.openapi.actionSystem.impl.ActionButtonWithText
 import com.intellij.openapi.application.ApplicationManager
@@ -112,6 +111,14 @@ class MongoLensMainPanel(
             connectionManager = connectionManager,
             parentDisposable = this,
             onStatusUpdate = { text, _ -> setStatus(text) },
+            onSyncYaml = { reloadProfilesAsync() },
+            onProfileFilterChanged = { profileId, selectedProfile ->
+                selectedProfileFilterId = profileId
+                if (selectedProfile != null && connectionManager.isEffectivelyReadOnly(selectedProfile)) {
+                    setStatus(I18n.t("header.status.readOnly"))
+                }
+            },
+            onAddCustomUri = { openCustomUriDialog(null) },
             onOpenFindTab = { profile, db, coll, forceNew ->
                 if (forceNew) {
                     tabManager.openNewClonedTab(profile, db, coll, CollectionWorkspaceTab.WorkspaceMode.FIND)
@@ -133,7 +140,6 @@ class MongoLensMainPanel(
             }
         )
 
-        // Body starts immediately with Connections Tree | Collection Workspace Tabs (NO duplicate top header bar)
         buildBody()
 
         YamlConfigWatcher(project, this) {
@@ -169,11 +175,12 @@ class MongoLensMainPanel(
     }
 
     /**
-     * Builds the lightweight native ToolWindowEx title actions integrated into IntelliJ's
-     * single native ToolWindow title bar (100% IntelliJ New UI compatible).
+     * Simplified native ToolWindow title bar actions: ONLY 2 items:
+     * 1. Version & Connection Status ("v0.1.6 · 연결됨 (126ms)")
+     * 2. [⚙ 설정 / Settings] popup group (Decrypt Config, Check/Install Update, Language Switch)
      */
     fun createTitleActions(): List<AnAction> {
-        // 1. Version & Connection Status indicator
+        // 1. Version & Connection Status Action
         val versionStatusAction = object : AnAction(), DumbAware, CustomComponentAction {
             override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
 
@@ -194,11 +201,14 @@ class MongoLensMainPanel(
             }
         }
 
-        // 2. Profile Selector Dropdown (DefaultActionGroup, isPopup = true)
-        val profileSelectorGroup = object : DefaultActionGroup(), DumbAware, CustomComponentAction {
+        // 2. [⚙ 설정 / Settings] Popup Group
+        val settingsGroup = object : DefaultActionGroup(), DumbAware, CustomComponentAction {
             init {
                 isPopup = true
-                templatePresentation.icon = AllIcons.Nodes.DataTables
+                templatePresentation.isPopupGroup = true
+                templatePresentation.isPerformGroup = false
+                templatePresentation.icon = AllIcons.General.Settings
+                templatePresentation.text = I18n.t("header.settings")
             }
 
             override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
@@ -208,170 +218,70 @@ class MongoLensMainPanel(
             }
 
             override fun update(e: AnActionEvent) {
-                val selectedId = selectedProfileFilterId
-                val label = if (selectedId == null) {
-                    I18n.t("header.allProfiles")
+                e.presentation.isPopupGroup = true
+                e.presentation.isPerformGroup = false
+                e.presentation.icon = AllIcons.General.Settings
+                val pending = availableUpdate
+                e.presentation.text = if (pending != null) {
+                    "${I18n.t("header.settings")} (⬆)"
                 } else {
-                    val found = discoveredProfiles.firstOrNull { it.id == selectedId }
-                    if (found != null) {
-                        if (found.readOnly) "${found.displayName} 🔒" else found.displayName
-                    } else {
-                        I18n.t("header.allProfiles")
-                    }
+                    I18n.t("header.settings")
                 }
-                e.presentation.text = label
-                e.presentation.icon = AllIcons.Nodes.DataTables
+                e.presentation.description = I18n.t("header.settingsTooltip")
             }
 
             override fun getChildren(e: AnActionEvent?): Array<AnAction> {
-                val actions = mutableListOf<AnAction>()
-                val currentFilterId = selectedProfileFilterId
-
-                actions.add(object : AnAction(
-                    I18n.t("header.allProfiles"),
-                    null,
-                    if (currentFilterId == null) AllIcons.Actions.Checked else null
+                val decryptItem = object : AnAction(
+                    I18n.t("header.settings.decrypt"),
+                    I18n.t("header.cryptoConfigTooltip"),
+                    AllIcons.Nodes.Padlock
                 ), DumbAware {
                     override fun actionPerformed(ev: AnActionEvent) {
-                        selectedProfileFilterId = null
-                        connectionsTree.setProfileFilter(null)
+                        openDecryptConfigDialog()
+                    }
+                }
+
+                val pending = availableUpdate
+                val updateLabel = when {
+                    checkingUpdate -> I18n.t("header.update.checking")
+                    pending != null -> I18n.t("header.settings.updateInstall", pending.tagName)
+                    else -> I18n.t("header.settings.updateCheck")
+                }
+                val updateItem = object : AnAction(
+                    updateLabel,
+                    if (pending != null) I18n.t("header.update.availableTooltip", pending.tagName) else I18n.t("header.update.tooltip"),
+                    AllIcons.Actions.Download
+                ), DumbAware {
+                    override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+                    override fun update(ev: AnActionEvent) {
+                        ev.presentation.isEnabled = !checkingUpdate
+                    }
+                    override fun actionPerformed(ev: AnActionEvent) {
+                        val rel = availableUpdate
+                        if (rel != null) {
+                            PluginUpdateChecker.promptAndInstallUpdate(project, rel)
+                        } else {
+                            triggerUpdateCheck(silent = false)
+                        }
+                    }
+                }
+
+                val langItem = object : AnAction(
+                    I18n.t("header.settings.langSwitch"),
+                    I18n.t("header.lang.toggleTooltip"),
+                    AllIcons.General.Web
+                ), DumbAware {
+                    override fun actionPerformed(ev: AnActionEvent) {
+                        I18n.toggle()
                         refreshTitleToolbar()
                     }
-                })
-
-                val snapshot = discoveredProfiles
-                if (snapshot.isNotEmpty()) {
-                    actions.add(Separator.getInstance())
-                    for (profile in snapshot) {
-                        val itemText = if (profile.readOnly) "${profile.displayName} 🔒" else profile.displayName
-                        val isSelected = currentFilterId == profile.id
-                        actions.add(object : AnAction(
-                            itemText,
-                            profile.maskedLocation(),
-                            if (isSelected) AllIcons.Actions.Checked else null
-                        ), DumbAware {
-                            override fun actionPerformed(ev: AnActionEvent) {
-                                selectedProfileFilterId = profile.id
-                                connectionsTree.setProfileFilter(profile.id)
-                                if (connectionManager.isEffectivelyReadOnly(profile)) {
-                                    setStatus(I18n.t("header.status.readOnly"))
-                                }
-                                refreshTitleToolbar()
-                            }
-                        })
-                    }
                 }
 
-                actions.add(Separator.getInstance())
-                actions.add(object : AnAction(
-                    I18n.t("header.addCustomUri"),
-                    null,
-                    AllIcons.General.Add
-                ), DumbAware {
-                    override fun actionPerformed(ev: AnActionEvent) {
-                        openCustomUriDialog(null)
-                    }
-                })
-
-                return actions.toTypedArray()
+                return arrayOf(decryptItem, updateItem, langItem)
             }
         }
 
-        // 3. YAML Sync Action (AllIcons.Actions.Refresh)
-        val syncYamlAction = object : AnAction(AllIcons.Actions.Refresh), DumbAware {
-            override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
-
-            override fun update(e: AnActionEvent) {
-                e.presentation.text = I18n.t("header.syncYaml").removePrefix("↻ ").trim()
-                e.presentation.description = I18n.t("header.syncYamlTooltip")
-                e.presentation.icon = AllIcons.Actions.Refresh
-            }
-
-            override fun actionPerformed(e: AnActionEvent) {
-                reloadProfilesAsync()
-            }
-        }
-
-        // 4. Decrypt Config Action (AllIcons.Nodes.Padlock)
-        val decryptConfigAction = object : AnAction(AllIcons.Nodes.Padlock), DumbAware {
-            override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
-
-            override fun update(e: AnActionEvent) {
-                e.presentation.text = I18n.t("header.cryptoConfig").removePrefix("🔐 ").trim()
-                e.presentation.description = I18n.t("header.cryptoConfigTooltip")
-                e.presentation.icon = AllIcons.Nodes.Padlock
-            }
-
-            override fun actionPerformed(e: AnActionEvent) {
-                openDecryptConfigDialog()
-            }
-        }
-
-        // 5. Update Check / Install Action (AllIcons.Actions.Download)
-        val updateAction = object : AnAction(AllIcons.Actions.Download), DumbAware, CustomComponentAction {
-            override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
-
-            override fun createCustomComponent(presentation: Presentation, place: String): JComponent {
-                return ActionButtonWithText(this, presentation, place, ActionToolbar.DEFAULT_MINIMUM_BUTTON_SIZE)
-            }
-
-            override fun update(e: AnActionEvent) {
-                val pending = availableUpdate
-                e.presentation.isEnabled = !checkingUpdate
-                e.presentation.icon = AllIcons.Actions.Download
-                when {
-                    checkingUpdate -> {
-                        e.presentation.text = I18n.t("header.update.checking")
-                        e.presentation.description = I18n.t("header.update.checking")
-                    }
-                    pending != null -> {
-                        e.presentation.text = "⬆ ${pending.tagName}"
-                        e.presentation.description = I18n.t("header.update.availableTooltip", pending.tagName)
-                    }
-                    else -> {
-                        e.presentation.text = I18n.t("header.update.check").removePrefix("↻ ").trim()
-                        e.presentation.description = I18n.t("header.update.tooltip")
-                    }
-                }
-            }
-
-            override fun actionPerformed(e: AnActionEvent) {
-                val pending = availableUpdate
-                if (pending != null) {
-                    PluginUpdateChecker.promptAndInstallUpdate(project, pending)
-                } else {
-                    triggerUpdateCheck(silent = false)
-                }
-            }
-        }
-
-        // 6. KO / EN Language Toggle Action
-        val langToggleAction = object : AnAction(), DumbAware, CustomComponentAction {
-            override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
-
-            override fun createCustomComponent(presentation: Presentation, place: String): JComponent {
-                return ActionButtonWithText(this, presentation, place, ActionToolbar.DEFAULT_MINIMUM_BUTTON_SIZE)
-            }
-
-            override fun update(e: AnActionEvent) {
-                e.presentation.text = I18n.getLang().code
-                e.presentation.description = I18n.t("header.lang.toggleTooltip")
-            }
-
-            override fun actionPerformed(e: AnActionEvent) {
-                I18n.toggle()
-                refreshTitleToolbar()
-            }
-        }
-
-        return listOf(
-            versionStatusAction,
-            profileSelectorGroup,
-            syncYamlAction,
-            decryptConfigAction,
-            updateAction,
-            langToggleAction
-        )
+        return listOf(versionStatusAction, settingsGroup)
     }
 
     fun openDecryptConfigDialog() {

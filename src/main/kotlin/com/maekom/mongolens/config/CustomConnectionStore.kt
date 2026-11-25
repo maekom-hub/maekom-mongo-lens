@@ -20,8 +20,17 @@ class CustomConnectionStore(private val projectBasePath: Path?) {
         return try {
             val text = Files.readString(file, StandardCharsets.UTF_8)
             val listType = object : TypeToken<List<MongoConnectionProfile>>() {}.type
-            val parsed: List<MongoConnectionProfile>? = gson.fromJson(text, listType)
-            parsed?.map { it.copy(source = ProfileSource.CUSTOM) } ?: emptyList()
+            val parsed: List<MongoConnectionProfile?>? = gson.fromJson(text, listType)
+            @Suppress("USELESS_ELVIS")
+            parsed?.filterNotNull()?.map { p ->
+                p.copy(
+                    id = (p.id as String?) ?: "custom:${java.util.UUID.randomUUID()}",
+                    displayName = (p.displayName as String?) ?: "Custom",
+                    profileName = (p.profileName as String?) ?: "custom",
+                    host = (p.host as String?) ?: "localhost",
+                    source = ProfileSource.CUSTOM
+                )
+            } ?: emptyList()
         } catch (_: Throwable) {
             emptyList()
         }

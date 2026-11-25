@@ -273,7 +273,7 @@ class MongoShellPanel(
     }
 
     fun executeShell() {
-        val script = shellEditor.text.trim()
+        val script = (shellEditor.text as String?)?.trim().orEmpty()
         if (script.isEmpty()) return
 
         if (MongoShellExecutor.isWriteOperation(script)) {
@@ -283,6 +283,7 @@ class MongoShellPanel(
         }
 
         val userVars = variableStore.loadAll()
+        resultViewer.resetTableBatchDecryption()
         runBtn.isEnabled = false
         onStatusUpdate(I18n.t("header.status.querying"), false)
 

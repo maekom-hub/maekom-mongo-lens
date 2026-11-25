@@ -6,6 +6,7 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.Messages
 import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.SimpleTextAttributes
@@ -18,12 +19,15 @@ import com.maekom.mongolens.config.ProfileSource
 import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import java.awt.BorderLayout
+import java.awt.Dimension
 import java.awt.Font
 import java.awt.event.KeyAdapter
 import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.BorderFactory
+import javax.swing.DefaultComboBoxModel
+import javax.swing.JButton
 import javax.swing.JMenuItem
 import javax.swing.JPanel
 import javax.swing.JPopupMenu
@@ -40,12 +44,28 @@ class ConnectionsTreePanel(
     private val connectionManager: MongoConnectionManager,
     parentDisposable: Disposable,
     private val onStatusUpdate: (String, Boolean) -> Unit,
+    private val onSyncYaml: () -> Unit,
+    private val onProfileFilterChanged: (String?, MongoConnectionProfile?) -> Unit,
+    private val onAddCustomUri: () -> Unit,
     private val onOpenFindTab: (MongoConnectionProfile, String, String, Boolean) -> Unit,
     private val onOpenAggTab: (MongoConnectionProfile, String, String) -> Unit,
     private val onOpenShellTab: (MongoConnectionProfile, String, String) -> Unit,
     private val onEditCustomProfile: (MongoConnectionProfile) -> Unit,
     private val onDeleteCustomProfile: (MongoConnectionProfile) -> Unit
 ) : JPanel(BorderLayout()) {
+
+    private sealed class ProfileComboItem {
+        object AllProfiles : ProfileComboItem() {
+            override fun toString(): String = I18n.t("header.allProfiles")
+        }
+        data class SingleProfile(val profile: MongoConnectionProfile) : ProfileComboItem() {
+            override fun toString(): String =
+                if (profile.readOnly) "${profile.displayName} 🔒" else profile.displayName
+        }
+        object AddCustomUri : ProfileComboItem() {
+            override fun toString(): String = I18n.t("header.addCustomUri")
+        }
+    }
 
     sealed class TreeNodeData {
         data class ProfileNode(val profile: MongoConnectionProfile, var loaded: Boolean = false) : TreeNodeData()
@@ -61,7 +81,22 @@ class ConnectionsTreePanel(
 
     private val headerLabel = JBLabel(I18n.t("tree.header")).apply {
         font = font.deriveFont(Font.BOLD)
-        border = JBUI.Borders.empty(6, 10)
+    }
+
+    // Compact Refresh button with icon (no truncation even in narrow sidebar)
+    private val syncYamlBtn = JButton(
+        I18n.t("header.syncYaml").removePrefix("↻ ").trim(),
+        AllIcons.Actions.Refresh
+    ).apply {
+        margin = JBUI.insets(2, 6)
+        toolTipText = I18n.t("header.syncYamlTooltip")
+    }
+
+    private val profileComboModel = DefaultComboBoxModel<ProfileComboItem>()
+    private val profileCombo = ComboBox(profileComboModel).apply {
+        // Prevent long profile names from widening the Connections sidebar or triggering horizontal scrollbars
+        minimumSize = Dimension(0, JBUI.scale(30))
+        preferredSize = Dimension(0, JBUI.scale(30))
     }
 
     private val rootNode = DefaultMutableTreeNode("Connections")
@@ -69,14 +104,11 @@ class ConnectionsTreePanel(
     private val tree = Tree(treeModel)
 
     private var allProfiles: List<MongoConnectionProfile> = emptyList()
-    private var filterProfileId: String? = null // null means All
+    private var filterProfileId: String? = null
+    private var suppressComboEvent = false
 
     init {
-        val headerPanel = JPanel(BorderLayout()).apply {
-            border = BorderFactory.createMatteBorder(0, 0, 1, 0, JBUI.CurrentTheme.ToolWindow.borderColor())
-            add(headerLabel, BorderLayout.WEST)
-        }
-        add(headerPanel, BorderLayout.NORTH)
+        buildTwoRowHeader()
 
         tree.isRootVisible = false
         tree.showsRootHandles = true
@@ -190,18 +222,13 @@ class ConnectionsTreePanel(
                 val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return
                 when (val data = node.userObject) {
                     is TreeNodeData.CollectionNode -> {
-                        // Normal click (single or double) opens or focuses existing tab — never duplicates
                         onOpenFindTab(data.profile, data.database, data.collection, false)
                     }
                     is TreeNodeData.ProfileNode -> {
-                        if (e.clickCount == 2) {
-                            tree.expandPath(path)
-                        }
+                        if (e.clickCount == 2) tree.expandPath(path)
                     }
                     is TreeNodeData.DatabaseNode -> {
-                        if (e.clickCount == 2) {
-                            tree.expandPath(path)
-                        }
+                        if (e.clickCount == 2) tree.expandPath(path)
                     }
                     else -> Unit
                 }
@@ -220,19 +247,100 @@ class ConnectionsTreePanel(
         I18n.addListener(parentDisposable) { refreshTexts() }
     }
 
+    /**
+     * Two-row sidebar header:
+     * Row 1: Left "Connections" (Bold) | Right compact [↻ YAML 동기화]
+     * Row 2: Full-width (100%) Profile selector ComboBox with minimumSize = (0, 30)
+     */
+    private fun buildTwoRowHeader() {
+        val row1 = JPanel(BorderLayout(4, 0)).apply {
+            add(headerLabel, BorderLayout.WEST)
+            add(syncYamlBtn, BorderLayout.EAST)
+        }
+
+        val headerPanel = JPanel(BorderLayout(0, 4)).apply {
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 0, 1, 0, JBUI.CurrentTheme.ToolWindow.borderColor()),
+                JBUI.Borders.empty(5, 8, 6, 8)
+            )
+            add(row1, BorderLayout.NORTH)
+            add(profileCombo, BorderLayout.SOUTH)
+        }
+
+        syncYamlBtn.addActionListener { onSyncYaml() }
+
+        profileCombo.addActionListener {
+            if (suppressComboEvent) return@addActionListener
+            when (val selected = profileCombo.selectedItem as? ProfileComboItem) {
+                is ProfileComboItem.AllProfiles -> {
+                    filterProfileId = null
+                    rebuildTree()
+                    onProfileFilterChanged(null, null)
+                }
+                is ProfileComboItem.SingleProfile -> {
+                    filterProfileId = selected.profile.id
+                    rebuildTree()
+                    onProfileFilterChanged(selected.profile.id, selected.profile)
+                }
+                is ProfileComboItem.AddCustomUri -> {
+                    restoreComboSelection()
+                    onAddCustomUri()
+                }
+                null -> Unit
+            }
+        }
+
+        add(headerPanel, BorderLayout.NORTH)
+    }
+
     fun setProfiles(profiles: List<MongoConnectionProfile>, selectedFilterId: String?) {
         this.allProfiles = profiles
         this.filterProfileId = selectedFilterId
+        rebuildProfileCombo()
         rebuildTree()
     }
 
     fun setProfileFilter(profileId: String?) {
         this.filterProfileId = profileId
+        restoreComboSelection()
         rebuildTree()
     }
 
     fun repaintTree() {
         tree.repaint()
+    }
+
+    private fun rebuildProfileCombo() {
+        suppressComboEvent = true
+        try {
+            profileComboModel.removeAllElements()
+            profileComboModel.addElement(ProfileComboItem.AllProfiles)
+            allProfiles.forEach { p -> profileComboModel.addElement(ProfileComboItem.SingleProfile(p)) }
+            profileComboModel.addElement(ProfileComboItem.AddCustomUri)
+            restoreComboSelection()
+        } finally {
+            suppressComboEvent = false
+        }
+    }
+
+    private fun restoreComboSelection() {
+        suppressComboEvent = true
+        try {
+            if (filterProfileId == null) {
+                if (profileComboModel.size > 0) profileCombo.selectedIndex = 0
+                return
+            }
+            for (i in 0 until profileComboModel.size) {
+                val item = profileComboModel.getElementAt(i)
+                if (item is ProfileComboItem.SingleProfile && item.profile.id == filterProfileId) {
+                    profileCombo.selectedIndex = i
+                    return
+                }
+            }
+            if (profileComboModel.size > 0) profileCombo.selectedIndex = 0
+        } finally {
+            suppressComboEvent = false
+        }
     }
 
     private fun rebuildTree() {
@@ -245,7 +353,6 @@ class ConnectionsTreePanel(
 
         for (profile in visible) {
             val profileNode = DefaultMutableTreeNode(TreeNodeData.ProfileNode(profile, loaded = false))
-            // Add dummy child so expand handle appears without connecting yet (Lazy Connection)
             profileNode.add(DefaultMutableTreeNode(TreeNodeData.PlaceholderNode(I18n.t("tree.loading"))))
             rootNode.add(profileNode)
         }
@@ -450,7 +557,10 @@ class ConnectionsTreePanel(
     private fun refreshTexts() {
         SwingUtilities.invokeLater {
             headerLabel.text = I18n.t("tree.header")
+            syncYamlBtn.text = I18n.t("header.syncYaml").removePrefix("↻ ").trim()
+            syncYamlBtn.toolTipText = I18n.t("header.syncYamlTooltip")
             tree.emptyText.text = I18n.t("tree.empty")
+            profileCombo.repaint()
             tree.repaint()
         }
     }

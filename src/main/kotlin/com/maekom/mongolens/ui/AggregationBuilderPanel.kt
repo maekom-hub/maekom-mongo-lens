@@ -168,7 +168,7 @@ class AggregationBuilderPanel(
             operatorCombo.addActionListener {
                 val selectedOp = operatorCombo.selectedItem?.toString()?.trim() ?: return@addActionListener
                 if (selectedOp != lastOperator) {
-                    val currentText = bodyEditor.text.trim()
+                    val currentText = (bodyEditor.text as String?)?.trim().orEmpty()
                     if (currentText.isEmpty() || currentText == defaultSkeletonFor(lastOperator).trim()) {
                         bodyEditor.text = defaultSkeletonFor(selectedOp)
                     }
@@ -322,7 +322,7 @@ class AggregationBuilderPanel(
         runBtn.addActionListener { executePipeline() }
         toShellBtn.addActionListener {
             try {
-                val json = if (activeSubMode == "UI") serializeActiveStagesToJson() else rawScriptEditor.text.trim().ifEmpty { "[]" }
+                val json = if (activeSubMode == "UI") serializeActiveStagesToJson() else (rawScriptEditor.text as String?)?.trim().orEmpty().ifEmpty { "[]" }
                 onConvertToShell("db.$collection.aggregate($json)")
             } catch (t: Throwable) {
                 showErrorBanner(t.message ?: "Error serializing pipeline")
@@ -407,7 +407,7 @@ class AggregationBuilderPanel(
             rawModeBtn.isSelected = false
             return
         }
-        val rawText = rawScriptEditor.text.trim()
+        val rawText = (rawScriptEditor.text as String?)?.trim().orEmpty()
         try {
             val parsedStages = if (rawText.isEmpty()) {
                 emptyList()
@@ -461,7 +461,7 @@ class AggregationBuilderPanel(
 
     private fun buildStageBsonDocument(card: StageCard): BsonDocument {
         val op = card.currentOperator()
-        val body = card.bodyEditor.text.trim().ifEmpty { "{}" }
+        val body = (card.bodyEditor.text as String?)?.trim().orEmpty().ifEmpty { "{}" }
         val combined = """{ "${MongoShellNormalizer.escapeJsonString(op)}": $body }"""
         return MongoShellNormalizer.parseBsonDocument(combined)
     }
@@ -529,6 +529,7 @@ class AggregationBuilderPanel(
         recordHistory: Boolean,
         rawForHistory: String = "[]"
     ) {
+        resultViewer.resetTableBatchDecryption()
         runBtn.isEnabled = false
         onStatusUpdate(I18n.t("header.status.querying"), false)
 

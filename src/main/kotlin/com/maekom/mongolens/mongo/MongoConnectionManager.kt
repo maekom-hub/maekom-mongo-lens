@@ -179,15 +179,15 @@ class MongoConnectionManager(project: Project) : Disposable {
         profile: MongoConnectionProfile,
         database: String,
         collection: String,
-        filterRaw: String,
-        projectionRaw: String,
-        sortRaw: String,
+        filterRaw: String?,
+        projectionRaw: String?,
+        sortRaw: String?,
         skip: Int,
         limit: Int
     ): QueryExecutionResult {
-        val filter = MongoShellNormalizer.parseBsonDocument(filterRaw)
-        val projection = MongoShellNormalizer.parseBsonDocument(projectionRaw)
-        val sort = MongoShellNormalizer.parseBsonDocument(sortRaw)
+        val filter = MongoShellNormalizer.parseBsonDocument(filterRaw?.trim().orEmpty().ifEmpty { "{}" })
+        val projection = MongoShellNormalizer.parseBsonDocument(projectionRaw?.trim().orEmpty().ifEmpty { "{}" })
+        val sort = MongoShellNormalizer.parseBsonDocument(sortRaw?.trim().orEmpty().ifEmpty { "{}" })
 
         val client = getOrCreateClient(profile)
         val coll = client.getDatabase(database).getCollection(collection, BsonDocument::class.java)

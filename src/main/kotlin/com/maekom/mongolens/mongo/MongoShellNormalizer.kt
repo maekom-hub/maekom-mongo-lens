@@ -38,17 +38,19 @@ object MongoShellNormalizer {
 
     fun formatCompact(doc: BsonDocument): String = doc.toJson(relaxedCompactSettings)
 
-    fun parseBsonDocument(raw: String): BsonDocument {
-        val trimmed = raw.trim()
+    fun parseBsonDocument(raw: String?): BsonDocument {
+        val trimmed = raw?.trim().orEmpty()
         if (trimmed.isEmpty()) return BsonDocument()
         val normalized = normalizeToExtendedJson(trimmed)
+        if (normalized.isEmpty()) return BsonDocument()
         return BsonDocument.parse(normalized)
     }
 
-    fun parsePipeline(raw: String): List<BsonDocument> {
-        val trimmed = raw.trim()
+    fun parsePipeline(raw: String?): List<BsonDocument> {
+        val trimmed = raw?.trim().orEmpty()
         if (trimmed.isEmpty()) return emptyList()
         val normalized = normalizeToExtendedJson(trimmed)
+        if (normalized.isEmpty()) return emptyList()
         val array = BsonArray.parse(normalized)
         return array.mapIndexed { idx, value ->
             if (!value.isDocument) {
@@ -337,12 +339,12 @@ object MongoShellNormalizer {
     }
 
     fun buildSmartInQuery(
-        rawInput: String,
-        fieldName: String = "_id",
+        rawInput: String?,
+        fieldName: String? = "_id",
         preferredType: SmartInValueType = SmartInValueType.AUTO
     ): String {
-        val cleanField = fieldName.trim().ifEmpty { "_id" }
-        val tokens = rawInput
+        val cleanField = fieldName?.trim().orEmpty().ifEmpty { "_id" }
+        val tokens = rawInput.orEmpty()
             .split(Regex("[\\r\\n,;\\t\\s]+"))
             .map { it.trim().trim('"', '\'') }
             .filter { it.isNotEmpty() }
@@ -384,8 +386,8 @@ object MongoShellNormalizer {
     }
 
     /** Extracts non-operator field keys currently present in a Filter query string */
-    fun extractFilterFieldKeys(filterRaw: String): List<String> {
-        val trimmed = filterRaw.trim()
+    fun extractFilterFieldKeys(filterRaw: String?): List<String> {
+        val trimmed = filterRaw?.trim().orEmpty()
         if (trimmed.isEmpty() || trimmed == "{}") return emptyList()
         val found = linkedSetOf<String>()
         try {
@@ -429,15 +431,15 @@ object MongoShellNormalizer {
 
     fun toMongoshFindCommand(
         collection: String,
-        filter: String,
-        projection: String,
-        sort: String,
+        filter: String?,
+        projection: String?,
+        sort: String?,
         skip: Int,
         limit: Int
     ): String {
-        val f = filter.trim().ifEmpty { "{}" }
-        val p = projection.trim()
-        val s = sort.trim()
+        val f = filter?.trim().orEmpty().ifEmpty { "{}" }
+        val p = projection?.trim().orEmpty()
+        val s = sort?.trim().orEmpty()
 
         val sb = StringBuilder()
         sb.append("db.getCollection('${collection.replace("'", "\\'")}').find(")
@@ -458,8 +460,8 @@ object MongoShellNormalizer {
         return sb.toString()
     }
 
-    fun toMongoshAggregateCommand(collection: String, pipelineJson: String): String {
-        val p = pipelineJson.trim().ifEmpty { "[]" }
+    fun toMongoshAggregateCommand(collection: String, pipelineJson: String?): String {
+        val p = pipelineJson?.trim().orEmpty().ifEmpty { "[]" }
         return "db.getCollection('${collection.replace("'", "\\'")}').aggregate($p)"
     }
 }

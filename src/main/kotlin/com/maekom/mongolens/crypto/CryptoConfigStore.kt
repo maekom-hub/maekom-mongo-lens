@@ -38,7 +38,19 @@ class CryptoConfigStore(private val projectBasePath: Path?) {
                     val type = object : TypeToken<LinkedHashMap<String, ProfileCryptoConfig>>() {}.type
                     val parsed = gson.fromJson<LinkedHashMap<String, ProfileCryptoConfig>>(text, type)
                     if (parsed != null) {
-                        configCache.putAll(parsed)
+                        @Suppress("USELESS_ELVIS")
+                        parsed.forEach { (k, v) ->
+                            if (k != null && v != null) {
+                                configCache[k] = ProfileCryptoConfig(
+                                    profileName = (v.profileName as String?) ?: k,
+                                    prefix = (v.prefix as String?) ?: "ENC-",
+                                    mode = (v.mode as DecryptMode?) ?: DecryptMode.AES_CBC_IV_PREFIX,
+                                    keyEncoding = (v.keyEncoding as KeyEncoding?) ?: KeyEncoding.UTF8,
+                                    fixedIv = (v.fixedIv as String?) ?: "",
+                                    revealSeconds = if (v.revealSeconds in 5..60) v.revealSeconds else 10
+                                )
+                            }
+                        }
                     }
                 } catch (_: Throwable) {
                     // Ignore malformed config file

@@ -186,13 +186,15 @@ object QueryHistoryPopup {
         }
         val modeBadge = UiHelpers.createBadgeLabel(modeShort, UiHelpers.COLOR_BLUE_BG, UiHelpers.COLOR_BLUE_FG)
 
+        @Suppress("USELESS_ELVIS")
         val subtitleText = when (item.mode) {
-            "AGGREGATION" -> item.pipelineJson.replace("\n", " ").trim().take(80)
-            "SHELL" -> item.shellScript.replace("\n", " ").trim().take(80)
+            "AGGREGATION" -> (item.pipelineJson as String?).orEmpty().replace("\n", " ").trim().take(80)
+            "SHELL" -> (item.shellScript as String?).orEmpty().replace("\n", " ").trim().take(80)
             else -> buildString {
-                append(item.filter.replace("\n", " ").trim().take(55))
-                if (item.sort.trim().isNotEmpty() && item.sort.trim() != "{}") {
-                    append(" | sort: ").append(item.sort.trim().take(25))
+                append((item.filter as String?).orEmpty().replace("\n", " ").trim().take(55))
+                val s = (item.sort as String?)?.trim().orEmpty()
+                if (s.isNotEmpty() && s != "{}") {
+                    append(" | sort: ").append(s.take(25))
                 }
             }
         }

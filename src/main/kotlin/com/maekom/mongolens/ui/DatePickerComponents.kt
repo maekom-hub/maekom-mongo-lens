@@ -140,7 +140,7 @@ class DateEditorPanel(initialIsoOrMillis: String = "") : JPanel() {
 
     private fun onManualIsoEdited() {
         if (suppressSync) return
-        val parsed = tryParseInstant(manualIsoField.text.trim()) ?: return
+        val parsed = tryParseInstant((manualIsoField.text as String?)?.trim().orEmpty()) ?: return
         currentInstant = parsed
         suppressSync = true
         try {
@@ -176,16 +176,16 @@ class DateEditorPanel(initialIsoOrMillis: String = "") : JPanel() {
     }
 
     fun getUtcIsoString(): String {
-        val manual = tryParseInstant(manualIsoField.text.trim())
+        val manual = tryParseInstant((manualIsoField.text as String?)?.trim().orEmpty())
         if (manual != null) {
             currentInstant = manual
         }
         return formatUtcIso(currentInstant)
     }
 
-    fun getManualRawText(): String = manualIsoField.text.trim()
+    fun getManualRawText(): String = (manualIsoField.text as String?)?.trim().orEmpty()
 
-    fun isValidDateInput(): Boolean = tryParseInstant(manualIsoField.text.trim()) != null
+    fun isValidDateInput(): Boolean = tryParseInstant((manualIsoField.text as String?)?.trim().orEmpty()) != null
 
     companion object {
         private val isoFormatter = DateTimeFormatter.ISO_INSTANT

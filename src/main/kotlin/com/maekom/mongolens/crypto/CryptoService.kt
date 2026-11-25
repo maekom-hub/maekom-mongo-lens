@@ -2,6 +2,10 @@ package com.maekom.mongolens.crypto
 
 import com.maekom.mongolens.config.EnvResolver
 import com.maekom.mongolens.i18n.I18n
+import org.bson.BsonArray
+import org.bson.BsonDocument
+import org.bson.BsonString
+import org.bson.BsonValue
 import org.yaml.snakeyaml.LoaderOptions
 import org.yaml.snakeyaml.Yaml
 import org.yaml.snakeyaml.constructor.SafeConstructor
@@ -61,10 +65,93 @@ data class YamlKeyCandidate(
 
 object CryptoService {
 
+    data class RecursiveDecryptResult(
+        val value: BsonValue,
+        val decryptedCount: Int,
+        val failedCount: Int,
+        val firstError: Throwable?
+    )
+
     fun isEncryptedCandidate(value: String, config: ProfileCryptoConfig): Boolean {
         val prefix = config.prefix
         if (prefix.isEmpty()) return false
         return value.startsWith(prefix) && value.length > prefix.length + 4
+    }
+
+    fun containsEncryptedCandidate(value: BsonValue, config: ProfileCryptoConfig): Boolean {
+        if (config.prefix.isEmpty()) return false
+        return when (value) {
+            is BsonString -> isEncryptedCandidate(value.value, config)
+            is BsonDocument -> value.values.any { containsEncryptedCandidate(it, config) }
+            is BsonArray -> value.values.any { containsEncryptedCandidate(it, config) }
+            else -> false
+        }
+    }
+
+    fun decryptBsonValueRecursively(
+        value: BsonValue,
+        config: ProfileCryptoConfig,
+        secretKey: String
+    ): RecursiveDecryptResult {
+        return when (value) {
+            is BsonString -> {
+                if (!isEncryptedCandidate(value.value, config)) {
+                    RecursiveDecryptResult(value, 0, 0, null)
+                } else {
+                    val outcome = runCatching { decrypt(value.value, config, secretKey) }
+                    outcome.fold(
+                        onSuccess = { plain -> RecursiveDecryptResult(BsonString(plain), 1, 0, null) },
+                        onFailure = { err -> RecursiveDecryptResult(value, 0, 1, err) }
+                    )
+                }
+            }
+
+            is BsonDocument -> {
+                var decryptedCount = 0
+                var failedCount = 0
+                var firstError: Throwable? = null
+                val rebuilt = BsonDocument()
+                for ((k, v) in value) {
+                    val child = decryptBsonValueRecursively(v, config, secretKey)
+                    decryptedCount += child.decryptedCount
+                    failedCount += child.failedCount
+                    if (firstError == null && child.firstError != null) {
+                        firstError = child.firstError
+                    }
+                    rebuilt[k] = child.value
+                }
+                RecursiveDecryptResult(
+                    value = if (decryptedCount > 0) rebuilt else value,
+                    decryptedCount = decryptedCount,
+                    failedCount = failedCount,
+                    firstError = firstError
+                )
+            }
+
+            is BsonArray -> {
+                var decryptedCount = 0
+                var failedCount = 0
+                var firstError: Throwable? = null
+                val rebuilt = BsonArray()
+                for (elem in value) {
+                    val child = decryptBsonValueRecursively(elem, config, secretKey)
+                    decryptedCount += child.decryptedCount
+                    failedCount += child.failedCount
+                    if (firstError == null && child.firstError != null) {
+                        firstError = child.firstError
+                    }
+                    rebuilt.add(child.value)
+                }
+                RecursiveDecryptResult(
+                    value = if (decryptedCount > 0) rebuilt else value,
+                    decryptedCount = decryptedCount,
+                    failedCount = failedCount,
+                    firstError = firstError
+                )
+            }
+
+            else -> RecursiveDecryptResult(value, 0, 0, null)
+        }
     }
 
     fun decodeKeyBytes(rawKey: String, encoding: KeyEncoding): ByteArray {
