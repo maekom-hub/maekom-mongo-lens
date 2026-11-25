@@ -13,6 +13,7 @@ import com.intellij.ui.tabs.TabInfo
 import com.maekom.mongolens.config.MongoConnectionProfile
 import com.maekom.mongolens.config.SavedQueryStore
 import com.maekom.mongolens.config.VariableStore
+import com.maekom.mongolens.crypto.CryptoConfigStore
 import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import java.awt.event.MouseAdapter
@@ -23,11 +24,13 @@ import javax.swing.SwingUtilities
 
 class WorkspaceTabManager(
     private val project: Project,
+    private val projectBasePath: java.nio.file.Path?,
     private val tabs: JBTabs,
     private val parentDisposable: Disposable,
     private val connectionManager: MongoConnectionManager,
     private val savedQueryStore: SavedQueryStore,
     private val variableStore: VariableStore,
+    private val cryptoStore: CryptoConfigStore,
     private val onStatusUpdate: (String, Boolean) -> Unit,
     private val onReadOnlyStateChanged: () -> Unit,
     private val onTabCountChanged: (Int) -> Unit
@@ -103,9 +106,11 @@ class WorkspaceTabManager(
 
         val workspaceTab = CollectionWorkspaceTab(
             project = project,
+            projectBasePath = projectBasePath,
             connectionManager = connectionManager,
             savedQueryStore = savedQueryStore,
             variableStore = variableStore,
+            cryptoStore = cryptoStore,
             profile = profile,
             database = database,
             collection = collection,
@@ -203,6 +208,11 @@ class WorkspaceTabManager(
     fun closeAllTabs() {
         val allIds = entriesById.keys.toList()
         allIds.forEach { closeTab(it) }
+    }
+
+    fun activeTabProfileName(): String? {
+        val selectedInfo = tabs.selectedInfo ?: return null
+        return entryByTabInfo[selectedInfo]?.workspaceTab?.profile?.profileName
     }
 
     fun updateAllReadOnlyBadges() {

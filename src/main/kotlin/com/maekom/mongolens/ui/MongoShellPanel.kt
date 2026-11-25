@@ -21,6 +21,7 @@ import com.maekom.mongolens.config.MongoConnectionProfile
 import com.maekom.mongolens.config.SavedQuery
 import com.maekom.mongolens.config.SavedQueryStore
 import com.maekom.mongolens.config.VariableStore
+import com.maekom.mongolens.crypto.CryptoConfigStore
 import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import com.maekom.mongolens.mongo.MongoShellExecutor
@@ -40,9 +41,11 @@ import javax.swing.SwingUtilities
 
 class MongoShellPanel(
     private val project: Project,
+    private val projectBasePath: java.nio.file.Path?,
     private val connectionManager: MongoConnectionManager,
     private val savedQueryStore: SavedQueryStore,
     private val variableStore: VariableStore,
+    private val cryptoStore: CryptoConfigStore,
     private val profile: MongoConnectionProfile,
     private val database: String,
     private val collection: String,
@@ -110,7 +113,9 @@ class MongoShellPanel(
 
     private val resultViewer = ResultViewerPanel(
         project = project,
+        projectBasePath = projectBasePath,
         connectionManager = connectionManager,
+        cryptoStore = cryptoStore,
         profile = profile,
         database = database,
         collection = collection,

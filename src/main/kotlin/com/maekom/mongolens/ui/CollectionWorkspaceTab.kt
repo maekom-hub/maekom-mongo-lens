@@ -11,6 +11,7 @@ import com.intellij.util.ui.JBUI
 import com.maekom.mongolens.config.MongoConnectionProfile
 import com.maekom.mongolens.config.SavedQueryStore
 import com.maekom.mongolens.config.VariableStore
+import com.maekom.mongolens.crypto.CryptoConfigStore
 import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import com.maekom.mongolens.mongo.SmartInValueType
@@ -30,9 +31,11 @@ import javax.swing.SwingUtilities
 
 class CollectionWorkspaceTab(
     private val project: Project,
+    private val projectBasePath: java.nio.file.Path?,
     private val connectionManager: MongoConnectionManager,
     savedQueryStore: SavedQueryStore,
     variableStore: VariableStore,
+    cryptoStore: CryptoConfigStore,
     val profile: MongoConnectionProfile,
     val database: String,
     val collection: String,
@@ -78,9 +81,11 @@ class CollectionWorkspaceTab(
 
     private val shellPanel = MongoShellPanel(
         project = project,
+        projectBasePath = projectBasePath,
         connectionManager = connectionManager,
         savedQueryStore = savedQueryStore,
         variableStore = variableStore,
+        cryptoStore = cryptoStore,
         profile = profile,
         database = database,
         collection = collection,
@@ -96,8 +101,10 @@ class CollectionWorkspaceTab(
 
     private val findPanel = FindQueryPanel(
         project = project,
+        projectBasePath = projectBasePath,
         connectionManager = connectionManager,
         savedQueryStore = savedQueryStore,
+        cryptoStore = cryptoStore,
         profile = profile,
         database = database,
         collection = collection,
@@ -117,8 +124,10 @@ class CollectionWorkspaceTab(
 
     private val aggregationPanel = AggregationBuilderPanel(
         project = project,
+        projectBasePath = projectBasePath,
         connectionManager = connectionManager,
         savedQueryStore = savedQueryStore,
+        cryptoStore = cryptoStore,
         profile = profile,
         database = database,
         collection = collection,

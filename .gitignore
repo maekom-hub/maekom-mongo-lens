@@ -19,6 +19,7 @@ out/
 .idea/shelf/
 .idea/maekom-mongo-connections.json
 .idea/maekom-mongo-variables.json
+.idea/maekom-mongo-crypto.json
 *.iml
 
 # Logs, heap dumps & local secrets

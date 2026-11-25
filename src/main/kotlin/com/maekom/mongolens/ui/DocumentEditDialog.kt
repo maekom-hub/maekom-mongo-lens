@@ -18,6 +18,8 @@ import com.intellij.ui.table.JBTable
 import com.intellij.util.ui.FormBuilder
 import com.intellij.util.ui.JBUI
 import com.maekom.mongolens.config.MongoConnectionProfile
+import com.maekom.mongolens.crypto.CryptoConfigStore
+import com.maekom.mongolens.crypto.CryptoService
 import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import com.maekom.mongolens.mongo.MongoShellNormalizer
@@ -83,6 +85,8 @@ class DocumentEditDialog(
     private val rawDocument: Document? = null,
     private val isReadOnly: Boolean,
     private val focusFieldPath: String? = null,
+    private val projectBasePath: java.nio.file.Path? = null,
+    private val cryptoStore: CryptoConfigStore? = null,
     private val onSavedInDb: (BsonDocument) -> Unit,
     private val onDeletedInDb: () -> Unit
 ) : DialogWrapper(project) {
@@ -1178,6 +1182,19 @@ class DocumentEditDialog(
             add(oidGenBtn, BorderLayout.EAST)
         }
 
+        private val encStringField = JBTextField()
+        private val encDecryptBtn = JButton(I18n.t("crypto.btn.decrypt")).apply {
+            margin = JBUI.insets(0, 5)
+            addActionListener {
+                revealTemporaryPlaintext(encStringField.text)
+            }
+        }
+        private val encStringComposite = JPanel(BorderLayout(2, 0)).apply {
+            add(encStringField, BorderLayout.CENTER)
+            add(encDecryptBtn, BorderLayout.EAST)
+        }
+        private var usingEncryptedEditor = false
+
         override fun getTableCellEditorComponent(
             table: JTable?,
             value: Any?,
@@ -1188,6 +1205,7 @@ class DocumentEditDialog(
             val node = treeTableModel.getNodeAt(row)
             currentType = node?.type ?: BsonFieldType.STRING
             val strVal = value?.toString() ?: ""
+            usingEncryptedEditor = false
 
             return when (currentType) {
                 BsonFieldType.BOOLEAN -> {
@@ -1202,6 +1220,17 @@ class DocumentEditDialog(
                     oidField.text = strVal
                     oidComposite
                 }
+                BsonFieldType.STRING -> {
+                    val store = cryptoStore
+                    if (store != null && CryptoService.isEncryptedCandidate(strVal, store.getConfig(profile.profileName))) {
+                        usingEncryptedEditor = true
+                        encStringField.text = strVal
+                        encStringComposite
+                    } else {
+                        plainField.text = strVal
+                        plainField
+                    }
+                }
                 else -> {
                     plainField.text = strVal
                     plainField
@@ -1210,11 +1239,50 @@ class DocumentEditDialog(
         }
 
         override fun getCellEditorValue(): Any {
-            return when (currentType) {
-                BsonFieldType.BOOLEAN -> boolCombo.selectedItem?.toString() ?: "false"
-                BsonFieldType.DATE -> dateField.text
-                BsonFieldType.OBJECT_ID -> oidField.text
+            return when {
+                currentType == BsonFieldType.BOOLEAN -> boolCombo.selectedItem?.toString() ?: "false"
+                currentType == BsonFieldType.DATE -> dateField.text
+                currentType == BsonFieldType.OBJECT_ID -> oidField.text
+                usingEncryptedEditor -> encStringField.text
                 else -> plainField.text
+            }
+        }
+
+        private fun revealTemporaryPlaintext(cipherText: String) {
+            val store = cryptoStore ?: return
+            var secret = store.getSecretKey(profile.profileName)
+            if (secret.isBlank()) {
+                val cfgDlg = DecryptConfigDialog(project, projectBasePath, store, profile.profileName)
+                if (!cfgDlg.showAndGet()) return
+                secret = store.getSecretKey(profile.profileName)
+                if (secret.isBlank()) return
+            }
+            val cfg = store.getConfig(profile.profileName)
+            try {
+                val plain = CryptoService.decrypt(cipherText, cfg, secret)
+                val sec = cfg.clampedRevealSeconds()
+                val textField = JBTextField(plain).apply {
+                    isEditable = false
+                    font = Font(Font.MONOSPACED, Font.BOLD, 12)
+                    preferredSize = Dimension(380, 30)
+                }
+                val popup = com.intellij.openapi.ui.popup.JBPopupFactory.getInstance()
+                    .createComponentPopupBuilder(textField, textField)
+                    .setTitle(I18n.t("crypto.tempRevealTitle", sec))
+                    .setRequestFocus(true)
+                    .setFocusable(true)
+                    .setCancelOnClickOutside(true)
+                    .setCancelKeyEnabled(true)
+                    .createPopup()
+                popup.showInCenterOf(treeTable)
+                textField.selectAll()
+                val closeTimer = javax.swing.Timer(sec * 1000) {
+                    if (!popup.isDisposed) popup.cancel()
+                }
+                closeTimer.isRepeats = false
+                closeTimer.start()
+            } catch (t: Throwable) {
+                showErrorBanner(I18n.t("crypto.decryptFailed", t.message ?: t.javaClass.simpleName))
             }
         }
     }

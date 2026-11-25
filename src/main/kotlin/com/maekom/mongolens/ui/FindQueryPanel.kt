@@ -13,20 +13,18 @@ import com.intellij.util.ui.JBUI
 import com.maekom.mongolens.config.MongoConnectionProfile
 import com.maekom.mongolens.config.SavedQuery
 import com.maekom.mongolens.config.SavedQueryStore
+import com.maekom.mongolens.crypto.CryptoConfigStore
 import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import com.maekom.mongolens.mongo.MongoShellNormalizer
 import com.maekom.mongolens.mongo.SmartInValueType
 import java.awt.BorderLayout
-import java.awt.Cursor
 import java.awt.Dimension
 import java.awt.FlowLayout
 import java.awt.Font
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
-import java.awt.event.MouseAdapter
-import java.awt.event.MouseEvent
-import java.awt.event.MouseMotionAdapter
+import java.nio.file.Path
 import java.util.UUID
 import javax.swing.BorderFactory
 import javax.swing.JButton
@@ -37,8 +35,10 @@ import javax.swing.SwingUtilities
 
 class FindQueryPanel(
     private val project: Project,
+    private val projectBasePath: Path?,
     private val connectionManager: MongoConnectionManager,
     private val savedQueryStore: SavedQueryStore,
+    private val cryptoStore: CryptoConfigStore,
     private val profile: MongoConnectionProfile,
     private val database: String,
     private val collection: String,
@@ -50,16 +50,7 @@ class FindQueryPanel(
     private val onConvertToShell: (String) -> Unit
 ) : JPanel(BorderLayout()), Disposable {
 
-    companion object {
-        private const val FILTER_COLLAPSED_HEIGHT = 28
-        private const val FILTER_EXPANDED_HEIGHT = 96
-        private const val FILTER_MIN_DRAG_HEIGHT = 28
-        private const val FILTER_MAX_DRAG_HEIGHT = 180
-    }
-
     private val limitPresets = arrayOf(20, 50, 100, 500, 1000)
-
-    private var currentFilterHeight = FILTER_COLLAPSED_HEIGHT
 
     private val filterLabel = JBLabel(I18n.t("find.filter")).apply {
         preferredSize = Dimension(38, 26)
@@ -70,37 +61,23 @@ class FindQueryPanel(
     private val projectToggleBtn = JButton(I18n.t("find.projectAdd")).apply {
         margin = JBUI.insets(2, 6)
     }
-    private val filterExpandToggleBtn = JButton("⇕").apply {
-        margin = JBUI.insets(2, 5)
-        preferredSize = Dimension(28, 26)
-        toolTipText = I18n.t("find.filterExpandTooltip")
-    }
     private val sortLabel = JBLabel(I18n.t("find.sort")).apply {
         preferredSize = Dimension(38, 24)
     }
     private val limitLabel = JBLabel(I18n.t("find.limit"))
     private val skipLabel = JBLabel(I18n.t("find.skip"))
 
+    // Auto-Grow/Shrink Filter editor (1 line = 28px, 2..6 lines auto-grow/shrink, 7+ lines = 140px + scrollbar)
     private val filterEditor = MongoJsonEditor(
         projectRef = project,
         initialText = "{}",
         multiLine = false,
+        autoGrow = true,
         completionMode = MongoJsonEditor.CompletionMode.FILTER,
         fieldSuggestionsSupplier = fieldSuggestionsSupplier,
-        onExecuteShortcut = { executeFind() }
-    ).apply {
-        applyDynamicHeight(FILTER_COLLAPSED_HEIGHT)
-    }
-
-    // 3px bottom drag resize handle right below Filter editor
-    private val filterResizeHandle = JPanel().apply {
-        preferredSize = Dimension(100, 4)
-        minimumSize = Dimension(40, 4)
-        maximumSize = Dimension(Int.MAX_VALUE, 4)
-        cursor = Cursor.getPredefinedCursor(Cursor.S_RESIZE_CURSOR)
-        toolTipText = I18n.t("find.filterResizeTooltip")
-        border = BorderFactory.createMatteBorder(0, 0, 1, 0, JBUI.CurrentTheme.ToolWindow.borderColor())
-    }
+        onExecuteShortcut = { executeFind() },
+        onAutoHeightChanged = { revalidateHierarchy() }
+    )
 
     private val projectEditor = MongoJsonEditor(
         projectRef = project,
@@ -138,7 +115,7 @@ class FindQueryPanel(
         preferredSize = Dimension(64, 25)
     }
 
-    // Row 1 Right Block (Top-aligned when Filter expands)
+    // Row 1 Right Block (Top-aligned when Filter auto-grows)
     private val runBtn = JButton(I18n.t("find.run")).apply {
         margin = JBUI.insets(2, 8)
         font = font.deriveFont(Font.BOLD)
@@ -174,7 +151,9 @@ class FindQueryPanel(
 
     private val resultViewer = ResultViewerPanel(
         project = project,
+        projectBasePath = projectBasePath,
         connectionManager = connectionManager,
+        cryptoStore = cryptoStore,
         profile = profile,
         database = database,
         collection = collection,
@@ -210,28 +189,20 @@ class FindQueryPanel(
             insets = JBUI.insets(1, 2)
         }
 
-        // Row 0 Left: Filter label (top-aligned) + Filter editor with 3px drag handle + [+ Project] [⇕] (top-aligned)
-        val filterEditorWithHandle = JPanel(BorderLayout(0, 0)).apply {
-            add(filterEditor, BorderLayout.CENTER)
-            add(filterResizeHandle, BorderLayout.SOUTH)
-        }
+        // Row 0 Left: Clean [Filter label] + [Auto-Grow Filter Editor] + [+ Project] (no manual resize button/handle)
         val filterLabelWrap = JPanel(BorderLayout()).apply {
             add(filterLabel, BorderLayout.NORTH)
         }
-        val filterRightMiniBtns = JPanel(FlowLayout(FlowLayout.RIGHT, 2, 0)).apply {
-            add(projectToggleBtn)
-            add(filterExpandToggleBtn)
-        }
-        val filterRightMiniWrap = JPanel(BorderLayout()).apply {
-            add(filterRightMiniBtns, BorderLayout.NORTH)
+        val projectToggleWrap = JPanel(BorderLayout()).apply {
+            add(projectToggleBtn, BorderLayout.NORTH)
         }
         val row1Left = JPanel(BorderLayout(4, 0)).apply {
             add(filterLabelWrap, BorderLayout.WEST)
-            add(filterEditorWithHandle, BorderLayout.CENTER)
-            add(filterRightMiniWrap, BorderLayout.EAST)
+            add(filterEditor, BorderLayout.CENTER)
+            add(projectToggleWrap, BorderLayout.EAST)
         }
 
-        // Row 0 Right: [▶ 조회] [초기화] pinned to NORTH so Filter expansion never stretches them
+        // Row 0 Right: [▶ 조회] [초기화] top-aligned
         val row1Right = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
             add(runBtn)
             add(resetBtn)
@@ -274,42 +245,12 @@ class FindQueryPanel(
         grid.add(row2Right, gbc)
 
         wireListeners()
-        installFilterResizeDrag()
 
         queryBarWrapper.apply {
             border = BorderFactory.createMatteBorder(0, 0, 1, 0, JBUI.CurrentTheme.ToolWindow.borderColor())
             add(grid, BorderLayout.CENTER)
         }
         add(queryBarWrapper, BorderLayout.NORTH)
-    }
-
-    private fun installFilterResizeDrag() {
-        var dragStartY = 0
-        var startHeight = FILTER_COLLAPSED_HEIGHT
-
-        filterResizeHandle.addMouseListener(object : MouseAdapter() {
-            override fun mousePressed(e: MouseEvent) {
-                dragStartY = e.yOnScreen
-                startHeight = currentFilterHeight
-            }
-        })
-
-        filterResizeHandle.addMouseMotionListener(object : MouseMotionAdapter() {
-            override fun mouseDragged(e: MouseEvent) {
-                val delta = e.yOnScreen - dragStartY
-                val nextHeight = (startHeight + delta).coerceIn(FILTER_MIN_DRAG_HEIGHT, FILTER_MAX_DRAG_HEIGHT)
-                // Snap nicely between collapsed 28px and expanded 40..180px
-                val effective = if (nextHeight in 35..39) 40 else nextHeight
-                setFilterHeight(effective)
-            }
-        })
-    }
-
-    private fun setFilterHeight(heightPx: Int) {
-        if (currentFilterHeight == heightPx) return
-        currentFilterHeight = heightPx
-        filterEditor.applyDynamicHeight(heightPx)
-        revalidateHierarchy()
     }
 
     private fun revalidateHierarchy() {
@@ -333,11 +274,6 @@ class FindQueryPanel(
             projectRowContainer.isVisible = projectExpanded
             updateProjectToggleText()
             revalidateHierarchy()
-        }
-
-        filterExpandToggleBtn.addActionListener {
-            val next = if (currentFilterHeight <= 34) FILTER_EXPANDED_HEIGHT else FILTER_COLLAPSED_HEIGHT
-            setFilterHeight(next)
         }
 
         limitDecreaseBtn.addActionListener {
@@ -376,11 +312,7 @@ class FindQueryPanel(
                 schemaFieldTypes = fieldTypesSupplier()
             )
             if (dlg.showAndGet()) {
-                val query = dlg.getGeneratedQuery()
-                filterEditor.text = query
-                if (query.lines().size > 1 && currentFilterHeight <= 34) {
-                    setFilterHeight(FILTER_EXPANDED_HEIGHT)
-                }
+                filterEditor.text = dlg.getGeneratedQuery()
                 if (dlg.runImmediately) {
                     skipSpinner.value = 0
                     executeFind()
@@ -389,8 +321,7 @@ class FindQueryPanel(
         }
 
         toShellBtn.addActionListener {
-            val cmd = buildDirectShellFindCommand()
-            onConvertToShell(cmd)
+            onConvertToShell(buildDirectShellFindCommand())
         }
 
         savedQueriesBtn.addActionListener { showSavedQueriesPopup() }
@@ -544,9 +475,6 @@ class FindQueryPanel(
             projectRowContainer.isVisible = true
             updateProjectToggleText()
         }
-        if (q.filter.lines().size > 1 && currentFilterHeight <= 34) {
-            setFilterHeight(FILTER_EXPANDED_HEIGHT)
-        }
         executeFind()
     }
 
@@ -562,8 +490,6 @@ class FindQueryPanel(
             limitLabel.text = I18n.t("find.limit")
             skipLabel.text = I18n.t("find.skip")
             updateProjectToggleText()
-            filterExpandToggleBtn.toolTipText = I18n.t("find.filterExpandTooltip")
-            filterResizeHandle.toolTipText = I18n.t("find.filterResizeTooltip")
             runBtn.text = I18n.t("find.run")
             runBtn.toolTipText = I18n.t("find.runTooltip")
             resetBtn.text = I18n.t("find.reset")

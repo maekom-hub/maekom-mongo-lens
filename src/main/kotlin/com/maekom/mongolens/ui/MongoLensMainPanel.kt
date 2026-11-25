@@ -18,6 +18,7 @@ import com.maekom.mongolens.config.SavedQueryStore
 import com.maekom.mongolens.config.SpringYamlConfigParser
 import com.maekom.mongolens.config.VariableStore
 import com.maekom.mongolens.config.YamlConfigWatcher
+import com.maekom.mongolens.crypto.CryptoConfigStore
 import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import com.maekom.mongolens.update.PluginUpdateChecker
@@ -62,6 +63,7 @@ class MongoLensMainPanel(
     private val customStore = CustomConnectionStore(projectBasePath)
     private val savedQueryStore = SavedQueryStore(projectBasePath)
     private val variableStore = VariableStore(projectBasePath)
+    private val cryptoStore = CryptoConfigStore(projectBasePath)
     private val connectionManager = MongoConnectionManager(project)
 
     private var discoveredProfiles: List<MongoConnectionProfile> = emptyList()
@@ -89,6 +91,10 @@ class MongoLensMainPanel(
 
     private val statusLabel = JBLabel(I18n.t("header.status.idle")).apply {
         border = JBUI.Borders.empty(0, 6)
+    }
+    private val cryptoConfigBtn = JButton(I18n.t("header.cryptoConfig")).apply {
+        margin = JBUI.insets(1, 8)
+        toolTipText = I18n.t("header.cryptoConfigTooltip")
     }
     private val updateBtn = JButton(I18n.t("header.update.check")).apply {
         margin = JBUI.insets(1, 8)
@@ -120,11 +126,13 @@ class MongoLensMainPanel(
 
         tabManager = WorkspaceTabManager(
             project = project,
+            projectBasePath = projectBasePath,
             tabs = tabs,
             parentDisposable = this,
             connectionManager = connectionManager,
             savedQueryStore = savedQueryStore,
             variableStore = variableStore,
+            cryptoStore = cryptoStore,
             onStatusUpdate = { text, isError -> setStatus(text, isError) },
             onReadOnlyStateChanged = { connectionsTree.repaintTree() },
             onTabCountChanged = { count ->
@@ -190,6 +198,7 @@ class MongoLensMainPanel(
 
         val right = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 1)).apply {
             add(statusLabel)
+            add(cryptoConfigBtn)
             add(updateBtn)
             add(langToggleBtn)
         }
@@ -221,6 +230,14 @@ class MongoLensMainPanel(
         }
 
         syncYamlBtn.addActionListener { reloadProfilesAsync() }
+
+        cryptoConfigBtn.addActionListener {
+            val targetProfileName = tabManager.activeTabProfileName()
+                ?: discoveredProfiles.firstOrNull { it.id == selectedProfileFilterId }?.profileName
+                ?: discoveredProfiles.firstOrNull()?.profileName
+                ?: "default"
+            DecryptConfigDialog(project, projectBasePath, cryptoStore, targetProfileName).show()
+        }
 
         updateBtn.addActionListener {
             val pending = availableUpdate
@@ -393,6 +410,8 @@ class MongoLensMainPanel(
             titleLabel.text = I18n.t("app.title")
             syncYamlBtn.text = I18n.t("header.syncYaml")
             syncYamlBtn.toolTipText = I18n.t("header.syncYamlTooltip")
+            cryptoConfigBtn.text = I18n.t("header.cryptoConfig")
+            cryptoConfigBtn.toolTipText = I18n.t("header.cryptoConfigTooltip")
             langToggleBtn.text = I18n.getLang().code
             langToggleBtn.toolTipText = I18n.t("header.lang.toggleTooltip")
             welcomeTitleLabel.text = I18n.t("workspace.welcome.title")

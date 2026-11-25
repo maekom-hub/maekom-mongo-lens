@@ -1,0 +1,204 @@
+package com.maekom.mongolens.ui
+
+import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.ComboBox
+import com.intellij.openapi.ui.DialogWrapper
+import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.ui.ValidationInfo
+import com.intellij.ui.components.JBLabel
+import com.intellij.ui.components.JBPasswordField
+import com.intellij.ui.components.JBTextField
+import com.intellij.util.ui.FormBuilder
+import com.intellij.util.ui.JBUI
+import com.maekom.mongolens.crypto.CryptoConfigStore
+import com.maekom.mongolens.crypto.CryptoService
+import com.maekom.mongolens.crypto.DecryptMode
+import com.maekom.mongolens.crypto.KeyEncoding
+import com.maekom.mongolens.crypto.ProfileCryptoConfig
+import com.maekom.mongolens.i18n.I18n
+import java.awt.BorderLayout
+import java.awt.Dimension
+import java.awt.FlowLayout
+import java.awt.Font
+import java.nio.file.Path
+import javax.swing.BorderFactory
+import javax.swing.JButton
+import javax.swing.JComponent
+import javax.swing.JPanel
+import javax.swing.JSpinner
+import javax.swing.JToggleButton
+import javax.swing.SpinnerNumberModel
+
+class DecryptConfigDialog(
+    private val project: Project,
+    private val projectBasePath: Path?,
+    private val cryptoStore: CryptoConfigStore,
+    private val profileName: String
+) : DialogWrapper(project) {
+
+    private val initialConfig = cryptoStore.getConfig(profileName)
+    private val initialSecret = cryptoStore.getSecretKey(profileName)
+
+    private val prefixField = JBTextField(initialConfig.prefix)
+    private val modeCombo = ComboBox(DecryptMode.values()).apply {
+        selectedItem = initialConfig.mode
+    }
+    private val encodingCombo = ComboBox(KeyEncoding.values()).apply {
+        selectedItem = initialConfig.keyEncoding
+    }
+    private val secretKeyField = JBPasswordField().apply {
+        text = initialSecret
+    }
+    private val defaultEchoChar: Char = secretKeyField.echoChar
+    private val eyeToggleBtn = JToggleButton("👁", false).apply {
+        margin = JBUI.insets(1, 5)
+        preferredSize = Dimension(34, 26)
+    }
+    private val scanYamlBtn = JButton(I18n.t("crypto.dialog.scanYaml")).apply {
+        margin = JBUI.insets(2, 8)
+    }
+    private val fixedIvField = JBTextField(initialConfig.fixedIv).apply {
+        isEnabled = initialConfig.mode == DecryptMode.AES_CBC_FIXED_IV
+    }
+    private val revealSecondsSpinner = JSpinner(
+        SpinnerNumberModel(initialConfig.clampedRevealSeconds(), 5, 60, 1)
+    ).apply {
+        preferredSize = Dimension(72, 26)
+    }
+
+    // Live Decryption Test area
+    private val testInputField = JBTextField("").apply {
+        emptyText.text = I18n.t("crypto.dialog.testInput")
+    }
+    private val testBtn = JButton(I18n.t("crypto.dialog.testBtn")).apply {
+        margin = JBUI.insets(2, 8)
+    }
+    private val testResultLabel = JBLabel(" ").apply {
+        font = Font(Font.MONOSPACED, Font.BOLD, 11)
+    }
+
+    init {
+        title = "${I18n.t("crypto.dialog.title")} — $profileName"
+        wireListeners()
+        init()
+    }
+
+    private fun wireListeners() {
+        eyeToggleBtn.addActionListener {
+            secretKeyField.echoChar = if (eyeToggleBtn.isSelected) 0.toChar() else defaultEchoChar
+        }
+
+        modeCombo.addActionListener {
+            fixedIvField.isEnabled = (modeCombo.selectedItem as? DecryptMode) == DecryptMode.AES_CBC_FIXED_IV
+        }
+
+        scanYamlBtn.addActionListener {
+            val candidates = CryptoService.scanYamlForSecretKeyCandidates(projectBasePath)
+            if (candidates.isEmpty()) {
+                Messages.showInfoMessage(project, I18n.t("crypto.dialog.scanYamlEmpty"), I18n.t("crypto.dialog.scanYaml"))
+                return@addActionListener
+            }
+            if (candidates.size == 1) {
+                secretKeyField.text = candidates.first().resolvedValue
+                return@addActionListener
+            }
+            val labels = candidates.map { it.toString() }.toTypedArray()
+            val chosen = Messages.showEditableChooseDialog(
+                I18n.t("crypto.dialog.scanYamlPick"),
+                I18n.t("crypto.dialog.scanYaml"),
+                Messages.getQuestionIcon(),
+                labels,
+                labels.first(),
+                null
+            )
+            val idx = labels.indexOf(chosen)
+            if (idx >= 0) {
+                secretKeyField.text = candidates[idx].resolvedValue
+            }
+        }
+
+        testBtn.addActionListener {
+            val sample = testInputField.text.trim()
+            if (sample.isEmpty()) return@addActionListener
+            try {
+                val cfg = buildConfig()
+                val decrypted = CryptoService.decrypt(sample, cfg, String(secretKeyField.password))
+                testResultLabel.text = I18n.t("crypto.dialog.testSuccess", decrypted)
+                testResultLabel.foreground = UiHelpers.COLOR_GREEN_FG
+            } catch (t: Throwable) {
+                testResultLabel.text = I18n.t("crypto.decryptFailed", t.message ?: t.javaClass.simpleName)
+                testResultLabel.foreground = UiHelpers.COLOR_RED_FG
+            }
+        }
+    }
+
+    override fun createCenterPanel(): JComponent {
+        val keyRow = JPanel(BorderLayout(4, 0)).apply {
+            add(secretKeyField, BorderLayout.CENTER)
+            val rightBtns = JPanel(FlowLayout(FlowLayout.RIGHT, 2, 0)).apply {
+                add(eyeToggleBtn)
+                add(scanYamlBtn)
+            }
+            add(rightBtns, BorderLayout.EAST)
+        }
+
+        val profileBadge = UiHelpers.createBadgeLabel(profileName, UiHelpers.COLOR_BLUE_BG, UiHelpers.COLOR_BLUE_FG)
+
+        val testPanel = JPanel(BorderLayout(4, 4)).apply {
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createTitledBorder(I18n.t("crypto.dialog.testSection")),
+                JBUI.Borders.empty(4, 6)
+            )
+            val inputRow = JPanel(BorderLayout(6, 0)).apply {
+                add(testInputField, BorderLayout.CENTER)
+                add(testBtn, BorderLayout.EAST)
+            }
+            add(inputRow, BorderLayout.NORTH)
+            add(testResultLabel, BorderLayout.SOUTH)
+        }
+
+        val form = FormBuilder.createFormBuilder()
+            .addLabeledComponent(JBLabel(I18n.t("crypto.dialog.profile")), profileBadge, 1, false)
+            .addLabeledComponent(JBLabel(I18n.t("crypto.dialog.prefix")), prefixField, 1, false)
+            .addLabeledComponent(JBLabel(I18n.t("crypto.dialog.mode")), modeCombo, 1, false)
+            .addLabeledComponent(JBLabel(I18n.t("crypto.dialog.keyEncoding")), encodingCombo, 1, false)
+            .addLabeledComponent(JBLabel(I18n.t("crypto.dialog.secretKey")), keyRow, 1, false)
+            .addLabeledComponent(JBLabel(I18n.t("crypto.dialog.fixedIv")), fixedIvField, 1, false)
+            .addLabeledComponent(JBLabel(I18n.t("crypto.dialog.revealSeconds")), revealSecondsSpinner, 1, false)
+            .addComponent(testPanel, 8)
+            .panel
+
+        form.preferredSize = Dimension(560, 355)
+        form.border = JBUI.Borders.empty(6)
+        return form
+    }
+
+    override fun doValidate(): ValidationInfo? {
+        val rawKey = String(secretKeyField.password)
+        if (rawKey.isNotBlank()) {
+            val enc = (encodingCombo.selectedItem as? KeyEncoding) ?: KeyEncoding.UTF8
+            try {
+                CryptoService.decodeKeyBytes(rawKey, enc)
+            } catch (t: Throwable) {
+                return ValidationInfo(t.message ?: "Invalid AES key", secretKeyField)
+            }
+        }
+        return null
+    }
+
+    override fun doOKAction() {
+        cryptoStore.saveConfig(buildConfig(), String(secretKeyField.password))
+        super.doOKAction()
+    }
+
+    private fun buildConfig(): ProfileCryptoConfig {
+        return ProfileCryptoConfig(
+            profileName = profileName,
+            prefix = prefixField.text.trim(),
+            mode = (modeCombo.selectedItem as? DecryptMode) ?: DecryptMode.AES_CBC_IV_PREFIX,
+            keyEncoding = (encodingCombo.selectedItem as? KeyEncoding) ?: KeyEncoding.UTF8,
+            fixedIv = fixedIvField.text.trim(),
+            revealSeconds = ((revealSecondsSpinner.value as? Int) ?: 10).coerceIn(5, 60)
+        )
+    }
+}

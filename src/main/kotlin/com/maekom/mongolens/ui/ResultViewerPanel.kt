@@ -18,6 +18,8 @@ import com.intellij.ui.table.JBTable
 import com.intellij.ui.treeStructure.Tree
 import com.intellij.util.ui.JBUI
 import com.maekom.mongolens.config.MongoConnectionProfile
+import com.maekom.mongolens.crypto.CryptoConfigStore
+import com.maekom.mongolens.crypto.CryptoService
 import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.IndexScanType
 import com.maekom.mongolens.mongo.MongoConnectionManager
@@ -26,15 +28,18 @@ import com.maekom.mongolens.mongo.QueryExecutionResult
 import org.bson.BsonArray
 import org.bson.BsonDateTime
 import org.bson.BsonDocument
+import org.bson.BsonString
 import org.bson.BsonValue
 import org.bson.Document
 import java.awt.BorderLayout
 import java.awt.CardLayout
 import java.awt.Component
+import java.awt.Cursor
 import java.awt.Dimension
 import java.awt.FlowLayout
 import java.awt.Font
 import java.awt.Point
+import java.awt.Rectangle
 import java.awt.datatransfer.StringSelection
 import java.awt.datatransfer.Transferable
 import java.awt.event.FocusAdapter
@@ -43,6 +48,8 @@ import java.awt.event.KeyAdapter
 import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import java.awt.event.MouseMotionAdapter
+import java.nio.file.Path
 import javax.swing.BorderFactory
 import javax.swing.JButton
 import javax.swing.JComponent
@@ -55,6 +62,7 @@ import javax.swing.JToggleButton
 import javax.swing.JTree
 import javax.swing.ListSelectionModel
 import javax.swing.SwingUtilities
+import javax.swing.Timer
 import javax.swing.ToolTipManager
 import javax.swing.TransferHandler
 import javax.swing.table.AbstractTableModel
@@ -66,7 +74,9 @@ import javax.swing.tree.TreePath
 
 class ResultViewerPanel(
     private val project: Project,
+    private val projectBasePath: Path?,
     private val connectionManager: MongoConnectionManager,
+    private val cryptoStore: CryptoConfigStore,
     private val profile: MongoConnectionProfile,
     private val database: String,
     private val collection: String,
@@ -97,6 +107,15 @@ class ResultViewerPanel(
         val bsonValue: BsonValue,
         val fieldPath: String
     ) : DefaultMutableTreeNode(keyLabel)
+
+    private data class DecryptedEntry(
+        val plaintext: String,
+        var remainingSeconds: Int,
+        val treeNode: FieldTreeNode
+    )
+
+    private val decryptedFields = linkedMapOf<String, DecryptedEntry>()
+    private val decryptCountdownTimer: Timer = Timer(1000) { onDecryptTimerTick() }
 
     private var currentDocs: MutableList<BsonDocument> = mutableListOf()
     private var currentResult: QueryExecutionResult? = null
@@ -271,15 +290,44 @@ class ResultViewerPanel(
                     is FieldTreeNode -> {
                         append(value.keyLabel, SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)
                         append(": ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                        val valColor = UiHelpers.bsonTypeColor(value.bsonValue)
-                        append(
-                            UiHelpers.bsonDisplayValue(value.bsonValue),
-                            SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, valColor)
-                        )
-                        append(
-                            "  [${UiHelpers.bsonTypeTag(value.bsonValue)}]",
-                            SimpleTextAttributes(SimpleTextAttributes.STYLE_ITALIC, UiHelpers.BSON_NULL_COLOR)
-                        )
+
+                        val decrypted = decryptedFields[decryptKeyFor(value)]
+                        if (decrypted != null) {
+                            append(
+                                "\"${decrypted.plaintext}\"",
+                                SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, UiHelpers.COLOR_GREEN_FG)
+                            )
+                            append(
+                                "  [String]",
+                                SimpleTextAttributes(SimpleTextAttributes.STYLE_ITALIC, UiHelpers.BSON_NULL_COLOR)
+                            )
+                            append(
+                                "  ${decrypted.remainingSeconds}s  ",
+                                SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, UiHelpers.COLOR_ORANGE_FG)
+                            )
+                            append(
+                                "[${I18n.t("crypto.btn.hide")}]",
+                                SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, UiHelpers.COLOR_BLUE_FG)
+                            )
+                        } else {
+                            val valColor = UiHelpers.bsonTypeColor(value.bsonValue)
+                            append(
+                                UiHelpers.bsonDisplayValue(value.bsonValue),
+                                SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, valColor)
+                            )
+                            append(
+                                "  [${UiHelpers.bsonTypeTag(value.bsonValue)}]",
+                                SimpleTextAttributes(SimpleTextAttributes.STYLE_ITALIC, UiHelpers.BSON_NULL_COLOR)
+                            )
+                            val strVal = (value.bsonValue as? BsonString)?.value
+                            if (strVal != null && CryptoService.isEncryptedCandidate(strVal, cryptoStore.getConfig(profile.profileName))) {
+                                append("  ", SimpleTextAttributes.REGULAR_ATTRIBUTES)
+                                append(
+                                    "[${I18n.t("crypto.btn.decrypt")}]",
+                                    SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, UiHelpers.COLOR_BLUE_FG)
+                                )
+                            }
+                        }
                     }
                     is DefaultMutableTreeNode -> {
                         append(value.userObject?.toString() ?: "", SimpleTextAttributes.GRAYED_ATTRIBUTES)
@@ -288,12 +336,35 @@ class ResultViewerPanel(
             }
         }
 
+        resultTree.addMouseMotionListener(object : MouseMotionAdapter() {
+            override fun mouseMoved(e: MouseEvent) {
+                val path = resultTree.getPathForLocation(e.x, e.y)
+                val node = path?.lastPathComponent as? FieldTreeNode
+                val rect = if (path != null && node != null) computeCryptoBadgeRect(path, node) else null
+                resultTree.cursor = if (rect != null && rect.contains(e.point)) {
+                    Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                } else {
+                    Cursor.getDefaultCursor()
+                }
+            }
+        })
+
         resultTree.addMouseListener(object : MouseAdapter() {
             override fun mousePressed(e: MouseEvent) = maybeShowTreeContextMenu(e)
             override fun mouseReleased(e: MouseEvent) = maybeShowTreeContextMenu(e)
 
             override fun mouseClicked(e: MouseEvent) {
-                if (SwingUtilities.isLeftMouseButton(e) && e.clickCount == 2) {
+                if (!SwingUtilities.isLeftMouseButton(e)) return
+                if (e.clickCount == 1) {
+                    val path = resultTree.getPathForLocation(e.x, e.y) ?: return
+                    val node = path.lastPathComponent as? FieldTreeNode ?: return
+                    val badgeRect = computeCryptoBadgeRect(path, node)
+                    if (badgeRect != null && badgeRect.contains(e.point)) {
+                        e.consume()
+                        handleCryptoBadgeClick(node)
+                        return
+                    }
+                } else if (e.clickCount == 2) {
                     handleTreeDoubleClickCopyOverlay(e)
                 }
             }
@@ -355,7 +426,12 @@ class ResultViewerPanel(
         val relX = e.x - bounds.x
 
         val clickedKey = relX <= (keyWidth + 6)
-        val targetText = if (clickedKey) keyLabel else UiHelpers.bsonPureTextValue(bsonValue)
+        val decryptedPlain = (path.lastPathComponent as? FieldTreeNode)?.let { decryptedFields[decryptKeyFor(it)]?.plaintext }
+        val targetText = when {
+            clickedKey -> keyLabel
+            decryptedPlain != null -> decryptedPlain
+            else -> UiHelpers.bsonPureTextValue(bsonValue)
+        }
         val overlayX = if (clickedKey) bounds.x else bounds.x + keyWidth + colonWidth
 
         showCopyableTextOverlay(
@@ -559,6 +635,109 @@ class ResultViewerPanel(
         menu.show(invoker, x, y)
     }
 
+    private fun decryptKeyFor(node: FieldTreeNode): String = "${node.rootDocNode.docIndex}:${node.fieldPath}"
+
+    private fun computeCryptoBadgeRect(path: TreePath, node: FieldTreeNode): Rectangle? {
+        val strVal = (node.bsonValue as? BsonString)?.value ?: return null
+        val decrypted = decryptedFields[decryptKeyFor(node)]
+        val config = cryptoStore.getConfig(profile.profileName)
+        if (decrypted == null && !CryptoService.isEncryptedCandidate(strVal, config)) {
+            return null
+        }
+
+        val bounds = resultTree.getPathBounds(path) ?: return null
+        val plainFm = resultTree.getFontMetrics(resultTree.font)
+        val boldFm = resultTree.getFontMetrics(resultTree.font.deriveFont(Font.BOLD))
+        val italicFm = resultTree.getFontMetrics(resultTree.font.deriveFont(Font.ITALIC))
+
+        val prefixWidth = if (decrypted != null) {
+            boldFm.stringWidth(node.keyLabel) +
+                plainFm.stringWidth(": ") +
+                boldFm.stringWidth("\"${decrypted.plaintext}\"") +
+                italicFm.stringWidth("  [String]") +
+                boldFm.stringWidth("  ${decrypted.remainingSeconds}s  ")
+        } else {
+            boldFm.stringWidth(node.keyLabel) +
+                plainFm.stringWidth(": ") +
+                plainFm.stringWidth(UiHelpers.bsonDisplayValue(node.bsonValue)) +
+                italicFm.stringWidth("  [${UiHelpers.bsonTypeTag(node.bsonValue)}]") +
+                plainFm.stringWidth("  ")
+        }
+
+        val badgeText = if (decrypted != null) "[${I18n.t("crypto.btn.hide")}]" else "[${I18n.t("crypto.btn.decrypt")}]"
+        val badgeWidth = boldFm.stringWidth(badgeText) + 10
+        return Rectangle(bounds.x + prefixWidth - 4, bounds.y, badgeWidth, bounds.height)
+    }
+
+    private fun handleCryptoBadgeClick(node: FieldTreeNode) {
+        val key = decryptKeyFor(node)
+        // If currently revealed, immediately hide and wipe plaintext
+        if (decryptedFields.remove(key) != null) {
+            treeModel.nodeChanged(node)
+            if (decryptedFields.isEmpty()) decryptCountdownTimer.stop()
+            return
+        }
+
+        val cipherText = (node.bsonValue as? BsonString)?.value ?: return
+        var secretKey = cryptoStore.getSecretKey(profile.profileName)
+        if (secretKey.isBlank()) {
+            val dlg = DecryptConfigDialog(project, projectBasePath, cryptoStore, profile.profileName)
+            if (!dlg.showAndGet()) return
+            secretKey = cryptoStore.getSecretKey(profile.profileName)
+            if (secretKey.isBlank()) return
+        }
+
+        val config = cryptoStore.getConfig(profile.profileName)
+        try {
+            val plaintext = CryptoService.decrypt(cipherText, config, secretKey)
+            decryptedFields[key] = DecryptedEntry(
+                plaintext = plaintext,
+                remainingSeconds = config.clampedRevealSeconds(),
+                treeNode = node
+            )
+            treeModel.nodeChanged(node)
+            if (!decryptCountdownTimer.isRunning) {
+                decryptCountdownTimer.start()
+            }
+        } catch (t: Throwable) {
+            UiHelpers.notify(
+                project,
+                I18n.t("crypto.decryptFailed", t.message ?: t.javaClass.simpleName),
+                com.intellij.notification.NotificationType.WARNING
+            )
+        }
+    }
+
+    private fun onDecryptTimerTick() {
+        if (decryptedFields.isEmpty()) {
+            decryptCountdownTimer.stop()
+            return
+        }
+        val toRemove = mutableListOf<String>()
+        for ((k, entry) in decryptedFields) {
+            entry.remainingSeconds -= 1
+            if (entry.remainingSeconds <= 0) {
+                toRemove.add(k)
+            } else {
+                treeModel.nodeChanged(entry.treeNode)
+            }
+        }
+        for (k in toRemove) {
+            val removed = decryptedFields.remove(k)
+            if (removed != null) {
+                treeModel.nodeChanged(removed.treeNode)
+            }
+        }
+        if (decryptedFields.isEmpty()) {
+            decryptCountdownTimer.stop()
+        }
+    }
+
+    private fun clearAllDecryptedPlaintext() {
+        decryptCountdownTimer.stop()
+        decryptedFields.clear()
+    }
+
     private fun openDocumentEditDialog(
         docIndex: Int,
         targetBsonDoc: BsonDocument,
@@ -577,6 +756,8 @@ class ResultViewerPanel(
                 rawDocument = targetRawDoc,
                 isReadOnly = isReadOnly,
                 focusFieldPath = focusFieldPath,
+                projectBasePath = projectBasePath,
+                cryptoStore = cryptoStore,
                 onSavedInDb = { updatedDoc -> replaceDocumentInPlace(docIndex, updatedDoc) },
                 onDeletedInDb = { removeDocumentInPlace(docIndex) }
             )
@@ -688,6 +869,7 @@ class ResultViewerPanel(
         limit: Int = result.documents.size.coerceAtLeast(1),
         previewBanner: String? = null
     ) {
+        clearAllDecryptedPlaintext()
         this.currentDocs = result.documents.toMutableList()
         this.currentResult = result
         this.currentSkip = skip
@@ -896,6 +1078,7 @@ class ResultViewerPanel(
     }
 
     override fun dispose() {
+        clearAllDecryptedPlaintext()
         activeCopyOverlayPopup?.let { if (!it.isDisposed) it.cancel() }
         if (!rawJsonEditor.isDisposed) {
             EditorFactory.getInstance().releaseEditor(rawJsonEditor)

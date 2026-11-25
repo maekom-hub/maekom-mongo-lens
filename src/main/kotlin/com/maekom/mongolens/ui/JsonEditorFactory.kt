@@ -35,15 +35,17 @@ class MongoJsonEditor(
     private val projectRef: Project,
     initialText: String = "{}",
     private val multiLine: Boolean = false,
+    private val autoGrow: Boolean = false,
     private val completionMode: CompletionMode = CompletionMode.GENERIC,
     private val fieldSuggestionsSupplier: () -> List<String> = { emptyList() },
-    private val onExecuteShortcut: (() -> Unit)? = null
+    private val onExecuteShortcut: (() -> Unit)? = null,
+    private val onAutoHeightChanged: (() -> Unit)? = null
 ) : EditorTextField(
     EditorFactory.getInstance().createDocument(com.intellij.openapi.util.text.StringUtil.convertLineSeparators(initialText)),
     projectRef,
     resolveJsonFileType(),
     false,
-    !multiLine
+    !(multiLine || autoGrow)
 ) {
     enum class CompletionMode {
         FILTER,
@@ -77,24 +79,32 @@ class MongoJsonEditor(
     }
 
     private var suppressAutoPopup = false
+    private var lastAutoHeightPx = 28
 
     init {
-        if (multiLine) {
+        if (multiLine || autoGrow) {
             setOneLineMode(false)
+        }
+        if (autoGrow) {
+            setFixedHeight(28)
         }
     }
 
     override fun createEditor(): EditorEx {
         val editor = super.createEditor()
         editor.settings.apply {
-            isLineNumbersShown = multiLine
-            isFoldingOutlineShown = multiLine
-            isAutoCodeFoldingEnabled = multiLine
+            isLineNumbersShown = multiLine && !autoGrow
+            isFoldingOutlineShown = multiLine && !autoGrow
+            isAutoCodeFoldingEnabled = multiLine && !autoGrow
             isUseSoftWraps = true
             isRightMarginShown = false
             isHighlightSelectionOccurrences = true
-            additionalLinesCount = if (multiLine) 1 else 0
-            additionalColumnsCount = 2
+            additionalLinesCount = if (multiLine && !autoGrow) 1 else 0
+            additionalColumnsCount = if (autoGrow) 0 else 2
+        }
+        if (autoGrow) {
+            editor.setVerticalScrollbarVisible(false)
+            updateAutoGrowHeight(editor)
         }
 
         suggestionList.addMouseListener(object : MouseAdapter() {
@@ -188,6 +198,13 @@ class MongoJsonEditor(
 
         editor.document.addDocumentListener(object : DocumentListener {
             override fun documentChanged(event: DocumentEvent) {
+                if (autoGrow) {
+                    ApplicationManager.getApplication().invokeLater {
+                        if (!editor.isDisposed) {
+                            updateAutoGrowHeight(editor)
+                        }
+                    }
+                }
                 if (suppressAutoPopup || !editor.contentComponent.isFocusOwner) return
                 ApplicationManager.getApplication().invokeLater {
                     if (!editor.isDisposed && editor.contentComponent.isFocusOwner) {
@@ -198,6 +215,28 @@ class MongoJsonEditor(
         })
 
         return editor
+    }
+
+    private fun updateAutoGrowHeight(editor: EditorEx) {
+        val lines = editor.document.lineCount.coerceAtLeast(1)
+        val clampedLines = lines.coerceAtMost(6)
+        val targetHeight = if (clampedLines <= 1) 28 else (28 + (clampedLines - 1) * 22).coerceAtMost(140)
+        val needScrollbar = lines >= 7
+        editor.setVerticalScrollbarVisible(needScrollbar)
+
+        if (targetHeight != lastAutoHeightPx) {
+            lastAutoHeightPx = targetHeight
+            setFixedHeight(targetHeight)
+            onAutoHeightChanged?.invoke()
+        }
+    }
+
+    private fun setFixedHeight(heightPx: Int) {
+        preferredSize = Dimension(preferredSize.width.coerceAtLeast(140), heightPx)
+        minimumSize = Dimension(100, heightPx)
+        maximumSize = Dimension(Int.MAX_VALUE, heightPx)
+        revalidate()
+        repaint()
     }
 
     private fun autoClosePair(editor: EditorEx, closingChar: Char) {
@@ -325,6 +364,34 @@ class MongoJsonEditor(
         }
 
         val hasColonAfter = text.substring(replaceEnd).trimStart().startsWith(":")
+        val trimmedAll = text.trim()
+        val needsOuterBraces = (completionMode == CompletionMode.FILTER || completionMode == CompletionMode.SORT) &&
+            !trimmedAll.startsWith("{")
+
+        if (needsOuterBraces) {
+            val (wrapped, caretPos, selStart, selEnd) = if (completionMode == CompletionMode.SORT && selected.kind == "field") {
+                val ins = "{ \"${selected.text}\": -1 }"
+                val minusOneStart = ins.indexOf("-1")
+                Quad(ins, minusOneStart + 2, minusOneStart, minusOneStart + 2)
+            } else {
+                val ins = "{ \"${selected.text}\":  }"
+                val caretIdx = ins.length - 2 // right after ": " before " }"
+                Quad(ins, caretIdx, -1, -1)
+            }
+            suppressAutoPopup = true
+            try {
+                WriteCommandAction.runWriteCommandAction(projectRef) {
+                    doc.replaceString(0, doc.textLength, wrapped)
+                    editor.caretModel.moveToOffset(caretPos)
+                    if (selStart >= 0 && selEnd > selStart) {
+                        editor.selectionModel.setSelection(selStart, selEnd)
+                    }
+                }
+            } finally {
+                suppressAutoPopup = false
+            }
+            return
+        }
 
         val (insertion, caretDelta, selectStartDelta, selectEndDelta) = when {
             hasColonAfter -> Quad("\"${selected.text}\"", selected.text.length + 2, -1, -1)
