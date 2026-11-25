@@ -39,7 +39,7 @@ class MongoJsonEditor(
     private val fieldSuggestionsSupplier: () -> List<String> = { emptyList() },
     private val onExecuteShortcut: (() -> Unit)? = null
 ) : EditorTextField(
-    EditorFactory.getInstance().createDocument(initialText),
+    EditorFactory.getInstance().createDocument(com.intellij.openapi.util.text.StringUtil.convertLineSeparators(initialText)),
     projectRef,
     resolveJsonFileType(),
     false,

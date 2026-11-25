@@ -227,12 +227,31 @@ object UiHelpers {
     }
 
     fun bsonIdRawText(idValue: BsonValue): String {
-        return when (idValue) {
-            is BsonObjectId -> idValue.value.toHexString()
-            is BsonString -> idValue.value
-            is BsonInt32 -> idValue.value.toString()
-            is BsonInt64 -> idValue.value.toString()
-            else -> idValue.toString()
+        return try {
+            when (idValue) {
+                is BsonObjectId -> idValue.value.toHexString()
+                is BsonString -> idValue.value
+                is BsonInt32 -> idValue.value.toString()
+                is BsonInt64 -> idValue.value.toString()
+                is BsonDouble -> idValue.value.toString()
+                is BsonDecimal128 -> idValue.value.toString()
+                is BsonDateTime -> formatIsoUtc(idValue.value)
+                is BsonBinary -> {
+                    val subType = idValue.type
+                    if ((subType == org.bson.BsonBinarySubType.UUID_STANDARD.value ||
+                            subType == org.bson.BsonBinarySubType.UUID_LEGACY.value) &&
+                        idValue.data.size == 16
+                    ) {
+                        idValue.asUuid().toString()
+                    } else {
+                        "Binary(${idValue.data.size}B)"
+                    }
+                }
+                is BsonDocument -> com.maekom.mongolens.mongo.MongoShellNormalizer.formatCompact(idValue)
+                else -> idValue.toString()
+            }
+        } catch (_: Throwable) {
+            idValue.toString()
         }
     }
 }

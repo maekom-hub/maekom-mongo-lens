@@ -9,6 +9,7 @@ import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.ValidationInfo
+import com.intellij.openapi.util.text.StringUtil
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.JBTextField
@@ -20,6 +21,8 @@ import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import com.maekom.mongolens.mongo.MongoShellNormalizer
 import org.bson.BsonArray
+import org.bson.BsonBinary
+import org.bson.BsonBinarySubType
 import org.bson.BsonBoolean
 import org.bson.BsonDateTime
 import org.bson.BsonDecimal128
@@ -31,6 +34,7 @@ import org.bson.BsonNull
 import org.bson.BsonObjectId
 import org.bson.BsonString
 import org.bson.BsonValue
+import org.bson.Document
 import org.bson.types.Decimal128
 import org.bson.types.ObjectId
 import java.awt.BorderLayout
@@ -45,6 +49,7 @@ import java.awt.event.MouseEvent
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneOffset
+import java.util.UUID
 import javax.swing.BorderFactory
 import javax.swing.DefaultCellEditor
 import javax.swing.JButton
@@ -66,8 +71,10 @@ class DocumentEditDialog(
     private val database: String,
     private val collection: String,
     private val originalDoc: BsonDocument,
+    @Suppress("unused")
+    private val rawDocument: Document? = null,
     private val isReadOnly: Boolean,
-    private val initialFocusPath: List<String> = emptyList(),
+    private val focusFieldPath: String? = null,
     private val onSavedInDb: (BsonDocument) -> Unit,
     private val onDeletedInDb: () -> Unit
 ) : DialogWrapper(project) {
@@ -81,6 +88,7 @@ class DocumentEditDialog(
         BOOLEAN("Boolean"),
         DATE("Date"),
         OBJECT_ID("ObjectId"),
+        UUID_TYPE("UUID"),
         ARRAY("Array"),
         OBJECT("Object"),
         NULL("Null");
@@ -99,6 +107,16 @@ class DocumentEditDialog(
                 is BsonBoolean -> BOOLEAN
                 is BsonDateTime -> DATE
                 is BsonObjectId -> OBJECT_ID
+                is BsonBinary -> {
+                    val sub = v.type
+                    if ((sub == BsonBinarySubType.UUID_STANDARD.value || sub == BsonBinarySubType.UUID_LEGACY.value) &&
+                        v.data.size == 16
+                    ) {
+                        UUID_TYPE
+                    } else {
+                        STRING
+                    }
+                }
                 is BsonArray -> ARRAY
                 is BsonDocument -> OBJECT
                 is BsonNull -> NULL
@@ -113,7 +131,9 @@ class DocumentEditDialog(
         var valueText: String,
         var parent: EditableFieldNode? = null,
         var expanded: Boolean = true,
-        val children: MutableList<EditableFieldNode> = mutableListOf()
+        val children: MutableList<EditableFieldNode> = mutableListOf(),
+        var originalBsonValue: BsonValue? = null,
+        var modified: Boolean = false
     ) {
         fun depth(): Int {
             var d = 0
@@ -180,9 +200,10 @@ class DocumentEditDialog(
         isEnabled = !isReadOnly
     }
 
+    // Normalize line separators strictly to '\n' so IntelliJ DocumentImpl never throws AssertionError
     private val rawJsonEditor = MongoJsonEditor(
         projectRef = project,
-        initialText = MongoShellNormalizer.formatPrettyExtended(originalDoc),
+        initialText = safePrettyJson(originalDoc),
         multiLine = true
     )
 
@@ -209,6 +230,15 @@ class DocumentEditDialog(
         focusInitialPath()
     }
 
+    private fun safePrettyJson(doc: BsonDocument): String {
+        val raw = try {
+            MongoShellNormalizer.formatPrettyExtended(doc)
+        } catch (_: Throwable) {
+            doc.toJson()
+        }
+        return StringUtil.convertLineSeparators(raw)
+    }
+
     private fun loadBsonIntoTree(doc: BsonDocument) {
         rootNode.children.clear()
         for ((k, v) in doc) {
@@ -228,11 +258,20 @@ class DocumentEditDialog(
             is BsonBoolean -> value.value.toString()
             is BsonDateTime -> UiHelpers.formatIsoUtc(value.value)
             is BsonObjectId -> value.value.toHexString()
+            is BsonBinary -> UiHelpers.bsonIdRawText(value)
             is BsonNull -> "null"
             is BsonDocument, is BsonArray -> ""
             else -> UiHelpers.bsonPureTextValue(value)
         }
-        val node = EditableFieldNode(key = key, type = type, valueText = text, parent = parent, expanded = true)
+        val node = EditableFieldNode(
+            key = key,
+            type = type,
+            valueText = text,
+            parent = parent,
+            expanded = true,
+            originalBsonValue = value,
+            modified = false
+        )
         when (value) {
             is BsonDocument -> {
                 for ((ck, cv) in value) {
@@ -259,7 +298,6 @@ class DocumentEditDialog(
         cm.getColumn(3).maxWidth = 38
         cm.getColumn(3).minWidth = 32
 
-        // Column 0: Indented Key renderer with expand/collapse chevron
         cm.getColumn(0).cellRenderer = object : DefaultTableCellRenderer() {
             override fun getTableCellRendererComponent(
                 table: JTable,
@@ -292,7 +330,6 @@ class DocumentEditDialog(
             }
         }
 
-        // Column 1: BSON Type dropdown editor & colored badge renderer
         val typeCombo = JComboBox(BsonFieldType.values())
         cm.getColumn(1).cellEditor = DefaultCellEditor(typeCombo)
         cm.getColumn(1).cellRenderer = object : DefaultTableCellRenderer() {
@@ -308,7 +345,7 @@ class DocumentEditDialog(
                 val node = treeTableModel.getNodeAt(row)
                 if (node != null && !isSelected) {
                     lbl.foreground = when (node.type) {
-                        BsonFieldType.OBJECT_ID -> UiHelpers.BSON_OID_COLOR
+                        BsonFieldType.OBJECT_ID, BsonFieldType.UUID_TYPE -> UiHelpers.BSON_OID_COLOR
                         BsonFieldType.DATE -> UiHelpers.BSON_DATE_COLOR
                         BsonFieldType.INT32, BsonFieldType.INT64, BsonFieldType.DOUBLE, BsonFieldType.DECIMAL128 -> UiHelpers.BSON_NUM_COLOR
                         BsonFieldType.STRING -> UiHelpers.BSON_STR_COLOR
@@ -321,7 +358,6 @@ class DocumentEditDialog(
             }
         }
 
-        // Column 2: Value renderer
         cm.getColumn(2).cellRenderer = object : DefaultTableCellRenderer() {
             override fun getTableCellRendererComponent(
                 table: JTable,
@@ -337,7 +373,7 @@ class DocumentEditDialog(
                     lbl.foreground = when {
                         node.type.isContainer() || node.type == BsonFieldType.NULL -> UiHelpers.BSON_NULL_COLOR
                         node.type == BsonFieldType.STRING -> UiHelpers.BSON_STR_COLOR
-                        node.type == BsonFieldType.OBJECT_ID -> UiHelpers.BSON_OID_COLOR
+                        node.type == BsonFieldType.OBJECT_ID || node.type == BsonFieldType.UUID_TYPE -> UiHelpers.BSON_OID_COLOR
                         node.type == BsonFieldType.DATE -> UiHelpers.BSON_DATE_COLOR
                         node.type == BsonFieldType.BOOLEAN -> UiHelpers.BSON_BOOL_COLOR
                         else -> UiHelpers.BSON_NUM_COLOR
@@ -347,7 +383,6 @@ class DocumentEditDialog(
             }
         }
 
-        // Column 3: [✕] Delete row button renderer
         cm.getColumn(3).cellRenderer = object : DefaultTableCellRenderer() {
             override fun getTableCellRendererComponent(
                 table: JTable,
@@ -367,7 +402,6 @@ class DocumentEditDialog(
             }
         }
 
-        // Handle clicks on chevron (expand/collapse) and [✕] delete column
         treeTable.addMouseListener(object : MouseAdapter() {
             override fun mousePressed(e: MouseEvent) {
                 val row = treeTable.rowAtPoint(e.point)
@@ -375,14 +409,12 @@ class DocumentEditDialog(
                 if (row < 0 || col < 0) return
                 val node = treeTableModel.getNodeAt(row) ?: return
 
-                // Column 3: delete individual key line immediately
                 if (col == 3 && !isReadOnly && !node.isRootId(rootNode)) {
                     stopCellEditing()
                     deleteNode(node)
                     return
                 }
 
-                // Column 0: toggle expand/collapse when clicking chevron area on Object/Array
                 if (col == 0 && node.type.isContainer()) {
                     val cellRect = treeTable.getCellRect(row, col, false)
                     val chevronEnd = cellRect.x + node.depth() * 16 + 24
@@ -390,7 +422,9 @@ class DocumentEditDialog(
                         stopCellEditing()
                         node.expanded = !node.expanded
                         treeTableModel.rebuildVisibleRows()
-                        treeTable.setRowSelectionInterval(row, row)
+                        if (row < treeTable.rowCount) {
+                            treeTable.setRowSelectionInterval(row, row)
+                        }
                     }
                 }
             }
@@ -418,7 +452,6 @@ class DocumentEditDialog(
             border = JBUI.Borders.empty(4)
         }
 
-        // Top meta header: db.collection + _id + [Copy _id] | [Structured] [Raw JSON]
         val idDisplay = originalId?.let { UiHelpers.bsonIdRawText(it) } ?: "(no _id)"
         val copyIdMiniBtn = JButton(I18n.t("edit.dialog.copyId"), AllIcons.Actions.Copy).apply {
             margin = JBUI.insets(1, 6)
@@ -461,7 +494,6 @@ class DocumentEditDialog(
             add(bannerStack, BorderLayout.SOUTH)
         }
 
-        // Mode 1: Structured Key-Value panel
         val structuredPanel = JPanel(BorderLayout(0, 4)).apply {
             add(JBScrollPane(treeTable), BorderLayout.CENTER)
             val footerBar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2)).apply {
@@ -470,7 +502,6 @@ class DocumentEditDialog(
             add(footerBar, BorderLayout.SOUTH)
         }
 
-        // Mode 2: Raw JSON panel
         val copyFullJsonBtn = JButton(I18n.t("edit.dialog.copyFullJson"), AllIcons.Actions.Copy).apply {
             margin = JBUI.insets(2, 8)
             addActionListener {
@@ -544,7 +575,8 @@ class DocumentEditDialog(
                     type = newType,
                     valueText = dlg.fieldValue(),
                     parent = targetParent,
-                    expanded = true
+                    expanded = true,
+                    modified = true
                 )
                 targetParent.expanded = true
                 targetParent.children.add(newNode)
@@ -572,7 +604,7 @@ class DocumentEditDialog(
         stopCellEditing()
         try {
             val rebuilt = rebuildBsonDocumentFromTree()
-            rawJsonEditor.text = MongoShellNormalizer.formatPrettyExtended(rebuilt)
+            rawJsonEditor.text = safePrettyJson(rebuilt)
             activeMode = "RAW"
             structuredModeBtn.isSelected = false
             rawJsonModeBtn.isSelected = true
@@ -606,10 +638,12 @@ class DocumentEditDialog(
     }
 
     private fun focusInitialPath() {
-        if (initialFocusPath.isEmpty()) return
+        val rawPath = focusFieldPath?.trim().orEmpty()
+        if (rawPath.isEmpty()) return
+        val segments = rawPath.split(".").filter { it.isNotEmpty() }
         var current = rootNode
         var matched: EditableFieldNode? = null
-        for (segment in initialFocusPath) {
+        for (segment in segments) {
             val next = current.children.firstOrNull { it.key == segment } ?: break
             current.expanded = true
             current = next
@@ -642,9 +676,15 @@ class DocumentEditDialog(
     }
 
     private fun toBsonValue(node: EditableFieldNode): BsonValue {
+        // Always preserve original _id with its exact BSON type (ObjectId, String, Long, Int, UUID, etc.)
         if (node.isRootId(rootNode) && originalId != null) {
             return originalId
         }
+        // Preserve exotic unmodified primitive types (e.g. Binary, Regex, Timestamp) losslessly
+        if (!node.modified && !node.type.isContainer() && node.originalBsonValue != null) {
+            return node.originalBsonValue!!
+        }
+
         val raw = node.valueText
         return try {
             when (node.type) {
@@ -662,6 +702,7 @@ class DocumentEditDialog(
                 }
                 BsonFieldType.DATE -> BsonDateTime(parseEpochMillis(raw.trim()))
                 BsonFieldType.OBJECT_ID -> BsonObjectId(ObjectId(raw.trim()))
+                BsonFieldType.UUID_TYPE -> BsonBinary(UUID.fromString(raw.trim()))
                 BsonFieldType.NULL -> BsonNull.VALUE
                 BsonFieldType.OBJECT -> {
                     val obj = BsonDocument()
@@ -731,8 +772,8 @@ class DocumentEditDialog(
                     }
                 } catch (t: Throwable) {
                     ApplicationManager.getApplication().invokeLater {
-                        saveBtn.isEnabled = !isReadOnly
-                        deleteDocBtn.isEnabled = !isReadOnly && originalId != null
+                        saveBtn.isEnabled = true
+                        deleteDocBtn.isEnabled = true
                         showErrorBanner(t.message ?: t.javaClass.simpleName)
                     }
                 }
@@ -766,8 +807,8 @@ class DocumentEditDialog(
                     }
                 } catch (t: Throwable) {
                     ApplicationManager.getApplication().invokeLater {
-                        saveBtn.isEnabled = !isReadOnly
-                        deleteDocBtn.isEnabled = !isReadOnly && originalId != null
+                        saveBtn.isEnabled = true
+                        deleteDocBtn.isEnabled = true
                         showErrorBanner(t.message ?: t.javaClass.simpleName)
                     }
                 }
@@ -857,6 +898,7 @@ class DocumentEditDialog(
                     val newType = aValue as? BsonFieldType ?: return
                     if (newType != node.type) {
                         node.type = newType
+                        node.modified = true
                         when (newType) {
                             BsonFieldType.NULL -> {
                                 node.children.clear()
@@ -882,6 +924,14 @@ class DocumentEditDialog(
                                 node.children.clear()
                                 if (!ObjectId.isValid(node.valueText)) node.valueText = ObjectId().toHexString()
                             }
+                            BsonFieldType.UUID_TYPE -> {
+                                node.children.clear()
+                                try {
+                                    UUID.fromString(node.valueText.trim())
+                                } catch (_: Throwable) {
+                                    node.valueText = UUID.randomUUID().toString()
+                                }
+                            }
                             BsonFieldType.OBJECT, BsonFieldType.ARRAY -> {
                                 node.valueText = ""
                                 node.expanded = true
@@ -895,6 +945,7 @@ class DocumentEditDialog(
                 }
                 2 -> {
                     node.valueText = aValue?.toString() ?: ""
+                    node.modified = true
                     fireTableCellUpdated(rowIndex, 2)
                 }
             }
@@ -925,6 +976,7 @@ class DocumentEditDialog(
                     BsonFieldType.DOUBLE, BsonFieldType.DECIMAL128 -> if (valueField.text.isBlank()) valueField.text = "0.0"
                     BsonFieldType.DATE -> if (valueField.text.isBlank()) valueField.text = UiHelpers.formatIsoUtc(System.currentTimeMillis())
                     BsonFieldType.OBJECT_ID -> if (valueField.text.isBlank()) valueField.text = ObjectId().toHexString()
+                    BsonFieldType.UUID_TYPE -> if (valueField.text.isBlank()) valueField.text = UUID.randomUUID().toString()
                     BsonFieldType.OBJECT, BsonFieldType.ARRAY -> valueField.text = ""
                     BsonFieldType.STRING -> Unit
                 }

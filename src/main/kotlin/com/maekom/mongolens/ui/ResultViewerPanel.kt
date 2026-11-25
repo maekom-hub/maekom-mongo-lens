@@ -5,8 +5,10 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.editor.EditorFactory
 import com.intellij.openapi.editor.ex.EditorEx
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.popup.JBPopup
 import com.intellij.openapi.ui.popup.JBPopupFactory
+import com.intellij.openapi.util.text.StringUtil
 import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.awt.RelativePoint
@@ -25,6 +27,7 @@ import org.bson.BsonArray
 import org.bson.BsonDateTime
 import org.bson.BsonDocument
 import org.bson.BsonValue
+import org.bson.Document
 import java.awt.BorderLayout
 import java.awt.CardLayout
 import java.awt.Component
@@ -73,12 +76,27 @@ class ResultViewerPanel(
     private val onReadOnlyChanged: () -> Unit = {}
 ) : JPanel(BorderLayout()), Disposable {
 
-    private data class BsonTreeNodeData(
+    /**
+     * Explicit root document tree node carrying the original org.bson.Document, BsonDocument,
+     * and result list index directly alongside its display label.
+     */
+    class DocTreeNode(
+        var displayLabel: String,
+        var bsonDocument: BsonDocument,
+        var rawDocument: Document,
+        var docIndex: Int
+    ) : DefaultMutableTreeNode(displayLabel)
+
+    /**
+     * Explicit nested key/value tree node carrying a direct reference to its owning DocTreeNode
+     * and its dot-notation fieldPath (e.g. "status", "address.city").
+     */
+    class FieldTreeNode(
+        val rootDocNode: DocTreeNode,
         val keyLabel: String,
-        val value: BsonValue,
-        var rootDocIndex: Int,
-        val isRootDoc: Boolean = false
-    )
+        val bsonValue: BsonValue,
+        val fieldPath: String
+    ) : DefaultMutableTreeNode(keyLabel)
 
     private var currentDocs: MutableList<BsonDocument> = mutableListOf()
     private var currentResult: QueryExecutionResult? = null
@@ -86,7 +104,6 @@ class ResultViewerPanel(
     private var currentLimit: Int = 50
     private var previewBannerText: String? = null
     private var activeCopyOverlayPopup: JBPopup? = null
-    private var treeAllExpanded: Boolean = true
 
     private val summaryLabel = JBLabel(" ")
     private val indexBadge = UiHelpers.createBadgeLabel("", UiHelpers.COLOR_GREEN_BG, UiHelpers.COLOR_GREEN_FG).apply {
@@ -96,7 +113,10 @@ class ResultViewerPanel(
         isVisible = false
     }
 
-    private val expandCollapseBtn = JButton(I18n.t("result.tree.collapseAll")).apply {
+    private val expandAllBtn = JButton(I18n.t("result.tree.expandAll")).apply {
+        margin = JBUI.insets(1, 6)
+    }
+    private val collapseAllBtn = JButton(I18n.t("result.tree.collapseAll")).apply {
         margin = JBUI.insets(1, 6)
     }
 
@@ -117,9 +137,8 @@ class ResultViewerPanel(
         override fun getToolTipText(event: MouseEvent?): String? {
             if (event == null) return null
             val path = getPathForLocation(event.x, event.y) ?: return null
-            val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return null
-            val data = node.userObject as? BsonTreeNodeData ?: return null
-            val dt = data.value as? BsonDateTime ?: return null
+            val node = path.lastPathComponent as? FieldTreeNode ?: return null
+            val dt = node.bsonValue as? BsonDateTime ?: return null
             return I18n.t("result.date.kstTooltip", UiHelpers.formatKst(dt.value))
         }
     }
@@ -178,9 +197,6 @@ class ResultViewerPanel(
         I18n.addListener(this) { refreshTexts() }
     }
 
-    /**
-     * Single compact header row only — all external document action buttons removed to maximize result height.
-     */
     private fun buildHeaderBar() {
         val headerBar = JPanel(BorderLayout()).apply {
             border = BorderFactory.createMatteBorder(1, 0, 1, 0, JBUI.CurrentTheme.ToolWindow.borderColor())
@@ -191,16 +207,12 @@ class ResultViewerPanel(
             add(summaryLabel)
             add(indexBadge)
             add(previewBannerLabel)
-            add(expandCollapseBtn)
+            add(expandAllBtn)
+            add(collapseAllBtn)
         }
 
-        expandCollapseBtn.addActionListener {
-            if (treeAllExpanded) {
-                collapseAllNodes()
-            } else {
-                expandAllNodes(maxDepth = Int.MAX_VALUE)
-            }
-        }
+        expandAllBtn.addActionListener { expandAllRecursive() }
+        collapseAllBtn.addActionListener { collapseAllDocumentRoots() }
 
         val rightBar = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 2)).apply {
             if (onPrevPage != null && onNextPage != null) {
@@ -228,7 +240,6 @@ class ResultViewerPanel(
     private fun buildTreeView() {
         resultTree.isRootVisible = false
         resultTree.showsRootHandles = true
-        // Prevent double-click from collapsing/expanding nodes; handle-only expand/collapse
         resultTree.toggleClickCount = 0
         ToolTipManager.sharedInstance().registerComponent(resultTree)
 
@@ -242,25 +253,36 @@ class ResultViewerPanel(
                 row: Int,
                 hasFocus: Boolean
             ) {
-                val node = value as? DefaultMutableTreeNode ?: return
-                val data = node.userObject as? BsonTreeNodeData
-                if (data == null) {
-                    append(node.userObject?.toString() ?: "", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                    return
+                when (value) {
+                    is DocTreeNode -> {
+                        append(value.displayLabel, SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)
+                        append(": ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                        append(
+                            UiHelpers.bsonDisplayValue(value.bsonDocument),
+                            SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, UiHelpers.BSON_STRUCT_COLOR)
+                        )
+                        append(
+                            "  [${UiHelpers.bsonTypeTag(value.bsonDocument)}]",
+                            SimpleTextAttributes(SimpleTextAttributes.STYLE_ITALIC, UiHelpers.BSON_NULL_COLOR)
+                        )
+                    }
+                    is FieldTreeNode -> {
+                        append(value.keyLabel, SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)
+                        append(": ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                        val valColor = UiHelpers.bsonTypeColor(value.bsonValue)
+                        append(
+                            UiHelpers.bsonDisplayValue(value.bsonValue),
+                            SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, valColor)
+                        )
+                        append(
+                            "  [${UiHelpers.bsonTypeTag(value.bsonValue)}]",
+                            SimpleTextAttributes(SimpleTextAttributes.STYLE_ITALIC, UiHelpers.BSON_NULL_COLOR)
+                        )
+                    }
+                    is DefaultMutableTreeNode -> {
+                        append(value.userObject?.toString() ?: "", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                    }
                 }
-
-                append(data.keyLabel, SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)
-                append(": ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-
-                val valColor = UiHelpers.bsonTypeColor(data.value)
-                append(
-                    UiHelpers.bsonDisplayValue(data.value),
-                    SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, valColor)
-                )
-                append(
-                    "  [${UiHelpers.bsonTypeTag(data.value)}]",
-                    SimpleTextAttributes(SimpleTextAttributes.STYLE_ITALIC, UiHelpers.BSON_NULL_COLOR)
-                )
             }
         }
 
@@ -269,7 +291,6 @@ class ResultViewerPanel(
             override fun mouseReleased(e: MouseEvent) = maybeShowTreeContextMenu(e)
 
             override fun mouseClicked(e: MouseEvent) {
-                // Left double-click stays dedicated to inline key/value drag-select copy overlay
                 if (SwingUtilities.isLeftMouseButton(e) && e.clickCount == 2) {
                     handleTreeDoubleClickCopyOverlay(e)
                 }
@@ -277,61 +298,64 @@ class ResultViewerPanel(
 
             private fun maybeShowTreeContextMenu(e: MouseEvent) {
                 if (!e.isPopupTrigger) return
-                val path = resultTree.getPathForLocation(e.x, e.y) ?: return
-                resultTree.selectionPath = path
-                val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return
-                val data = node.userObject as? BsonTreeNodeData ?: return
-
-                val focusPath = extractFieldPath(path)
-                val copyText = if (data.isRootDoc) {
-                    MongoShellNormalizer.formatPrettyExtended(data.value.asDocument())
-                } else {
-                    "${data.keyLabel}: ${UiHelpers.bsonPureTextValue(data.value)}"
+                // Resolve row even when right-clicking blank space to the right of a tree label
+                val exactPath = resultTree.getPathForLocation(e.x, e.y)
+                val resolvedPath = exactPath ?: run {
+                    val closest = resultTree.getClosestPathForLocation(e.x, e.y) ?: return
+                    val bounds = resultTree.getPathBounds(closest) ?: return
+                    if (e.y in bounds.y..(bounds.y + bounds.height)) closest else return
                 }
+
+                resultTree.selectionPath = resolvedPath
+                val clickedNode = resolvedPath.lastPathComponent
+
+                val (targetDocNode, focusFieldPath, copyText) = when (clickedNode) {
+                    is DocTreeNode -> Triple(
+                        clickedNode,
+                        null,
+                        MongoShellNormalizer.formatPrettyExtended(clickedNode.bsonDocument)
+                    )
+                    is FieldTreeNode -> Triple(
+                        clickedNode.rootDocNode,
+                        clickedNode.fieldPath,
+                        "${clickedNode.keyLabel}: ${UiHelpers.bsonPureTextValue(clickedNode.bsonValue)}"
+                    )
+                    else -> return
+                }
+
                 showUnifiedContextMenu(
                     invoker = resultTree,
                     x = e.x,
                     y = e.y,
-                    docIndex = data.rootDocIndex,
-                    focusPath = focusPath,
+                    docIndex = targetDocNode.docIndex,
+                    targetBsonDoc = targetDocNode.bsonDocument,
+                    targetRawDoc = targetDocNode.rawDocument,
+                    focusFieldPath = focusFieldPath,
                     copyKeyValueText = copyText
                 )
             }
         })
     }
 
-    private fun extractFieldPath(path: TreePath): List<String> {
-        val segments = mutableListOf<String>()
-        for (comp in path.path) {
-            val node = comp as? DefaultMutableTreeNode ?: continue
-            val data = node.userObject as? BsonTreeNodeData ?: continue
-            if (!data.isRootDoc) {
-                segments.add(data.keyLabel)
-            }
-        }
-        return segments
-    }
-
     private fun handleTreeDoubleClickCopyOverlay(e: MouseEvent) {
         val path = resultTree.getPathForLocation(e.x, e.y) ?: return
-        val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return
-        val data = node.userObject as? BsonTreeNodeData ?: return
         val bounds = resultTree.getPathBounds(path) ?: return
+        val (keyLabel, bsonValue) = when (val node = path.lastPathComponent) {
+            is DocTreeNode -> node.displayLabel to node.bsonDocument
+            is FieldTreeNode -> node.keyLabel to node.bsonValue
+            else -> return
+        }
 
         val boldFont = resultTree.font.deriveFont(Font.BOLD)
         val fm = resultTree.getFontMetrics(boldFont)
-        val keyWidth = fm.stringWidth(data.keyLabel)
+        val keyWidth = fm.stringWidth(keyLabel)
         val colonWidth = fm.stringWidth(": ")
         val relX = e.x - bounds.x
 
         val clickedKey = relX <= (keyWidth + 6)
-        val targetText = if (clickedKey) {
-            data.keyLabel
-        } else {
-            UiHelpers.bsonPureTextValue(data.value)
-        }
-
+        val targetText = if (clickedKey) keyLabel else UiHelpers.bsonPureTextValue(bsonValue)
         val overlayX = if (clickedKey) bounds.x else bounds.x + keyWidth + colonWidth
+
         showCopyableTextOverlay(
             parent = resultTree,
             point = Point(overlayX, bounds.y),
@@ -408,7 +432,6 @@ class ResultViewerPanel(
         resultTable.rowHeight = 24
         ToolTipManager.sharedInstance().registerComponent(resultTable)
 
-        // Pure text/plain TransferHandler (no HTML pollution, no outer quotes)
         resultTable.transferHandler = object : TransferHandler() {
             override fun getSourceActions(c: JComponent?): Int = COPY
 
@@ -486,40 +509,41 @@ class ResultViewerPanel(
                 val modelCol = resultTable.convertColumnIndexToModel(col)
                 val colName = tableModel.getColumnName(modelCol)
                 val pureVal = tableModel.getPureCopyValueAt(modelRow, modelCol)
+                val bsonDoc = currentDocs.getOrNull(modelRow) ?: return
+                val rawDoc = toRawDocument(bsonDoc)
 
                 showUnifiedContextMenu(
                     invoker = resultTable,
                     x = e.x,
                     y = e.y,
                     docIndex = modelRow,
-                    focusPath = listOf(colName),
+                    targetBsonDoc = bsonDoc,
+                    targetRawDoc = rawDoc,
+                    focusFieldPath = colName,
                     copyKeyValueText = pureVal
                 )
             }
         })
     }
 
-    /**
-     * Unified right-click context menu for Tree View & Table View:
-     * 1. Edit Data... (opens unified DocumentEditDialog)
-     * 2. Separator
-     * 3. Copy Key / Value
-     */
     private fun showUnifiedContextMenu(
         invoker: Component,
         x: Int,
         y: Int,
         docIndex: Int,
-        focusPath: List<String>,
+        targetBsonDoc: BsonDocument,
+        targetRawDoc: Document,
+        focusFieldPath: String?,
         copyKeyValueText: String
     ) {
-        val doc = currentDocs.getOrNull(docIndex) ?: return
         val menu = JPopupMenu()
 
         menu.add(JMenuItem(I18n.t("result.doc.editData")).apply {
             font = font.deriveFont(Font.BOLD)
             addActionListener {
-                openDocumentEditDialog(docIndex, doc, focusPath)
+                ApplicationManager.getApplication().invokeLater {
+                    openDocumentEditDialog(docIndex, targetBsonDoc, targetRawDoc, focusFieldPath)
+                }
             }
         })
         menu.addSeparator()
@@ -533,26 +557,45 @@ class ResultViewerPanel(
         menu.show(invoker, x, y)
     }
 
-    private fun openDocumentEditDialog(docIndex: Int, doc: BsonDocument, focusPath: List<String>) {
-        val isReadOnly = connectionManager.isEffectivelyReadOnly(profile)
-        val dialog = DocumentEditDialog(
-            project = project,
-            connectionManager = connectionManager,
-            profile = profile,
-            database = database,
-            collection = collection,
-            originalDoc = doc,
-            isReadOnly = isReadOnly,
-            initialFocusPath = focusPath,
-            onSavedInDb = { updatedDoc -> replaceDocumentInPlace(docIndex, updatedDoc) },
-            onDeletedInDb = { removeDocumentInPlace(docIndex) }
-        )
-        dialog.show()
+    private fun openDocumentEditDialog(
+        docIndex: Int,
+        targetBsonDoc: BsonDocument,
+        targetRawDoc: Document,
+        focusFieldPath: String?
+    ) {
+        try {
+            val isReadOnly = connectionManager.isEffectivelyReadOnly(profile)
+            val dialog = DocumentEditDialog(
+                project = project,
+                connectionManager = connectionManager,
+                profile = profile,
+                database = database,
+                collection = collection,
+                originalDoc = targetBsonDoc,
+                rawDocument = targetRawDoc,
+                isReadOnly = isReadOnly,
+                focusFieldPath = focusFieldPath,
+                onSavedInDb = { updatedDoc -> replaceDocumentInPlace(docIndex, updatedDoc) },
+                onDeletedInDb = { removeDocumentInPlace(docIndex) }
+            )
+            dialog.show()
+        } catch (t: Throwable) {
+            Messages.showErrorDialog(
+                project,
+                "${t.javaClass.simpleName}: ${t.message ?: "Unknown error while opening Edit Data dialog."}",
+                I18n.t("result.doc.editTitle")
+            )
+        }
     }
 
-    /**
-     * Updates ONLY the edited document in Tree / Table / Raw JSON while preserving scroll position.
-     */
+    private fun toRawDocument(bsonDoc: BsonDocument): Document {
+        return try {
+            Document.parse(bsonDoc.toJson())
+        } catch (_: Throwable) {
+            Document()
+        }
+    }
+
     private fun replaceDocumentInPlace(docIndex: Int, updatedDoc: BsonDocument) {
         if (docIndex !in currentDocs.indices) return
         val savedTreePos = treeScrollPane.viewport.viewPosition
@@ -561,16 +604,19 @@ class ResultViewerPanel(
         currentDocs[docIndex] = updatedDoc
         currentResult = currentResult?.copy(documents = currentDocs.toList())
 
-        // Update single document subtree in Tree View without collapsing other documents
         if (docIndex < treeRoot.childCount) {
-            val docNode = treeRoot.getChildAt(docIndex) as? DefaultMutableTreeNode
+            val docNode = treeRoot.getChildAt(docIndex) as? DocTreeNode
             if (docNode != null) {
-                val idPreview = updatedDoc["_id"]?.let { UiHelpers.bsonPureTextValue(it) } ?: "doc"
-                docNode.userObject = BsonTreeNodeData("[${currentSkip + docIndex + 1}] $idPreview", updatedDoc, docIndex, isRootDoc = true)
+                val idPreview = updatedDoc["_id"]?.let { UiHelpers.bsonIdRawText(it) } ?: "doc"
+                docNode.displayLabel = "[${currentSkip + docIndex + 1}] $idPreview"
+                docNode.userObject = docNode.displayLabel
+                docNode.bsonDocument = updatedDoc
+                docNode.rawDocument = toRawDocument(updatedDoc)
                 docNode.removeAllChildren()
-                addDocumentChildren(docNode, updatedDoc, docIndex)
+                addDocumentChildren(docNode, docNode, updatedDoc, "")
                 treeModel.nodeStructureChanged(docNode)
-                expandSubtree(docNode)
+                // Keep 1st-level expanded and nested Object/Array collapsed
+                resultTree.expandPath(TreePath(docNode.path))
             }
         }
 
@@ -583,9 +629,6 @@ class ResultViewerPanel(
         }
     }
 
-    /**
-     * Removes ONLY the deleted document from Tree / Table / Raw JSON while preserving scroll position.
-     */
     private fun removeDocumentInPlace(docIndex: Int) {
         if (docIndex !in currentDocs.indices) return
         val savedTreePos = treeScrollPane.viewport.viewPosition
@@ -603,17 +646,13 @@ class ResultViewerPanel(
             if (nodeToRemove != null) {
                 treeModel.removeNodeFromParent(nodeToRemove)
             }
-            // Re-index remaining rootDocIndex values cleanly
             for (i in 0 until treeRoot.childCount) {
-                val rootChild = treeRoot.getChildAt(i) as? DefaultMutableTreeNode ?: continue
-                reindexSubtreeDocIndex(rootChild, i)
-                val data = rootChild.userObject as? BsonTreeNodeData
-                if (data != null && data.isRootDoc) {
-                    val doc = currentDocs.getOrNull(i)
-                    val idPreview = doc?.get("_id")?.let { UiHelpers.bsonPureTextValue(it) } ?: "doc"
-                    rootChild.userObject = data.copy(keyLabel = "[${currentSkip + i + 1}] $idPreview", rootDocIndex = i)
-                    treeModel.nodeChanged(rootChild)
-                }
+                val docNode = treeRoot.getChildAt(i) as? DocTreeNode ?: continue
+                docNode.docIndex = i
+                val idPreview = docNode.bsonDocument["_id"]?.let { UiHelpers.bsonIdRawText(it) } ?: "doc"
+                docNode.displayLabel = "[${currentSkip + i + 1}] $idPreview"
+                docNode.userObject = docNode.displayLabel
+                treeModel.nodeChanged(docNode)
             }
             if (currentDocs.isEmpty()) {
                 treeRoot.add(DefaultMutableTreeNode(I18n.t("result.empty")))
@@ -631,33 +670,14 @@ class ResultViewerPanel(
         }
     }
 
-    private fun reindexSubtreeDocIndex(node: DefaultMutableTreeNode, newDocIdx: Int) {
-        val data = node.userObject as? BsonTreeNodeData
-        if (data != null) {
-            data.rootDocIndex = newDocIdx
-        }
-        for (i in 0 until node.childCount) {
-            val child = node.getChildAt(i) as? DefaultMutableTreeNode ?: continue
-            reindexSubtreeDocIndex(child, newDocIdx)
-        }
-    }
-
-    private fun expandSubtree(node: DefaultMutableTreeNode) {
-        resultTree.expandPath(TreePath(node.path))
-        for (i in 0 until node.childCount) {
-            val child = node.getChildAt(i) as? DefaultMutableTreeNode ?: continue
-            if (child.childCount > 0) {
-                expandSubtree(child)
-            }
-        }
-    }
-
     private fun switchView(viewName: String) {
         activeView = viewName
         treeViewBtn.isSelected = viewName == "TREE"
         jsonViewBtn.isSelected = viewName == "JSON"
         tableViewBtn.isSelected = viewName == "TABLE"
-        expandCollapseBtn.isVisible = viewName == "TREE"
+        val isTree = viewName == "TREE"
+        expandAllBtn.isVisible = isTree
+        collapseAllBtn.isVisible = isTree
         cardLayout.show(cardsPanel, viewName)
     }
 
@@ -727,89 +747,102 @@ class ResultViewerPanel(
 
     private fun populateTree(docs: List<BsonDocument>) {
         treeRoot.removeAllChildren()
-        var totalNodes = 0
         if (docs.isEmpty()) {
             treeRoot.add(DefaultMutableTreeNode(I18n.t("result.empty")))
         } else {
             docs.forEachIndexed { idx, doc ->
-                val idPreview = doc["_id"]?.let { UiHelpers.bsonPureTextValue(it) } ?: "doc"
-                val docNode = DefaultMutableTreeNode(
-                    BsonTreeNodeData("[${currentSkip + idx + 1}] $idPreview", doc, idx, isRootDoc = true)
+                val idPreview = doc["_id"]?.let { UiHelpers.bsonIdRawText(it) } ?: "doc"
+                val docNode = DocTreeNode(
+                    displayLabel = "[${currentSkip + idx + 1}] $idPreview",
+                    bsonDocument = doc,
+                    rawDocument = toRawDocument(doc),
+                    docIndex = idx
                 )
-                totalNodes++
-                totalNodes += addDocumentChildren(docNode, doc, idx)
+                addDocumentChildren(docNode, docNode, doc, "")
                 treeRoot.add(docNode)
             }
         }
         treeModel.reload()
 
+        // Expand ONLY top-level document roots via TreePath (keeps nested Object/Array collapsed)
         if (docs.isNotEmpty()) {
-            val safeMaxDepth = if (docs.size >= 500 && totalNodes > 3000) 3 else Int.MAX_VALUE
-            expandAllNodes(safeMaxDepth)
+            expandDocumentRootsOnly()
         }
     }
 
-    private fun expandAllNodes(maxDepth: Int) {
-        fun expandRecursive(node: DefaultMutableTreeNode, depth: Int) {
-            if (depth > maxDepth || node.childCount == 0) return
-            if (node != treeRoot) {
+    /**
+     * Expands ONLY each document's top-level root node using TreePath (never expandRow),
+     * revealing 1st-level fields while leaving nested Objects and Arrays collapsed.
+     */
+    private fun expandDocumentRootsOnly() {
+        for (i in 0 until treeRoot.childCount) {
+            val docNode = treeRoot.getChildAt(i) as? DefaultMutableTreeNode ?: continue
+            resultTree.expandPath(TreePath(docNode.path))
+        }
+    }
+
+    /**
+     * Triggered only by the [Expand All] header button: recursively expands nested Objects & Arrays too.
+     */
+    private fun expandAllRecursive() {
+        fun visit(node: DefaultMutableTreeNode) {
+            if (node.childCount == 0) return
+            if (node !== treeRoot) {
                 resultTree.expandPath(TreePath(node.path))
             }
             for (i in 0 until node.childCount) {
                 val child = node.getChildAt(i) as? DefaultMutableTreeNode ?: continue
-                expandRecursive(child, depth + 1)
+                visit(child)
             }
         }
-        expandRecursive(treeRoot, 0)
-        treeAllExpanded = true
-        updateExpandCollapseButton()
+        visit(treeRoot)
     }
 
-    private fun collapseAllNodes() {
+    /**
+     * Triggered by the [Collapse All] header button: collapses all top-level document root nodes.
+     */
+    private fun collapseAllDocumentRoots() {
         for (i in treeRoot.childCount - 1 downTo 0) {
-            val child = treeRoot.getChildAt(i) as? DefaultMutableTreeNode ?: continue
-            resultTree.collapsePath(TreePath(child.path))
-        }
-        treeAllExpanded = false
-        updateExpandCollapseButton()
-    }
-
-    private fun updateExpandCollapseButton() {
-        expandCollapseBtn.text = if (treeAllExpanded) {
-            I18n.t("result.tree.collapseAll")
-        } else {
-            I18n.t("result.tree.expandAll")
+            val docNode = treeRoot.getChildAt(i) as? DefaultMutableTreeNode ?: continue
+            resultTree.collapsePath(TreePath(docNode.path))
         }
     }
 
-    private fun addDocumentChildren(parent: DefaultMutableTreeNode, doc: BsonDocument, docIdx: Int): Int {
-        var count = 0
+    private fun addDocumentChildren(
+        rootDocNode: DocTreeNode,
+        parent: DefaultMutableTreeNode,
+        doc: BsonDocument,
+        prefixPath: String
+    ) {
         for ((k, v) in doc) {
-            val child = DefaultMutableTreeNode(BsonTreeNodeData(k, v, docIdx))
-            count++
+            val fieldPath = if (prefixPath.isEmpty()) k else "$prefixPath.$k"
+            val child = FieldTreeNode(rootDocNode, k, v, fieldPath)
             when (v) {
-                is BsonDocument -> count += addDocumentChildren(child, v, docIdx)
-                is BsonArray -> count += addArrayChildren(child, v, docIdx)
+                is BsonDocument -> addDocumentChildren(rootDocNode, child, v, fieldPath)
+                is BsonArray -> addArrayChildren(rootDocNode, child, v, fieldPath)
                 else -> Unit
             }
             parent.add(child)
         }
-        return count
     }
 
-    private fun addArrayChildren(parent: DefaultMutableTreeNode, arr: BsonArray, docIdx: Int): Int {
-        var count = 0
+    private fun addArrayChildren(
+        rootDocNode: DocTreeNode,
+        parent: DefaultMutableTreeNode,
+        arr: BsonArray,
+        prefixPath: String
+    ) {
         arr.forEachIndexed { i, elem ->
-            val child = DefaultMutableTreeNode(BsonTreeNodeData("[$i]", elem, docIdx))
-            count++
+            val key = "[$i]"
+            val fieldPath = if (prefixPath.isEmpty()) key else "$prefixPath.$key"
+            val child = FieldTreeNode(rootDocNode, key, elem, fieldPath)
             when (elem) {
-                is BsonDocument -> count += addDocumentChildren(child, elem, docIdx)
-                is BsonArray -> count += addArrayChildren(child, elem, docIdx)
+                is BsonDocument -> addDocumentChildren(rootDocNode, child, elem, fieldPath)
+                is BsonArray -> addArrayChildren(rootDocNode, child, elem, fieldPath)
                 else -> Unit
             }
             parent.add(child)
         }
-        return count
     }
 
     private fun populateRawJson(docs: List<BsonDocument>) {
@@ -817,7 +850,7 @@ class ResultViewerPanel(
             "[]"
         } else {
             docs.joinToString(separator = ",\n", prefix = "[\n", postfix = "\n]") { doc ->
-                MongoShellNormalizer.formatPrettyExtended(doc)
+                StringUtil.convertLineSeparators(MongoShellNormalizer.formatPrettyExtended(doc))
                     .lines()
                     .joinToString("\n") { "  $it" }
             }
@@ -842,7 +875,8 @@ class ResultViewerPanel(
             tableViewBtn.text = I18n.t("result.view.table")
             prevBtn.text = I18n.t("result.prev")
             nextBtn.text = I18n.t("result.next")
-            updateExpandCollapseButton()
+            expandAllBtn.text = I18n.t("result.tree.expandAll")
+            collapseAllBtn.text = I18n.t("result.tree.collapseAll")
             updateSummaryAndBadges()
         }
     }
