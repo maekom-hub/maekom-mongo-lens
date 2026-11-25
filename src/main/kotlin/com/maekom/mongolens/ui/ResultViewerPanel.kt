@@ -104,6 +104,7 @@ class ResultViewerPanel(
     private var currentLimit: Int = 50
     private var previewBannerText: String? = null
     private var activeCopyOverlayPopup: JBPopup? = null
+    private var isTreeFullyExpanded: Boolean = false
 
     private val summaryLabel = JBLabel(" ")
     private val indexBadge = UiHelpers.createBadgeLabel("", UiHelpers.COLOR_GREEN_BG, UiHelpers.COLOR_GREEN_FG).apply {
@@ -113,10 +114,7 @@ class ResultViewerPanel(
         isVisible = false
     }
 
-    private val expandAllBtn = JButton(I18n.t("result.tree.expandAll")).apply {
-        margin = JBUI.insets(1, 6)
-    }
-    private val collapseAllBtn = JButton(I18n.t("result.tree.collapseAll")).apply {
+    private val expandCollapseToggleBtn = JButton(I18n.t("result.tree.expandAll")).apply {
         margin = JBUI.insets(1, 6)
     }
 
@@ -207,12 +205,16 @@ class ResultViewerPanel(
             add(summaryLabel)
             add(indexBadge)
             add(previewBannerLabel)
-            add(expandAllBtn)
-            add(collapseAllBtn)
+            add(expandCollapseToggleBtn)
         }
 
-        expandAllBtn.addActionListener { expandAllRecursive() }
-        collapseAllBtn.addActionListener { collapseAllDocumentRoots() }
+        expandCollapseToggleBtn.addActionListener {
+            if (isTreeFullyExpanded) {
+                collapseAllDocumentRoots()
+            } else {
+                expandAllRecursive()
+            }
+        }
 
         val rightBar = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 2)).apply {
             if (onPrevPage != null && onNextPage != null) {
@@ -676,8 +678,7 @@ class ResultViewerPanel(
         jsonViewBtn.isSelected = viewName == "JSON"
         tableViewBtn.isSelected = viewName == "TABLE"
         val isTree = viewName == "TREE"
-        expandAllBtn.isVisible = isTree
-        collapseAllBtn.isVisible = isTree
+        expandCollapseToggleBtn.isVisible = isTree
         cardLayout.show(cardsPanel, viewName)
     }
 
@@ -779,10 +780,12 @@ class ResultViewerPanel(
             val docNode = treeRoot.getChildAt(i) as? DefaultMutableTreeNode ?: continue
             resultTree.expandPath(TreePath(docNode.path))
         }
+        isTreeFullyExpanded = false
+        updateExpandCollapseToggleButton()
     }
 
     /**
-     * Triggered only by the [Expand All] header button: recursively expands nested Objects & Arrays too.
+     * Triggered by the unified [⊞ Expand All] toggle: recursively expands nested Objects & Arrays too.
      */
     private fun expandAllRecursive() {
         fun visit(node: DefaultMutableTreeNode) {
@@ -796,15 +799,27 @@ class ResultViewerPanel(
             }
         }
         visit(treeRoot)
+        isTreeFullyExpanded = true
+        updateExpandCollapseToggleButton()
     }
 
     /**
-     * Triggered by the [Collapse All] header button: collapses all top-level document root nodes.
+     * Triggered by the unified [⊟ Collapse All] toggle: collapses all top-level document root nodes.
      */
     private fun collapseAllDocumentRoots() {
         for (i in treeRoot.childCount - 1 downTo 0) {
             val docNode = treeRoot.getChildAt(i) as? DefaultMutableTreeNode ?: continue
             resultTree.collapsePath(TreePath(docNode.path))
+        }
+        isTreeFullyExpanded = false
+        updateExpandCollapseToggleButton()
+    }
+
+    private fun updateExpandCollapseToggleButton() {
+        expandCollapseToggleBtn.text = if (isTreeFullyExpanded) {
+            I18n.t("result.tree.collapseAll")
+        } else {
+            I18n.t("result.tree.expandAll")
         }
     }
 
@@ -875,8 +890,7 @@ class ResultViewerPanel(
             tableViewBtn.text = I18n.t("result.view.table")
             prevBtn.text = I18n.t("result.prev")
             nextBtn.text = I18n.t("result.next")
-            expandAllBtn.text = I18n.t("result.tree.expandAll")
-            collapseAllBtn.text = I18n.t("result.tree.collapseAll")
+            updateExpandCollapseToggleButton()
             updateSummaryAndBadges()
         }
     }

@@ -13,6 +13,7 @@ import com.maekom.mongolens.config.SavedQueryStore
 import com.maekom.mongolens.config.VariableStore
 import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.MongoConnectionManager
+import com.maekom.mongolens.mongo.SmartInValueType
 import java.awt.BorderLayout
 import java.awt.CardLayout
 import java.awt.Cursor
@@ -20,6 +21,7 @@ import java.awt.FlowLayout
 import java.awt.Font
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import javax.swing.BorderFactory
 import javax.swing.JPanel
@@ -46,6 +48,7 @@ class CollectionWorkspaceTab(
     }
 
     private val sampledFields = CopyOnWriteArrayList<String>()
+    private val sampledFieldTypes = ConcurrentHashMap<String, SmartInValueType>()
     private val cachedCollections = CopyOnWriteArrayList<String>(listOf(collection))
 
     private val findModeBtn = JToggleButton(I18n.t("workspace.mode.find"), initialMode == WorkspaceMode.FIND).apply {
@@ -99,7 +102,8 @@ class CollectionWorkspaceTab(
         database = database,
         collection = collection,
         fieldSuggestionsSupplier = { sampledFields.toList() },
-        onFieldsDiscovered = { fields -> mergeSampledFields(fields) },
+        fieldTypesSupplier = { sampledFieldTypes.toMap() },
+        onFieldsDiscovered = { fields, types -> mergeSampledSchema(fields, types) },
         onStatusUpdate = onStatusUpdate,
         onReadOnlyChanged = {
             updateReadOnlyBadge()
@@ -220,25 +224,30 @@ class CollectionWorkspaceTab(
     }
 
     private fun mergeSampledFields(fields: List<String>) {
+        mergeSampledSchema(fields, emptyMap())
+    }
+
+    private fun mergeSampledSchema(fields: List<String>, types: Map<String, SmartInValueType>) {
         val merged = linkedSetOf<String>()
         merged.addAll(sampledFields)
         merged.addAll(fields)
         sampledFields.clear()
         sampledFields.addAll(merged)
+        types.forEach { (k, v) -> sampledFieldTypes.putIfAbsent(k, v) }
     }
 
     private fun sampleMetadataInBackground() {
         object : Task.Backgroundable(project, "Sampling schema for $collection...", true) {
             override fun run(indicator: ProgressIndicator) {
                 try {
-                    val fields = connectionManager.sampleFieldNames(profile, database, collection, 30)
+                    val (fields, types) = connectionManager.sampleSchema(profile, database, collection, 30)
                     val colls = try {
                         connectionManager.listCollections(profile, database)
                     } catch (_: Throwable) {
                         listOf(collection)
                     }
                     ApplicationManager.getApplication().invokeLater {
-                        mergeSampledFields(fields)
+                        mergeSampledSchema(fields, types)
                         if (colls.isNotEmpty()) {
                             cachedCollections.clear()
                             cachedCollections.addAll(colls)

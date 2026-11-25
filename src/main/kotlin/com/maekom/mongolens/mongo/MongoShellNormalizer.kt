@@ -5,6 +5,13 @@ import org.bson.BsonDocument
 import org.bson.json.JsonMode
 import org.bson.json.JsonWriterSettings
 
+enum class SmartInValueType(val label: String) {
+    AUTO("Auto"),
+    OBJECT_ID("ObjectId"),
+    NUMBER("Number"),
+    STRING("String")
+}
+
 object MongoShellNormalizer {
     private val objectIdRegex = Regex("""(?:new\s+)?ObjectId\s*\(\s*["']([0-9a-fA-F]{24})["']\s*\)""")
     private val isoDateRegex = Regex("""(?:new\s+)?ISODate\s*\(\s*["']([^"']+)["']\s*\)""")
@@ -329,7 +336,11 @@ object MongoShellNormalizer {
         return sb.toString()
     }
 
-    fun buildSmartInQuery(rawInput: String, fieldName: String = "_id"): String {
+    fun buildSmartInQuery(
+        rawInput: String,
+        fieldName: String = "_id",
+        preferredType: SmartInValueType = SmartInValueType.AUTO
+    ): String {
         val cleanField = fieldName.trim().ifEmpty { "_id" }
         val tokens = rawInput
             .split(Regex("[\\r\\n,;\\t\\s]+"))
@@ -342,10 +353,24 @@ object MongoShellNormalizer {
         }
 
         val items = tokens.map { token ->
-            when {
-                hex24Regex.matches(token) -> """{ "${'$'}oid": "$token" }"""
-                integerRegex.matches(token) && token.toLongOrNull() != null -> token
-                else -> "\"${escapeJsonString(token)}\""
+            when (preferredType) {
+                SmartInValueType.STRING -> "\"${escapeJsonString(token)}\""
+                SmartInValueType.OBJECT_ID -> {
+                    if (hex24Regex.matches(token)) """{ "${'$'}oid": "$token" }"""
+                    else "\"${escapeJsonString(token)}\""
+                }
+                SmartInValueType.NUMBER -> {
+                    if (integerRegex.matches(token) && token.toLongOrNull() != null) token
+                    else if (token.toDoubleOrNull() != null) token
+                    else "\"${escapeJsonString(token)}\""
+                }
+                SmartInValueType.AUTO -> {
+                    when {
+                        hex24Regex.matches(token) -> """{ "${'$'}oid": "$token" }"""
+                        integerRegex.matches(token) && token.toLongOrNull() != null -> token
+                        else -> "\"${escapeJsonString(token)}\""
+                    }
+                }
             }
         }
 
@@ -356,6 +381,35 @@ object MongoShellNormalizer {
         }
 
         return "{\n  \"${escapeJsonString(cleanField)}\": { \"\$in\": [$joined] }\n}"
+    }
+
+    /** Extracts non-operator field keys currently present in a Filter query string */
+    fun extractFilterFieldKeys(filterRaw: String): List<String> {
+        val trimmed = filterRaw.trim()
+        if (trimmed.isEmpty() || trimmed == "{}") return emptyList()
+        val found = linkedSetOf<String>()
+        try {
+            val doc = parseBsonDocument(trimmed)
+            fun walk(d: BsonDocument) {
+                for ((k, v) in d) {
+                    if (!k.startsWith("$")) {
+                        found.add(k)
+                    }
+                    when {
+                        v.isDocument -> walk(v.asDocument())
+                        v.isArray -> v.asArray().forEach { elem -> if (elem.isDocument) walk(elem.asDocument()) }
+                    }
+                }
+            }
+            walk(doc)
+        } catch (_: Throwable) {
+            // Fallback regex for incomplete/in-progress Filter expressions
+            Regex("""["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?\s*:""").findAll(trimmed).forEach { m ->
+                val key = m.groupValues[1]
+                if (!key.startsWith("$")) found.add(key)
+            }
+        }
+        return found.toList()
     }
 
     fun escapeJsonString(s: String): String {

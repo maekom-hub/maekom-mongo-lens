@@ -34,7 +34,8 @@ data class QueryExecutionResult(
     val elapsedMs: Long,
     val scanType: IndexScanType,
     val indexName: String?,
-    val sampledFields: List<String>
+    val sampledFields: List<String>,
+    val sampledFieldTypes: Map<String, SmartInValueType> = emptyMap()
 )
 
 class MongoConnectionManager(project: Project) : Disposable {
@@ -156,7 +157,14 @@ class MongoConnectionManager(project: Project) : Disposable {
         database: String,
         collection: String,
         sampleSize: Int = 30
-    ): List<String> {
+    ): List<String> = sampleSchema(profile, database, collection, sampleSize).first
+
+    fun sampleSchema(
+        profile: MongoConnectionProfile,
+        database: String,
+        collection: String,
+        sampleSize: Int = 30
+    ): Pair<List<String>, Map<String, SmartInValueType>> {
         val client = getOrCreateClient(profile)
         val docs = client.getDatabase(database)
             .getCollection(collection, BsonDocument::class.java)
@@ -164,7 +172,7 @@ class MongoConnectionManager(project: Project) : Disposable {
             .limit(sampleSize)
             .maxTime(3, TimeUnit.SECONDS)
             .into(mutableListOf())
-        return extractFieldNames(docs)
+        return extractFieldSchema(docs)
     }
 
     fun executeFind(
@@ -219,7 +227,7 @@ class MongoConnectionManager(project: Project) : Disposable {
             IndexScanType.UNKNOWN to null
         }
 
-        val sampledFields = extractFieldNames(docs.take(30))
+        val (sampledFields, sampledFieldTypes) = extractFieldSchema(docs.take(30))
 
         return QueryExecutionResult(
             documents = docs,
@@ -228,7 +236,8 @@ class MongoConnectionManager(project: Project) : Disposable {
             elapsedMs = elapsedMs,
             scanType = scanType,
             indexName = indexName,
-            sampledFields = sampledFields
+            sampledFields = sampledFields,
+            sampledFieldTypes = sampledFieldTypes
         )
     }
 
@@ -253,7 +262,7 @@ class MongoConnectionManager(project: Project) : Disposable {
             IndexScanType.UNKNOWN to null
         }
 
-        val sampledFields = extractFieldNames(docs.take(30))
+        val (sampledFields, sampledFieldTypes) = extractFieldSchema(docs.take(30))
 
         return QueryExecutionResult(
             documents = docs,
@@ -262,7 +271,8 @@ class MongoConnectionManager(project: Project) : Disposable {
             elapsedMs = elapsedMs,
             scanType = scanType,
             indexName = indexName,
-            sampledFields = sampledFields
+            sampledFields = sampledFields,
+            sampledFieldTypes = sampledFieldTypes
         )
     }
 
@@ -361,13 +371,25 @@ class MongoConnectionManager(project: Project) : Disposable {
         }
     }
 
-    private fun extractFieldNames(docs: List<BsonDocument>): List<String> {
+    private fun extractFieldSchema(docs: List<BsonDocument>): Pair<List<String>, Map<String, SmartInValueType>> {
         val fields = linkedSetOf<String>()
+        val types = linkedMapOf<String, SmartInValueType>()
+
+        fun inferType(v: BsonValue): SmartInValueType? = when {
+            v.isObjectId -> SmartInValueType.OBJECT_ID
+            v.isInt32 || v.isInt64 || v.isDouble || v.isDecimal128 -> SmartInValueType.NUMBER
+            v.isString -> SmartInValueType.STRING
+            else -> null
+        }
+
         fun collect(doc: BsonDocument, prefix: String, depth: Int) {
             if (depth > 3) return
             for ((k, v) in doc) {
                 val path = if (prefix.isEmpty()) k else "$prefix.$k"
                 fields.add(path)
+                if (!types.containsKey(path)) {
+                    inferType(v)?.let { types[path] = it }
+                }
                 when {
                     v.isDocument -> collect(v.asDocument(), path, depth + 1)
                     v.isArray -> {
@@ -381,7 +403,7 @@ class MongoConnectionManager(project: Project) : Disposable {
             }
         }
         docs.forEach { collect(it, "", 0) }
-        return fields.toList()
+        return fields.toList() to types
     }
 
     private fun safeClose(client: MongoClient) {
