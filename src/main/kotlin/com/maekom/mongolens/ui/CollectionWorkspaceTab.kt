@@ -10,6 +10,7 @@ import com.intellij.ui.components.JBLabel
 import com.intellij.util.ui.JBUI
 import com.maekom.mongolens.config.MongoConnectionProfile
 import com.maekom.mongolens.config.SavedQueryStore
+import com.maekom.mongolens.config.VariableStore
 import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import java.awt.BorderLayout
@@ -29,6 +30,7 @@ class CollectionWorkspaceTab(
     private val project: Project,
     private val connectionManager: MongoConnectionManager,
     savedQueryStore: SavedQueryStore,
+    variableStore: VariableStore,
     val profile: MongoConnectionProfile,
     val database: String,
     val collection: String,
@@ -39,13 +41,22 @@ class CollectionWorkspaceTab(
 
     enum class WorkspaceMode {
         FIND,
-        AGGREGATION
+        AGGREGATION,
+        SHELL
     }
 
     private val sampledFields = CopyOnWriteArrayList<String>()
+    private val cachedCollections = CopyOnWriteArrayList<String>(listOf(collection))
 
-    private val findModeBtn = JToggleButton(I18n.t("workspace.mode.find"), initialMode == WorkspaceMode.FIND)
-    private val aggModeBtn = JToggleButton(I18n.t("workspace.mode.agg"), initialMode == WorkspaceMode.AGGREGATION)
+    private val findModeBtn = JToggleButton(I18n.t("workspace.mode.find"), initialMode == WorkspaceMode.FIND).apply {
+        margin = JBUI.insets(2, 8)
+    }
+    private val aggModeBtn = JToggleButton(I18n.t("workspace.mode.agg"), initialMode == WorkspaceMode.AGGREGATION).apply {
+        margin = JBUI.insets(2, 8)
+    }
+    private val shellModeBtn = JToggleButton(I18n.t("workspace.mode.shell"), initialMode == WorkspaceMode.SHELL).apply {
+        margin = JBUI.insets(2, 8)
+    }
 
     private val breadcrumbLabel = JBLabel("${profile.displayName}  /  $database.$collection").apply {
         font = font.deriveFont(Font.BOLD)
@@ -62,6 +73,24 @@ class CollectionWorkspaceTab(
     private val modeCardLayout = CardLayout()
     private val modeCardsPanel = JPanel(modeCardLayout)
 
+    private val shellPanel = MongoShellPanel(
+        project = project,
+        connectionManager = connectionManager,
+        savedQueryStore = savedQueryStore,
+        variableStore = variableStore,
+        profile = profile,
+        database = database,
+        collection = collection,
+        collectionsSupplier = { cachedCollections.toList() },
+        fieldSuggestionsSupplier = { sampledFields.toList() },
+        onFieldsDiscovered = { fields -> mergeSampledFields(fields) },
+        onStatusUpdate = onStatusUpdate,
+        onReadOnlyChanged = {
+            updateReadOnlyBadge()
+            onReadOnlyStateChanged()
+        }
+    )
+
     private val findPanel = FindQueryPanel(
         project = project,
         connectionManager = connectionManager,
@@ -75,6 +104,10 @@ class CollectionWorkspaceTab(
         onReadOnlyChanged = {
             updateReadOnlyBadge()
             onReadOnlyStateChanged()
+        },
+        onConvertToShell = { script ->
+            shellPanel.setScriptText(script)
+            switchMode(WorkspaceMode.SHELL)
         }
     )
 
@@ -91,20 +124,26 @@ class CollectionWorkspaceTab(
         onReadOnlyChanged = {
             updateReadOnlyBadge()
             onReadOnlyStateChanged()
+        },
+        onConvertToShell = { script ->
+            shellPanel.setScriptText(script)
+            switchMode(WorkspaceMode.SHELL)
         }
     )
 
     init {
         Disposer.register(this, findPanel)
         Disposer.register(this, aggregationPanel)
+        Disposer.register(this, shellPanel)
 
         val topBar = JPanel(BorderLayout()).apply {
             border = BorderFactory.createMatteBorder(0, 0, 1, 0, JBUI.CurrentTheme.ToolWindow.borderColor())
-            val left = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4)).apply {
+            val left = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2)).apply {
                 add(findModeBtn)
                 add(aggModeBtn)
+                add(shellModeBtn)
             }
-            val right = JPanel(FlowLayout(FlowLayout.RIGHT, 8, 4)).apply {
+            val right = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 2)).apply {
                 add(breadcrumbLabel)
                 add(readOnlyBadge)
             }
@@ -114,6 +153,7 @@ class CollectionWorkspaceTab(
 
         findModeBtn.addActionListener { switchMode(WorkspaceMode.FIND) }
         aggModeBtn.addActionListener { switchMode(WorkspaceMode.AGGREGATION) }
+        shellModeBtn.addActionListener { switchMode(WorkspaceMode.SHELL) }
 
         readOnlyBadge.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
@@ -133,6 +173,7 @@ class CollectionWorkspaceTab(
 
         modeCardsPanel.add(findPanel, "FIND")
         modeCardsPanel.add(aggregationPanel, "AGG")
+        modeCardsPanel.add(shellPanel, "SHELL")
 
         add(topBar, BorderLayout.NORTH)
         add(modeCardsPanel, BorderLayout.CENTER)
@@ -140,11 +181,10 @@ class CollectionWorkspaceTab(
         updateReadOnlyBadge()
         switchMode(initialMode)
 
-        // Pre-sample 20 documents asynchronously for field name autocompletion and initial view
+        // Pre-sample 30 documents + collection names asynchronously for autocomplete
+        sampleMetadataInBackground()
         if (initialMode == WorkspaceMode.FIND) {
             findPanel.executeFind()
-        } else {
-            sampleFieldsInBackground()
         }
 
         I18n.addListener(this) { refreshTexts() }
@@ -153,7 +193,13 @@ class CollectionWorkspaceTab(
     fun switchMode(mode: WorkspaceMode) {
         findModeBtn.isSelected = mode == WorkspaceMode.FIND
         aggModeBtn.isSelected = mode == WorkspaceMode.AGGREGATION
-        modeCardLayout.show(modeCardsPanel, if (mode == WorkspaceMode.FIND) "FIND" else "AGG")
+        shellModeBtn.isSelected = mode == WorkspaceMode.SHELL
+        val card = when (mode) {
+            WorkspaceMode.FIND -> "FIND"
+            WorkspaceMode.AGGREGATION -> "AGG"
+            WorkspaceMode.SHELL -> "SHELL"
+        }
+        modeCardLayout.show(modeCardsPanel, card)
     }
 
     fun updateReadOnlyBadge() {
@@ -181,16 +227,25 @@ class CollectionWorkspaceTab(
         sampledFields.addAll(merged)
     }
 
-    private fun sampleFieldsInBackground() {
+    private fun sampleMetadataInBackground() {
         object : Task.Backgroundable(project, "Sampling schema for $collection...", true) {
             override fun run(indicator: ProgressIndicator) {
                 try {
-                    val fields = connectionManager.sampleFieldNames(profile, database, collection, 20)
+                    val fields = connectionManager.sampleFieldNames(profile, database, collection, 30)
+                    val colls = try {
+                        connectionManager.listCollections(profile, database)
+                    } catch (_: Throwable) {
+                        listOf(collection)
+                    }
                     ApplicationManager.getApplication().invokeLater {
                         mergeSampledFields(fields)
+                        if (colls.isNotEmpty()) {
+                            cachedCollections.clear()
+                            cachedCollections.addAll(colls)
+                        }
                     }
                 } catch (_: Throwable) {
-                    // Non-fatal schema sampling error
+                    // Non-fatal background metadata sampling error
                 }
             }
         }.queue()
@@ -200,6 +255,7 @@ class CollectionWorkspaceTab(
         SwingUtilities.invokeLater {
             findModeBtn.text = I18n.t("workspace.mode.find")
             aggModeBtn.text = I18n.t("workspace.mode.agg")
+            shellModeBtn.text = I18n.t("workspace.mode.shell")
             updateReadOnlyBadge()
         }
     }

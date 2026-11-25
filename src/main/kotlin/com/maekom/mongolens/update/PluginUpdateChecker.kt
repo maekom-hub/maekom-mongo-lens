@@ -36,7 +36,7 @@ data class ReleaseInfo(
 object PluginUpdateChecker {
     const val PLUGIN_ID = "com.maekom.mongolens"
     const val RELEASES_API_URL = "https://api.github.com/repos/maekom-hub/maekom-mongo-lens/releases/latest"
-    private const val FALLBACK_VERSION = "0.1.0"
+    private const val FALLBACK_VERSION = "0.1.1"
 
     private val httpClient: HttpClient by lazy {
         HttpClient.newBuilder()
@@ -303,3 +303,5 @@ object PluginUpdateChecker {
         StartupActionScriptManager.addActionCommands(commands)
     }
 }
+
+typealias GitHubReleaseUpdater = PluginUpdateChecker

@@ -19,14 +19,13 @@ import com.maekom.mongolens.mongo.MongoShellNormalizer
 import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.FlowLayout
+import java.awt.Font
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
 import java.util.UUID
 import javax.swing.BorderFactory
 import javax.swing.JButton
-import javax.swing.JMenuItem
 import javax.swing.JPanel
-import javax.swing.JPopupMenu
 import javax.swing.JSpinner
 import javax.swing.SpinnerNumberModel
 import javax.swing.SwingUtilities
@@ -41,14 +40,24 @@ class FindQueryPanel(
     private val fieldSuggestionsSupplier: () -> List<String>,
     private val onFieldsDiscovered: (List<String>) -> Unit,
     private val onStatusUpdate: (String, Boolean) -> Unit,
-    private val onReadOnlyChanged: () -> Unit
+    private val onReadOnlyChanged: () -> Unit,
+    private val onConvertToShell: (String) -> Unit
 ) : JPanel(BorderLayout()), Disposable {
 
     private val limitPresets = arrayOf(20, 50, 100, 500, 1000)
 
-    private val filterLabel = JBLabel(I18n.t("find.filter"))
-    private val projectToggleBtn = JButton("${I18n.t("find.project")} ▸")
-    private val sortLabel = JBLabel(I18n.t("find.sort"))
+    private val filterLabel = JBLabel(I18n.t("find.filter")).apply {
+        preferredSize = Dimension(38, 24)
+    }
+    private val projectLabel = JBLabel(I18n.t("find.project")).apply {
+        preferredSize = Dimension(38, 24)
+    }
+    private val projectToggleBtn = JButton(I18n.t("find.projectAdd")).apply {
+        margin = JBUI.insets(2, 6)
+    }
+    private val sortLabel = JBLabel(I18n.t("find.sort")).apply {
+        preferredSize = Dimension(38, 24)
+    }
     private val limitLabel = JBLabel(I18n.t("find.limit"))
     private val skipLabel = JBLabel(I18n.t("find.skip"))
 
@@ -56,57 +65,77 @@ class FindQueryPanel(
         projectRef = project,
         initialText = "{}",
         multiLine = false,
+        completionMode = MongoJsonEditor.CompletionMode.FILTER,
         fieldSuggestionsSupplier = fieldSuggestionsSupplier,
         onExecuteShortcut = { executeFind() }
-    ).apply { setPreferredSizeHeight(30) }
+    ).apply { setPreferredSizeHeight(27) }
 
     private val projectEditor = MongoJsonEditor(
         projectRef = project,
         initialText = "{}",
         multiLine = false,
+        completionMode = MongoJsonEditor.CompletionMode.FILTER,
         fieldSuggestionsSupplier = fieldSuggestionsSupplier,
         onExecuteShortcut = { executeFind() }
-    ).apply { setPreferredSizeHeight(28) }
+    ).apply { setPreferredSizeHeight(26) }
 
     private val sortEditor = MongoJsonEditor(
         projectRef = project,
         initialText = "{}",
         multiLine = false,
+        completionMode = MongoJsonEditor.CompletionMode.SORT,
         fieldSuggestionsSupplier = fieldSuggestionsSupplier,
         onExecuteShortcut = { executeFind() }
-    ).apply { setPreferredSizeHeight(28) }
+    ).apply { setPreferredSizeHeight(27) }
 
     private val limitDecreaseBtn = JButton("-").apply {
-        preferredSize = Dimension(32, 26)
-        margin = JBUI.insets(0, 4)
+        preferredSize = Dimension(26, 25)
+        margin = JBUI.insets(1, 3)
         toolTipText = I18n.t("find.limitDecreaseTooltip")
     }
     private val limitCombo = ComboBox(limitPresets).apply {
         selectedItem = 50
-        preferredSize = Dimension(78, 26)
+        preferredSize = Dimension(68, 25)
     }
     private val limitIncreaseBtn = JButton("+").apply {
-        preferredSize = Dimension(32, 26)
-        margin = JBUI.insets(0, 4)
+        preferredSize = Dimension(26, 25)
+        margin = JBUI.insets(1, 3)
         toolTipText = I18n.t("find.limitIncreaseTooltip")
     }
     private val skipSpinner = JSpinner(SpinnerNumberModel(0, 0, Int.MAX_VALUE, 10)).apply {
-        preferredSize = Dimension(82, 26)
+        preferredSize = Dimension(64, 25)
     }
 
+    // Row 1 Right Block (Compact Accent)
     private val runBtn = JButton(I18n.t("find.run")).apply {
+        margin = JBUI.insets(2, 8)
+        font = font.deriveFont(Font.BOLD)
+        foreground = UiHelpers.COLOR_GREEN_FG
         toolTipText = I18n.t("find.runTooltip")
     }
-    private val resetBtn = JButton(I18n.t("find.reset"))
+    private val resetBtn = JButton(I18n.t("find.reset")).apply {
+        margin = JBUI.insets(2, 6)
+    }
+
+    // Row 2 Right Block (Compact Tools)
     private val smartInBtn = JButton(I18n.t("find.smartIn")).apply {
+        margin = JBUI.insets(2, 6)
         toolTipText = I18n.t("find.smartInTooltip")
     }
-    private val copyShellBtn = JButton(I18n.t("find.copyShell")).apply {
-        toolTipText = I18n.t("find.copyShellTooltip")
+    private val toShellBtn = JButton(I18n.t("find.toShell")).apply {
+        margin = JBUI.insets(2, 6)
+        toolTipText = I18n.t("find.toShellTooltip")
     }
-    private val savedQueriesBtn = JButton(I18n.t("find.savedQueries"))
+    private val savedQueriesBtn = JButton(I18n.t("find.savedQueries")).apply {
+        margin = JBUI.insets(2, 6)
+    }
 
-    private val projectRowPanel = JPanel(BorderLayout(6, 0))
+    private val projectRowContainer = JPanel(BorderLayout(4, 0)).apply {
+        border = JBUI.Borders.empty(2, 2, 0, 2)
+        add(projectLabel, BorderLayout.WEST)
+        add(projectEditor, BorderLayout.CENTER)
+        isVisible = false
+    }
     private var projectExpanded = false
 
     private val resultViewer = ResultViewerPanel(
@@ -132,35 +161,51 @@ class FindQueryPanel(
 
     init {
         Disposer.register(this, resultViewer)
-        buildQueryBar()
+        buildCompactQueryBar()
         add(resultViewer, BorderLayout.CENTER)
         I18n.addListener(this) { refreshTexts() }
     }
 
-    private fun buildQueryBar() {
-        val queryPanel = JPanel(GridBagLayout()).apply {
-            border = JBUI.Borders.empty(6, 8, 6, 8)
+    /**
+     * Compact 2-row GridBagLayout maximizing vertical space for the result viewer:
+     * Row 1: [Filter label + Filter editor + [+ Project]] (weightx=1.0) | [▶ 조회] [초기화] (fixed)
+     * Optional Project Row (only visible when [+ Project] toggled)
+     * Row 2: [Sort label + Sort editor + Limit -/combo/+ + Skip] (weightx=1.0) | [📋 Smart $in] [Shell] [⭐ 저장/기록] (fixed)
+     */
+    private fun buildCompactQueryBar() {
+        val grid = JPanel(GridBagLayout()).apply {
+            border = JBUI.Borders.empty(3, 6, 3, 6)
         }
 
         val gbc = GridBagConstraints().apply {
             fill = GridBagConstraints.HORIZONTAL
-            insets = JBUI.insets(2, 4)
+            insets = JBUI.insets(1, 2)
         }
 
-        // Row 0: Filter
-        gbc.gridx = 0; gbc.gridy = 0; gbc.weightx = 0.0
-        queryPanel.add(filterLabel, gbc)
-        gbc.gridx = 1; gbc.gridy = 0; gbc.weightx = 1.0; gbc.gridwidth = 3
-        queryPanel.add(filterEditor, gbc)
+        // Row 0 Left: Filter + [+ Project]
+        val row1Left = JPanel(BorderLayout(4, 0)).apply {
+            add(filterLabel, BorderLayout.WEST)
+            add(filterEditor, BorderLayout.CENTER)
+            add(projectToggleBtn, BorderLayout.EAST)
+        }
+        // Row 0 Right: [▶ 조회] [초기화]
+        val row1Right = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
+            add(runBtn)
+            add(resetBtn)
+        }
 
-        // Row 1: Sort + Limit + Skip
+        gbc.gridx = 0; gbc.gridy = 0; gbc.weightx = 1.0
+        grid.add(row1Left, gbc)
+        gbc.gridx = 1; gbc.gridy = 0; gbc.weightx = 0.0
+        grid.add(row1Right, gbc)
+
+        // Row 1 (Collapsible): Project input row
+        gbc.gridx = 0; gbc.gridy = 1; gbc.weightx = 1.0; gbc.gridwidth = 2
+        grid.add(projectRowContainer, gbc)
         gbc.gridwidth = 1
-        gbc.gridx = 0; gbc.gridy = 1; gbc.weightx = 0.0
-        queryPanel.add(sortLabel, gbc)
-        gbc.gridx = 1; gbc.gridy = 1; gbc.weightx = 0.6
-        queryPanel.add(sortEditor, gbc)
 
-        val pagingPanel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0)).apply {
+        // Row 2 Left: Sort + inline Limit/Skip
+        val inlinePaging = JPanel(FlowLayout(FlowLayout.LEFT, 3, 0)).apply {
             add(limitLabel)
             add(limitDecreaseBtn)
             add(limitCombo)
@@ -168,37 +213,28 @@ class FindQueryPanel(
             add(skipLabel)
             add(skipSpinner)
         }
-        gbc.gridx = 2; gbc.gridy = 1; gbc.weightx = 0.0; gbc.gridwidth = 2
-        queryPanel.add(pagingPanel, gbc)
-
-        // Row 2: Collapsible Project editor
-        projectRowPanel.apply {
-            add(projectEditor, BorderLayout.CENTER)
-            isVisible = false
+        val row2Left = JPanel(BorderLayout(4, 0)).apply {
+            add(sortLabel, BorderLayout.WEST)
+            add(sortEditor, BorderLayout.CENTER)
+            add(inlinePaging, BorderLayout.EAST)
         }
-        gbc.gridwidth = 1
-        gbc.gridx = 0; gbc.gridy = 2; gbc.weightx = 0.0
-        projectToggleBtn.margin = JBUI.insets(1, 6)
-        queryPanel.add(projectToggleBtn, gbc)
-        gbc.gridx = 1; gbc.gridy = 2; gbc.weightx = 1.0; gbc.gridwidth = 3
-        queryPanel.add(projectRowPanel, gbc)
-
-        // Row 3: Action buttons
-        val actionBar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2)).apply {
-            add(runBtn)
-            add(resetBtn)
+        // Row 2 Right: [📋 Smart $in] [Shell] [⭐ 저장/기록]
+        val row2Right = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
             add(smartInBtn)
-            add(copyShellBtn)
+            add(toShellBtn)
             add(savedQueriesBtn)
         }
-        gbc.gridx = 0; gbc.gridy = 3; gbc.weightx = 1.0; gbc.gridwidth = 4
-        queryPanel.add(actionBar, gbc)
+
+        gbc.gridx = 0; gbc.gridy = 2; gbc.weightx = 1.0
+        grid.add(row2Left, gbc)
+        gbc.gridx = 1; gbc.gridy = 2; gbc.weightx = 0.0
+        grid.add(row2Right, gbc)
 
         wireListeners()
 
         val wrapper = JPanel(BorderLayout()).apply {
             border = BorderFactory.createMatteBorder(0, 0, 1, 0, JBUI.CurrentTheme.ToolWindow.borderColor())
-            add(queryPanel, BorderLayout.CENTER)
+            add(grid, BorderLayout.CENTER)
         }
         add(wrapper, BorderLayout.NORTH)
     }
@@ -206,7 +242,7 @@ class FindQueryPanel(
     private fun wireListeners() {
         projectToggleBtn.addActionListener {
             projectExpanded = !projectExpanded
-            projectRowPanel.isVisible = projectExpanded
+            projectRowContainer.isVisible = projectExpanded
             updateProjectToggleText()
             revalidate()
             repaint()
@@ -250,20 +286,37 @@ class FindQueryPanel(
             }
         }
 
-        copyShellBtn.addActionListener {
-            val cmd = MongoShellNormalizer.toMongoshFindCommand(
-                collection = collection,
-                filter = filterEditor.text,
-                projection = projectEditor.text,
-                sort = sortEditor.text,
-                skip = currentSkip(),
-                limit = currentLimit()
-            )
-            UiHelpers.copyToClipboard(cmd)
-            UiHelpers.notify(project, I18n.t("result.copied"))
+        toShellBtn.addActionListener {
+            val cmd = buildDirectShellFindCommand()
+            onConvertToShell(cmd)
         }
 
-        savedQueriesBtn.addActionListener { showSavedQueriesMenu() }
+        savedQueriesBtn.addActionListener { showSavedQueriesPopup() }
+    }
+
+    private fun buildDirectShellFindCommand(): String {
+        val f = filterEditor.text.trim().ifEmpty { "{}" }
+        val p = projectEditor.text.trim()
+        val s = sortEditor.text.trim()
+        val skip = currentSkip()
+        val limit = currentLimit()
+
+        val sb = StringBuilder()
+        sb.append("db.").append(collection).append(".find(").append(f)
+        if (p.isNotEmpty() && p != "{}") {
+            sb.append(", ").append(p)
+        }
+        sb.append(")")
+        if (s.isNotEmpty() && s != "{}") {
+            sb.append(".sort(").append(s).append(")")
+        }
+        if (skip > 0) {
+            sb.append(".skip(").append(skip).append(")")
+        }
+        if (limit > 0) {
+            sb.append(".limit(").append(limit).append(")")
+        }
+        return sb.toString()
     }
 
     private fun currentLimit(): Int = (limitCombo.selectedItem as? Int) ?: 50
@@ -271,8 +324,12 @@ class FindQueryPanel(
     private fun currentSkip(): Int = (skipSpinner.value as? Int) ?: 0
 
     fun executeFind() {
+        filterEditor.dismissPopup()
+        sortEditor.dismissPopup()
+        projectEditor.dismissPopup()
+
         val filterRaw = filterEditor.text
-        val projRaw = if (projectExpanded) projectEditor.text else projectEditor.text
+        val projRaw = projectEditor.text
         val sortRaw = sortEditor.text
         val limit = currentLimit()
         val skip = currentSkip()
@@ -336,10 +393,14 @@ class FindQueryPanel(
         }.queue()
     }
 
-    private fun showSavedQueriesMenu() {
-        val menu = JPopupMenu()
-        menu.add(JMenuItem(I18n.t("find.savedQueries.save")).apply {
-            addActionListener {
+    private fun showSavedQueriesPopup() {
+        QueryHistoryPopup.show(
+            project = project,
+            invoker = savedQueriesBtn,
+            savedQueryStore = savedQueryStore,
+            collection = collection,
+            mode = "FIND",
+            onSaveCurrent = {
                 val name = Messages.showInputDialog(
                     project,
                     I18n.t("find.savedQueries.promptName"),
@@ -365,36 +426,9 @@ class FindQueryPanel(
                     )
                     UiHelpers.notify(project, I18n.t("find.savedQueries.savedToast", name))
                 }
-            }
-        })
-
-        menu.addSeparator()
-        menu.add(JMenuItem("— ${I18n.t("find.savedQueries.savedHeader")} —").apply { isEnabled = false })
-        val bookmarks = savedQueryStore.getBookmarks(collection, "FIND")
-        if (bookmarks.isEmpty()) {
-            menu.add(JMenuItem(I18n.t("find.savedQueries.empty")).apply { isEnabled = false })
-        } else {
-            bookmarks.take(15).forEach { q ->
-                menu.add(JMenuItem(q.name).apply {
-                    addActionListener { applySavedQuery(q) }
-                })
-            }
-        }
-
-        menu.addSeparator()
-        menu.add(JMenuItem("— ${I18n.t("find.savedQueries.historyHeader")} —").apply { isEnabled = false })
-        val history = savedQueryStore.getHistory(collection, "FIND")
-        if (history.isEmpty()) {
-            menu.add(JMenuItem(I18n.t("find.savedQueries.empty")).apply { isEnabled = false })
-        } else {
-            history.take(10).forEach { q ->
-                menu.add(JMenuItem(q.name).apply {
-                    addActionListener { applySavedQuery(q) }
-                })
-            }
-        }
-
-        menu.show(savedQueriesBtn, 0, savedQueriesBtn.height)
+            },
+            onSelectQuery = { q -> applySavedQuery(q) }
+        )
     }
 
     private fun applySavedQuery(q: SavedQuery) {
@@ -405,19 +439,20 @@ class FindQueryPanel(
         skipSpinner.value = q.skip.coerceAtLeast(0)
         if (q.projection.trim().isNotEmpty() && q.projection.trim() != "{}") {
             projectExpanded = true
-            projectRowPanel.isVisible = true
+            projectRowContainer.isVisible = true
             updateProjectToggleText()
         }
         executeFind()
     }
 
     private fun updateProjectToggleText() {
-        projectToggleBtn.text = if (projectExpanded) "${I18n.t("find.project")} ▾" else "${I18n.t("find.project")} ▸"
+        projectToggleBtn.text = if (projectExpanded) I18n.t("find.projectHide") else I18n.t("find.projectAdd")
     }
 
     private fun refreshTexts() {
         SwingUtilities.invokeLater {
             filterLabel.text = I18n.t("find.filter")
+            projectLabel.text = I18n.t("find.project")
             sortLabel.text = I18n.t("find.sort")
             limitLabel.text = I18n.t("find.limit")
             skipLabel.text = I18n.t("find.skip")
@@ -427,8 +462,8 @@ class FindQueryPanel(
             resetBtn.text = I18n.t("find.reset")
             smartInBtn.text = I18n.t("find.smartIn")
             smartInBtn.toolTipText = I18n.t("find.smartInTooltip")
-            copyShellBtn.text = I18n.t("find.copyShell")
-            copyShellBtn.toolTipText = I18n.t("find.copyShellTooltip")
+            toShellBtn.text = I18n.t("find.toShell")
+            toShellBtn.toolTipText = I18n.t("find.toShellTooltip")
             savedQueriesBtn.text = I18n.t("find.savedQueries")
             limitDecreaseBtn.toolTipText = I18n.t("find.limitDecreaseTooltip")
             limitIncreaseBtn.toolTipText = I18n.t("find.limitIncreaseTooltip")
@@ -436,6 +471,8 @@ class FindQueryPanel(
     }
 
     override fun dispose() {
-        // Child resultViewer disposed via Disposer
+        filterEditor.dismissPopup()
+        sortEditor.dismissPopup()
+        projectEditor.dismissPopup()
     }
 }

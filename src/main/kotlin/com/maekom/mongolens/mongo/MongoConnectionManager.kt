@@ -11,6 +11,7 @@ import com.mongodb.MongoCommandException
 import com.mongodb.client.MongoClient
 import com.mongodb.client.MongoClients
 import com.mongodb.client.model.CountOptions
+import com.mongodb.client.model.Filters
 import org.bson.BsonDocument
 import org.bson.BsonObjectId
 import org.bson.BsonValue
@@ -154,7 +155,7 @@ class MongoConnectionManager(project: Project) : Disposable {
         profile: MongoConnectionProfile,
         database: String,
         collection: String,
-        sampleSize: Int = 20
+        sampleSize: Int = 30
     ): List<String> {
         val client = getOrCreateClient(profile)
         val docs = client.getDatabase(database)
@@ -218,7 +219,7 @@ class MongoConnectionManager(project: Project) : Disposable {
             IndexScanType.UNKNOWN to null
         }
 
-        val sampledFields = extractFieldNames(docs.take(20))
+        val sampledFields = extractFieldNames(docs.take(30))
 
         return QueryExecutionResult(
             documents = docs,
@@ -252,7 +253,7 @@ class MongoConnectionManager(project: Project) : Disposable {
             IndexScanType.UNKNOWN to null
         }
 
-        val sampledFields = extractFieldNames(docs.take(20))
+        val sampledFields = extractFieldNames(docs.take(30))
 
         return QueryExecutionResult(
             documents = docs,
@@ -275,7 +276,7 @@ class MongoConnectionManager(project: Project) : Disposable {
         check(!isEffectivelyReadOnly(profile)) { "Write blocked: profile '${profile.displayName}' is READ-ONLY" }
         val client = getOrCreateClient(profile)
         val coll = client.getDatabase(database).getCollection(collection, BsonDocument::class.java)
-        coll.replaceOne(BsonDocument("_id", originalId), replacement)
+        coll.replaceOne(Filters.eq("_id", originalId), replacement)
     }
 
     fun cloneDocument(
@@ -303,7 +304,7 @@ class MongoConnectionManager(project: Project) : Disposable {
         check(!isEffectivelyReadOnly(profile)) { "Write blocked: profile '${profile.displayName}' is READ-ONLY" }
         val client = getOrCreateClient(profile)
         val coll = client.getDatabase(database).getCollection(collection, BsonDocument::class.java)
-        coll.deleteOne(BsonDocument("_id", id))
+        coll.deleteOne(Filters.eq("_id", id))
     }
 
     private fun buildClientSettings(uri: String): MongoClientSettings {
@@ -363,12 +364,19 @@ class MongoConnectionManager(project: Project) : Disposable {
     private fun extractFieldNames(docs: List<BsonDocument>): List<String> {
         val fields = linkedSetOf<String>()
         fun collect(doc: BsonDocument, prefix: String, depth: Int) {
-            if (depth > 2) return
+            if (depth > 3) return
             for ((k, v) in doc) {
                 val path = if (prefix.isEmpty()) k else "$prefix.$k"
                 fields.add(path)
-                if (v.isDocument) {
-                    collect(v.asDocument(), path, depth + 1)
+                when {
+                    v.isDocument -> collect(v.asDocument(), path, depth + 1)
+                    v.isArray -> {
+                        for (elem in v.asArray().take(3)) {
+                            if (elem.isDocument) {
+                                collect(elem.asDocument(), path, depth + 1)
+                            }
+                        }
+                    }
                 }
             }
         }

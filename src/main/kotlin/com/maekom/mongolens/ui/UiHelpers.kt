@@ -181,6 +181,51 @@ object UiHelpers {
         }
     }
 
+    /** Pure text without outer quotes — used for Tree double-click copy & Table cell copy */
+    fun bsonPureTextValue(value: BsonValue): String {
+        return when (value) {
+            is BsonString -> value.value
+            is BsonObjectId -> value.value.toHexString()
+            is BsonDateTime -> formatIsoUtc(value.value)
+            is BsonInt32 -> value.value.toString()
+            is BsonInt64 -> value.value.toString()
+            is BsonDecimal128 -> value.value.toString()
+            is BsonDouble -> value.value.toString()
+            is BsonBoolean -> value.value.toString()
+            is BsonNull -> "null"
+            is BsonBinary -> "Binary(${value.data.size} bytes)"
+            is BsonRegularExpression -> "/${value.pattern}/${value.options}"
+            is BsonTimestamp -> "Timestamp(${value.time}, ${value.inc})"
+            is BsonDocument -> com.maekom.mongolens.mongo.MongoShellNormalizer.formatCompact(value)
+            is BsonArray -> BsonDocument("v", value).toJson().let { j ->
+                val idx = j.indexOf(':')
+                if (idx > 0) j.substring(idx + 1, j.lastIndexOf('}')).trim() else value.toString()
+            }
+            else -> value.toString()
+        }
+    }
+
+    /** Clean quote-free display for Table View cells */
+    fun bsonTableDisplayValue(value: BsonValue): String {
+        return when (value) {
+            is BsonString -> value.value
+            is BsonObjectId -> value.value.toHexString()
+            is BsonDateTime -> formatIsoUtc(value.value)
+            is BsonInt32 -> value.value.toString()
+            is BsonInt64 -> value.value.toString()
+            is BsonDecimal128 -> value.value.toString()
+            is BsonDouble -> value.value.toString()
+            is BsonBoolean -> value.value.toString()
+            is BsonNull -> "null"
+            is BsonBinary -> "Binary(${value.data.size}B)"
+            is BsonRegularExpression -> "/${value.pattern}/${value.options}"
+            is BsonTimestamp -> "${value.time}:${value.inc}"
+            is BsonDocument -> "{...}"
+            is BsonArray -> "[${value.size} items]"
+            else -> value.toString()
+        }
+    }
+
     fun bsonIdRawText(idValue: BsonValue): String {
         return when (idValue) {
             is BsonObjectId -> idValue.value.toHexString()

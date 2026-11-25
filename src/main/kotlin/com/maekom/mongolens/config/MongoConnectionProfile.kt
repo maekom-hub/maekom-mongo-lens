@@ -85,13 +85,14 @@ data class SavedQuery(
     val profileId: String,
     val database: String,
     val collection: String,
-    val mode: String, // "FIND" or "AGGREGATION"
+    val mode: String, // "FIND", "AGGREGATION", or "SHELL"
     val filter: String = "{}",
     val projection: String = "{}",
     val sort: String = "{}",
     val limit: Int = 50,
     val skip: Int = 0,
     val pipelineJson: String = "[]",
+    val shellScript: String = "",
     val isHistory: Boolean = false,
     val timestamp: Long = System.currentTimeMillis()
 )

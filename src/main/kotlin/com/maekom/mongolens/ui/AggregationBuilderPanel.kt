@@ -50,7 +50,8 @@ class AggregationBuilderPanel(
     private val fieldSuggestionsSupplier: () -> List<String>,
     private val onFieldsDiscovered: (List<String>) -> Unit,
     private val onStatusUpdate: (String, Boolean) -> Unit,
-    private val onReadOnlyChanged: () -> Unit
+    private val onReadOnlyChanged: () -> Unit,
+    private val onConvertToShell: (String) -> Unit
 ) : JPanel(BorderLayout()), Disposable {
 
     companion object {
@@ -204,12 +205,20 @@ class AggregationBuilderPanel(
         }
     }
 
-    private val uiModeBtn = JToggleButton(I18n.t("agg.mode.ui"), true)
-    private val rawModeBtn = JToggleButton(I18n.t("agg.mode.raw"), false)
-    private val addStageBtn = JButton(I18n.t("agg.addStage"))
-    private val runBtn = JButton(I18n.t("agg.run"))
-    private val copyBtn = JButton(I18n.t("agg.copy"))
-    private val savedQueriesBtn = JButton(I18n.t("find.savedQueries"))
+    private val uiModeBtn = JToggleButton(I18n.t("agg.mode.ui"), true).apply { margin = JBUI.insets(2, 6) }
+    private val rawModeBtn = JToggleButton(I18n.t("agg.mode.raw"), false).apply { margin = JBUI.insets(2, 6) }
+    private val addStageBtn = JButton(I18n.t("agg.addStage")).apply { margin = JBUI.insets(2, 6) }
+    private val runBtn = JButton(I18n.t("agg.run")).apply {
+        margin = JBUI.insets(2, 8)
+        font = font.deriveFont(Font.BOLD)
+        foreground = UiHelpers.COLOR_GREEN_FG
+    }
+    private val toShellBtn = JButton(I18n.t("agg.toShell")).apply {
+        margin = JBUI.insets(2, 6)
+        toolTipText = I18n.t("agg.toShellTooltip")
+    }
+    private val copyBtn = JButton(I18n.t("agg.copy")).apply { margin = JBUI.insets(2, 6) }
+    private val savedQueriesBtn = JButton(I18n.t("find.savedQueries")).apply { margin = JBUI.insets(2, 6) }
 
     private val errorBanner = JBLabel("").apply {
         isOpaque = true
@@ -266,8 +275,9 @@ class AggregationBuilderPanel(
                 add(rawModeBtn)
                 add(addStageBtn)
             }
-            val right = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 4)).apply {
+            val right = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 3)).apply {
                 add(runBtn)
+                add(toShellBtn)
                 add(copyBtn)
                 add(savedQueriesBtn)
             }
@@ -305,6 +315,14 @@ class AggregationBuilderPanel(
             }
         }
         runBtn.addActionListener { executePipeline() }
+        toShellBtn.addActionListener {
+            try {
+                val json = if (activeSubMode == "UI") serializeActiveStagesToJson() else rawScriptEditor.text.trim().ifEmpty { "[]" }
+                onConvertToShell("db.$collection.aggregate($json)")
+            } catch (t: Throwable) {
+                showErrorBanner(t.message ?: "Error serializing pipeline")
+            }
+        }
         copyBtn.addActionListener {
             try {
                 val json = if (activeSubMode == "UI") serializeActiveStagesToJson() else rawScriptEditor.text
@@ -559,14 +577,18 @@ class AggregationBuilderPanel(
     }
 
     private fun showSavedQueriesMenu() {
-        val menu = JPopupMenu()
-        menu.add(JMenuItem(I18n.t("find.savedQueries.save")).apply {
-            addActionListener {
+        QueryHistoryPopup.show(
+            project = project,
+            invoker = savedQueriesBtn,
+            savedQueryStore = savedQueryStore,
+            collection = collection,
+            mode = "AGGREGATION",
+            onSaveCurrent = {
                 val json = try {
                     if (activeSubMode == "UI") serializeActiveStagesToJson() else rawScriptEditor.text
                 } catch (t: Throwable) {
                     showErrorBanner(t.message ?: "Invalid pipeline")
-                    return@addActionListener
+                    return@show
                 }
                 val name = Messages.showInputDialog(
                     project,
@@ -589,32 +611,9 @@ class AggregationBuilderPanel(
                     )
                     UiHelpers.notify(project, I18n.t("find.savedQueries.savedToast", name))
                 }
-            }
-        })
-
-        menu.addSeparator()
-        menu.add(JMenuItem("— ${I18n.t("find.savedQueries.savedHeader")} —").apply { isEnabled = false })
-        val bookmarks = savedQueryStore.getBookmarks(collection, "AGGREGATION")
-        if (bookmarks.isEmpty()) {
-            menu.add(JMenuItem(I18n.t("find.savedQueries.empty")).apply { isEnabled = false })
-        } else {
-            bookmarks.take(15).forEach { q ->
-                menu.add(JMenuItem(q.name).apply { addActionListener { loadSavedPipeline(q) } })
-            }
-        }
-
-        menu.addSeparator()
-        menu.add(JMenuItem("— ${I18n.t("find.savedQueries.historyHeader")} —").apply { isEnabled = false })
-        val history = savedQueryStore.getHistory(collection, "AGGREGATION")
-        if (history.isEmpty()) {
-            menu.add(JMenuItem(I18n.t("find.savedQueries.empty")).apply { isEnabled = false })
-        } else {
-            history.take(10).forEach { q ->
-                menu.add(JMenuItem(q.name).apply { addActionListener { loadSavedPipeline(q) } })
-            }
-        }
-
-        menu.show(savedQueriesBtn, 0, savedQueriesBtn.height)
+            },
+            onSelectQuery = { q -> loadSavedPipeline(q) }
+        )
     }
 
     private fun loadSavedPipeline(q: SavedQuery) {
@@ -643,6 +642,8 @@ class AggregationBuilderPanel(
             rawModeBtn.text = I18n.t("agg.mode.raw")
             addStageBtn.text = I18n.t("agg.addStage")
             runBtn.text = I18n.t("agg.run")
+            toShellBtn.text = I18n.t("agg.toShell")
+            toShellBtn.toolTipText = I18n.t("agg.toShellTooltip")
             copyBtn.text = I18n.t("agg.copy")
             savedQueriesBtn.text = I18n.t("find.savedQueries")
             emptyStagesLabel.text = I18n.t("agg.emptyStages")

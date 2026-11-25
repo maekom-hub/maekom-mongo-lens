@@ -43,23 +43,38 @@ class SavedQueryStore(private val projectBasePath: Path?) {
         saveAll(all)
     }
 
-    fun recordHistory(query: SavedQuery, maxHistory: Int = 30) {
+    fun recordHistory(query: SavedQuery, maxHistory: Int = 50) {
         val all = loadAll().toMutableList()
         val bookmarks = all.filter { !it.isHistory }
         val history = all.filter { it.isHistory }
             .filterNot {
                 it.collection == query.collection &&
                     it.mode == query.mode &&
-                    it.filter == query.filter &&
-                    it.projection == query.projection &&
-                    it.sort == query.sort &&
-                    it.pipelineJson == query.pipelineJson
+                    it.filter.trim() == query.filter.trim() &&
+                    it.projection.trim() == query.projection.trim() &&
+                    it.sort.trim() == query.sort.trim() &&
+                    it.pipelineJson.trim() == query.pipelineJson.trim() &&
+                    it.shellScript.trim() == query.shellScript.trim()
             }
             .toMutableList()
 
         history.add(0, query.copy(isHistory = true, timestamp = System.currentTimeMillis()))
         val trimmedHistory = history.take(maxHistory)
         saveAll(bookmarks + trimmedHistory)
+    }
+
+    fun deleteById(queryId: String) {
+        val updated = loadAll().filterNot { it.id == queryId }
+        saveAll(updated)
+    }
+
+    fun clearHistory(collection: String? = null, mode: String? = null) {
+        val updated = loadAll().filterNot { q ->
+            q.isHistory &&
+                (collection == null || q.collection == collection) &&
+                (mode == null || q.mode == mode)
+        }
+        saveAll(updated)
     }
 
     fun getBookmarks(collection: String? = null, mode: String? = null): List<SavedQuery> {

@@ -1,10 +1,6 @@
 package com.maekom.mongolens.ui
 
-import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
-import com.intellij.openapi.actionSystem.AnAction
-import com.intellij.openapi.actionSystem.AnActionEvent
-import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.Task
@@ -15,12 +11,12 @@ import com.intellij.ui.JBSplitter
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.tabs.JBTabs
 import com.intellij.ui.tabs.JBTabsFactory
-import com.intellij.ui.tabs.TabInfo
 import com.intellij.util.ui.JBUI
 import com.maekom.mongolens.config.CustomConnectionStore
 import com.maekom.mongolens.config.MongoConnectionProfile
 import com.maekom.mongolens.config.SavedQueryStore
 import com.maekom.mongolens.config.SpringYamlConfigParser
+import com.maekom.mongolens.config.VariableStore
 import com.maekom.mongolens.config.YamlConfigWatcher
 import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.MongoConnectionManager
@@ -34,7 +30,6 @@ import java.awt.Font
 import java.awt.GridBagLayout
 import java.nio.file.Path
 import java.nio.file.Paths
-import java.util.concurrent.atomic.AtomicInteger
 import javax.swing.BorderFactory
 import javax.swing.Box
 import javax.swing.BoxLayout
@@ -66,13 +61,13 @@ class MongoLensMainPanel(
     private val yamlParser = SpringYamlConfigParser()
     private val customStore = CustomConnectionStore(projectBasePath)
     private val savedQueryStore = SavedQueryStore(projectBasePath)
+    private val variableStore = VariableStore(projectBasePath)
     private val connectionManager = MongoConnectionManager(project)
 
     private var discoveredProfiles: List<MongoConnectionProfile> = emptyList()
     private var selectedProfileFilterId: String? = null
     private var suppressDropdownEvent = false
     private var availableUpdate: ReleaseInfo? = null
-    private val tabCounter = AtomicInteger(0)
 
     // Global 1-row header controls
     private val titleLabel = JBLabel(I18n.t("app.title")).apply {
@@ -104,22 +99,6 @@ class MongoLensMainPanel(
         toolTipText = I18n.t("header.lang.toggleTooltip")
     }
 
-    // Left tree & Right multi-tab workspace
-    private val connectionsTree = ConnectionsTreePanel(
-        project = project,
-        connectionManager = connectionManager,
-        parentDisposable = this,
-        onStatusUpdate = { text, isError -> setStatus(text, isError) },
-        onOpenFindTab = { profile, db, coll, forceNew -> openCollectionTab(profile, db, coll, CollectionWorkspaceTab.WorkspaceMode.FIND, forceNew) },
-        onOpenAggTab = { profile, db, coll -> openCollectionTab(profile, db, coll, CollectionWorkspaceTab.WorkspaceMode.AGGREGATION, true) },
-        onEditCustomProfile = { existing -> openCustomUriDialog(existing) },
-        onDeleteCustomProfile = { existing ->
-            connectionManager.closeClient(existing.id)
-            customStore.delete(existing.id)
-            reloadProfilesAsync()
-        }
-    )
-
     private val tabs: JBTabs = JBTabsFactory.createTabs(project, this)
     private val rightCardLayout = CardLayout()
     private val rightPanel = JPanel(rightCardLayout)
@@ -132,10 +111,53 @@ class MongoLensMainPanel(
         alignmentX = JComponent.CENTER_ALIGNMENT
     }
 
-    private val openTabsMap = linkedMapOf<TabInfo, CollectionWorkspaceTab>()
+    // Left tree & Right multi-tab manager
+    private lateinit var connectionsTree: ConnectionsTreePanel
+    private val tabManager: WorkspaceTabManager
 
     init {
         Disposer.register(parentDisposable, this)
+
+        tabManager = WorkspaceTabManager(
+            project = project,
+            tabs = tabs,
+            parentDisposable = this,
+            connectionManager = connectionManager,
+            savedQueryStore = savedQueryStore,
+            variableStore = variableStore,
+            onStatusUpdate = { text, isError -> setStatus(text, isError) },
+            onReadOnlyStateChanged = { connectionsTree.repaintTree() },
+            onTabCountChanged = { count ->
+                rightCardLayout.show(rightPanel, if (count > 0) "TABS" else "WELCOME")
+            }
+        )
+
+        connectionsTree = ConnectionsTreePanel(
+            project = project,
+            connectionManager = connectionManager,
+            parentDisposable = this,
+            onStatusUpdate = { text, isError -> setStatus(text, isError) },
+            onOpenFindTab = { profile, db, coll, forceNew ->
+                if (forceNew) {
+                    tabManager.openNewClonedTab(profile, db, coll, CollectionWorkspaceTab.WorkspaceMode.FIND)
+                } else {
+                    tabManager.openOrFocusCollectionTab(profile, db, coll)
+                }
+            },
+            onOpenAggTab = { profile, db, coll ->
+                tabManager.openNewClonedTab(profile, db, coll, CollectionWorkspaceTab.WorkspaceMode.AGGREGATION)
+            },
+            onOpenShellTab = { profile, db, coll ->
+                tabManager.openNewClonedTab(profile, db, coll, CollectionWorkspaceTab.WorkspaceMode.SHELL)
+            },
+            onEditCustomProfile = { existing -> openCustomUriDialog(existing) },
+            onDeleteCustomProfile = { existing ->
+                connectionManager.closeClient(existing.id)
+                customStore.delete(existing.id)
+                reloadProfilesAsync()
+            }
+        )
+
         buildGlobalHeader()
         buildBody()
 
@@ -229,7 +251,7 @@ class MongoLensMainPanel(
         rightPanel.add(tabs.component, "TABS")
         rightCardLayout.show(rightPanel, "WELCOME")
 
-        val splitter = JBSplitter(false, 0.24f).apply {
+        val splitter = JBSplitter(false, 0.22f).apply {
             firstComponent = connectionsTree
             secondComponent = rightPanel
         }
@@ -298,74 +320,6 @@ class MongoLensMainPanel(
             customStore.upsert(saved)
             connectionManager.closeClient(saved.id)
             reloadProfilesAsync()
-        }
-    }
-
-    private fun openCollectionTab(
-        profile: MongoConnectionProfile,
-        database: String,
-        collection: String,
-        mode: CollectionWorkspaceTab.WorkspaceMode,
-        forceNewTab: Boolean
-    ) {
-        // If single-clicked and an existing tab for the exact same collection is open, select it;
-        // double-click or context menu forces a new tab for side-by-side comparison.
-        if (!forceNewTab) {
-            val existingEntry = openTabsMap.entries.firstOrNull { (_, tab) ->
-                tab.profile.id == profile.id && tab.database == database && tab.collection == collection
-            }
-            if (existingEntry != null) {
-                tabs.select(existingEntry.key, true)
-                return
-            }
-        }
-
-        val tabPanel = CollectionWorkspaceTab(
-            project = project,
-            connectionManager = connectionManager,
-            savedQueryStore = savedQueryStore,
-            profile = profile,
-            database = database,
-            collection = collection,
-            initialMode = mode,
-            onStatusUpdate = { text, isError -> setStatus(text, isError) },
-            onReadOnlyStateChanged = {
-                connectionsTree.repaintTree()
-                openTabsMap.values.forEach { it.updateReadOnlyBadge() }
-            }
-        )
-        Disposer.register(this, tabPanel)
-
-        val num = tabCounter.incrementAndGet()
-        val modeSuffix = if (mode == CollectionWorkspaceTab.WorkspaceMode.AGGREGATION) " [Agg]" else ""
-        val tabTitle = "${profile.displayName}: $collection$modeSuffix"
-        val tabInfo = TabInfo(tabPanel).apply {
-            setText(tabTitle)
-            setTooltipText("${profile.displayName} / $database.$collection (#$num)")
-            setIcon(AllIcons.FileTypes.Json)
-        }
-
-        val closeAction = object : AnAction("Close Tab", "Close this workspace tab", AllIcons.Actions.Close) {
-            override fun actionPerformed(e: AnActionEvent) {
-                closeWorkspaceTab(tabInfo)
-            }
-        }
-        tabInfo.setTabLabelActions(DefaultActionGroup(closeAction), "MaekomMongoLensTab")
-
-        openTabsMap[tabInfo] = tabPanel
-        tabs.addTab(tabInfo)
-        tabs.select(tabInfo, true)
-        rightCardLayout.show(rightPanel, "TABS")
-    }
-
-    private fun closeWorkspaceTab(tabInfo: TabInfo) {
-        val tabPanel = openTabsMap.remove(tabInfo)
-        tabs.removeTab(tabInfo)
-        if (tabPanel != null) {
-            Disposer.dispose(tabPanel)
-        }
-        if (openTabsMap.isEmpty()) {
-            rightCardLayout.show(rightPanel, "WELCOME")
         }
     }
 
@@ -459,7 +413,6 @@ class MongoLensMainPanel(
     }
 
     override fun dispose() {
-        openTabsMap.clear()
-        // connectionManager is registered to project and disposed on project close; also safe if called here
+        tabManager.clearRegistry()
     }
 }

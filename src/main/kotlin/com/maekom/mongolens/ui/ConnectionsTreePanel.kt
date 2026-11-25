@@ -19,6 +19,8 @@ import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import java.awt.BorderLayout
 import java.awt.Font
+import java.awt.event.KeyAdapter
+import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.BorderFactory
@@ -40,6 +42,7 @@ class ConnectionsTreePanel(
     private val onStatusUpdate: (String, Boolean) -> Unit,
     private val onOpenFindTab: (MongoConnectionProfile, String, String, Boolean) -> Unit,
     private val onOpenAggTab: (MongoConnectionProfile, String, String) -> Unit,
+    private val onOpenShellTab: (MongoConnectionProfile, String, String) -> Unit,
     private val onEditCustomProfile: (MongoConnectionProfile) -> Unit,
     private val onDeleteCustomProfile: (MongoConnectionProfile) -> Unit
 ) : JPanel(BorderLayout()) {
@@ -158,6 +161,25 @@ class ConnectionsTreePanel(
             override fun treeWillCollapse(event: TreeExpansionEvent) = Unit
         })
 
+        tree.addKeyListener(object : KeyAdapter() {
+            override fun keyPressed(e: KeyEvent) {
+                if (e.keyCode != KeyEvent.VK_ENTER) return
+                val node = tree.lastSelectedPathComponent as? DefaultMutableTreeNode ?: return
+                val path = TreePath(node.path)
+                when (val data = node.userObject) {
+                    is TreeNodeData.CollectionNode -> {
+                        e.consume()
+                        onOpenFindTab(data.profile, data.database, data.collection, false)
+                    }
+                    is TreeNodeData.ProfileNode, is TreeNodeData.DatabaseNode -> {
+                        e.consume()
+                        if (tree.isExpanded(path)) tree.collapsePath(path) else tree.expandPath(path)
+                    }
+                    else -> Unit
+                }
+            }
+        })
+
         tree.addMouseListener(object : MouseAdapter() {
             override fun mousePressed(e: MouseEvent) = maybeShowContextMenu(e)
             override fun mouseReleased(e: MouseEvent) = maybeShowContextMenu(e)
@@ -168,11 +190,8 @@ class ConnectionsTreePanel(
                 val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return
                 when (val data = node.userObject) {
                     is TreeNodeData.CollectionNode -> {
-                        if (e.clickCount == 1) {
-                            onOpenFindTab(data.profile, data.database, data.collection, false)
-                        } else if (e.clickCount == 2) {
-                            onOpenFindTab(data.profile, data.database, data.collection, true)
-                        }
+                        // Normal click (single or double) opens or focuses existing tab — never duplicates
+                        onOpenFindTab(data.profile, data.database, data.collection, false)
                     }
                     is TreeNodeData.ProfileNode -> {
                         if (e.clickCount == 2) {
@@ -336,6 +355,9 @@ class ConnectionsTreePanel(
                 })
                 menu.add(JMenuItem(I18n.t("tree.ctx.openAgg")).apply {
                     addActionListener { onOpenAggTab(data.profile, data.database, data.collection) }
+                })
+                menu.add(JMenuItem(I18n.t("tree.ctx.openShell")).apply {
+                    addActionListener { onOpenShellTab(data.profile, data.database, data.collection) }
                 })
                 menu.addSeparator()
                 menu.add(JMenuItem(I18n.t("tree.ctx.copyName")).apply {
