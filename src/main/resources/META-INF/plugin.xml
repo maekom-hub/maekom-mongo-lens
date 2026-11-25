@@ -1,0 +1,27 @@
+<idea-plugin>
+    <id>com.maekom.mongolens</id>
+    <name>Maekom Mongo Lens</name>
+    <vendor url="https://github.com/maekom-hub/maekom-mongo-lens">maekom-hub</vendor>
+
+    <description><![CDATA[
+        <b>Maekom Mongo Lens</b> provides a Zero-Config MongoDB Compass-style GUI directly inside IntelliJ IDEA Community &amp; Ultimate.<br/><br/>
+        <ul>
+            <li><b>Zero-Config Spring Boot YAML Discovery:</b> Automatically parses single &amp; multi-document <code>application*.yml</code> files, resolves <code>${VAR:default}</code> placeholders and <code>.env</code>, and protects PRD environments with Read-Only lock.</li>
+            <li><b>Compass-Style Query Workspace:</b> Multi-tab Find workspace with Filter/Project/Sort JSON editors, field auto-completion, instant Limit stepping, Smart <code>$in</code> builder, Mongo Shell normalizer, and Tree / Raw JSON / Table viewers with index scan badges.</li>
+            <li><b>Bidirectional Aggregation Pipeline Builder:</b> Switch seamlessly between visual stage cards (with per-stage ON/OFF toggles &amp; 5-doc stage preview) and raw JSON script.</li>
+            <li><b>In-App GitHub Releases Updater &amp; Real-time KO/EN UI:</b> Check and install updates from GitHub Releases and toggle Korean/English without restarting the IDE.</li>
+        </ul>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow
+                id="Maekom Mongo Lens"
+                anchor="bottom"
+                icon="/icons/mongoLens.svg"
+                factoryClass="com.maekom.mongolens.ui.MaekomToolWindowFactory"
+                secondary="false"/>
+        <notificationGroup id="Maekom Mongo Lens" displayType="BALLOON"/>
+    </extensions>
+</idea-plugin>

@@ -1,0 +1,29 @@
+# Local management & AI agent files (NEVER commit to GitHub)
+manage.sh
+AGENTS.md
+GEMINI.md
+CLAUDE.md
+.maekom/
+
+# Gradle & Kotlin caches (keep gradle/wrapper/* tracked)
+.gradle/
+.kotlin/
+build/
+out/
+
+# IntelliJ Platform Sandbox & local IDE state
+.intellijPlatform/
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/usage.statistics.xml
+.idea/shelf/
+.idea/maekom-mongo-connections.json
+*.iml
+
+# Logs, heap dumps & local secrets
+*.log
+*.hprof
+.env
+.env.*
+local.properties
+.DS_Store
