@@ -220,7 +220,8 @@ class MongoJsonEditor(
     private fun updateAutoGrowHeight(editor: EditorEx) {
         val lines = editor.document.lineCount.coerceAtLeast(1)
         val clampedLines = lines.coerceAtMost(6)
-        val targetHeight = if (clampedLines <= 1) 28 else (28 + (clampedLines - 1) * 22).coerceAtMost(140)
+        val lineH = editor.lineHeight.coerceIn(18, 24)
+        val targetHeight = if (clampedLines <= 1) 28 else (10 + clampedLines * lineH).coerceIn(28, 140)
         val needScrollbar = lines >= 7
         editor.setVerticalScrollbarVisible(needScrollbar)
 
@@ -461,28 +462,6 @@ class MongoJsonEditor(
     fun setPreferredSizeHeight(height: Int) {
         preferredSize = Dimension(preferredSize.width.coerceAtLeast(140), height)
         minimumSize = Dimension(100, height.coerceAtMost(28))
-    }
-
-    /**
-     * Dynamically toggles between crisp 1-line mode (<=34px) and multi-line scrollable mode (>34px)
-     * without recreating the underlying document or losing text/caret.
-     */
-    fun applyDynamicHeight(heightPx: Int) {
-        val wantOneLine = heightPx <= 34
-        if (isOneLineMode != wantOneLine) {
-            setOneLineMode(wantOneLine)
-        }
-        (editor as? EditorEx)?.let { ed ->
-            ed.setVerticalScrollbarVisible(!wantOneLine)
-            ed.settings.isUseSoftWraps = true
-            ed.settings.additionalLinesCount = if (wantOneLine) 0 else 1
-        }
-        val clamped = heightPx.coerceIn(26, 200)
-        preferredSize = Dimension(preferredSize.width.coerceAtLeast(140), clamped)
-        minimumSize = Dimension(100, clamped)
-        maximumSize = Dimension(Int.MAX_VALUE, clamped)
-        revalidate()
-        repaint()
     }
 
     companion object {

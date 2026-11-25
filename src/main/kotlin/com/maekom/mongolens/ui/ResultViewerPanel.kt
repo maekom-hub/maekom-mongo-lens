@@ -211,6 +211,13 @@ class ResultViewerPanel(
         cardsPanel.add(tableScrollPane, "TABLE")
 
         add(cardsPanel, BorderLayout.CENTER)
+        com.intellij.openapi.util.Disposer.register(this) { clearAllDecryptedPlaintext() }
+        cryptoStore.addChangeListener(this) {
+            SwingUtilities.invokeLater {
+                clearAllDecryptedPlaintext()
+                resultTree.repaint()
+            }
+        }
         I18n.addListener(this) { refreshTexts() }
     }
 
@@ -338,7 +345,7 @@ class ResultViewerPanel(
 
         resultTree.addMouseMotionListener(object : MouseMotionAdapter() {
             override fun mouseMoved(e: MouseEvent) {
-                val path = resultTree.getPathForLocation(e.x, e.y)
+                val path = resolveTreePathAtPoint(e.x, e.y)
                 val node = path?.lastPathComponent as? FieldTreeNode
                 val rect = if (path != null && node != null) computeCryptoBadgeRect(path, node) else null
                 resultTree.cursor = if (rect != null && rect.contains(e.point)) {
@@ -356,7 +363,7 @@ class ResultViewerPanel(
             override fun mouseClicked(e: MouseEvent) {
                 if (!SwingUtilities.isLeftMouseButton(e)) return
                 if (e.clickCount == 1) {
-                    val path = resultTree.getPathForLocation(e.x, e.y) ?: return
+                    val path = resolveTreePathAtPoint(e.x, e.y) ?: return
                     val node = path.lastPathComponent as? FieldTreeNode ?: return
                     val badgeRect = computeCryptoBadgeRect(path, node)
                     if (badgeRect != null && badgeRect.contains(e.point)) {
@@ -635,6 +642,14 @@ class ResultViewerPanel(
         menu.show(invoker, x, y)
     }
 
+    private fun resolveTreePathAtPoint(x: Int, y: Int): TreePath? {
+        val exact = resultTree.getPathForLocation(x, y)
+        if (exact != null) return exact
+        val closest = resultTree.getClosestPathForLocation(x, y) ?: return null
+        val bounds = resultTree.getPathBounds(closest) ?: return null
+        return if (y in bounds.y..(bounds.y + bounds.height)) closest else null
+    }
+
     private fun decryptKeyFor(node: FieldTreeNode): String = "${node.rootDocNode.docIndex}:${node.fieldPath}"
 
     private fun computeCryptoBadgeRect(path: TreePath, node: FieldTreeNode): Rectangle? {
@@ -646,11 +661,12 @@ class ResultViewerPanel(
         }
 
         val bounds = resultTree.getPathBounds(path) ?: return null
+        val leftPad = (resultTree.cellRenderer as? ColoredTreeCellRenderer)?.ipad?.left ?: 2
         val plainFm = resultTree.getFontMetrics(resultTree.font)
         val boldFm = resultTree.getFontMetrics(resultTree.font.deriveFont(Font.BOLD))
         val italicFm = resultTree.getFontMetrics(resultTree.font.deriveFont(Font.ITALIC))
 
-        val prefixWidth = if (decrypted != null) {
+        val prefixWidth = leftPad + if (decrypted != null) {
             boldFm.stringWidth(node.keyLabel) +
                 plainFm.stringWidth(": ") +
                 boldFm.stringWidth("\"${decrypted.plaintext}\"") +
@@ -665,8 +681,8 @@ class ResultViewerPanel(
         }
 
         val badgeText = if (decrypted != null) "[${I18n.t("crypto.btn.hide")}]" else "[${I18n.t("crypto.btn.decrypt")}]"
-        val badgeWidth = boldFm.stringWidth(badgeText) + 10
-        return Rectangle(bounds.x + prefixWidth - 4, bounds.y, badgeWidth, bounds.height)
+        val badgeWidth = boldFm.stringWidth(badgeText) + 14
+        return Rectangle(bounds.x + prefixWidth - 6, bounds.y, badgeWidth, bounds.height)
     }
 
     private fun handleCryptoBadgeClick(node: FieldTreeNode) {
@@ -781,6 +797,11 @@ class ResultViewerPanel(
 
     private fun replaceDocumentInPlace(docIndex: Int, updatedDoc: BsonDocument) {
         if (docIndex !in currentDocs.indices) return
+        // Purge any active decrypted entries for this edited document
+        val prefix = "$docIndex:"
+        decryptedFields.keys.removeIf { it.startsWith(prefix) }
+        if (decryptedFields.isEmpty()) decryptCountdownTimer.stop()
+
         val savedTreePos = treeScrollPane.viewport.viewPosition
         val savedTablePos = tableScrollPane.viewport.viewPosition
 
@@ -814,6 +835,7 @@ class ResultViewerPanel(
 
     private fun removeDocumentInPlace(docIndex: Int) {
         if (docIndex !in currentDocs.indices) return
+        clearAllDecryptedPlaintext()
         val savedTreePos = treeScrollPane.viewport.viewPosition
         val savedTablePos = tableScrollPane.viewport.viewPosition
 

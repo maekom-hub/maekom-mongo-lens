@@ -252,6 +252,10 @@ class DocumentEditDialog(
         margin = JBUI.insets(2, 8)
         isEnabled = !isReadOnly
     }
+    private val decryptSelectedBtn = JButton("🔓 ${I18n.t("crypto.btn.decrypt")}").apply {
+        margin = JBUI.insets(2, 8)
+        isEnabled = false
+    }
 
     private val rawJsonEditor = MongoJsonEditor(
         projectRef = project,
@@ -797,11 +801,14 @@ class DocumentEditDialog(
             add(bannerStack, BorderLayout.SOUTH)
         }
 
-        // Structured mode toolbar: [+ Add Key/Value] [▲ Move Up] [▼ Move Down]
+        // Structured mode toolbar: [+ Add Key/Value] [▲ Move Up] [▼ Move Down] [🔓 Decrypt (works even in READ-ONLY!)]
         val structuredToolbar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2)).apply {
             add(addFieldBtn)
             add(moveUpBtn)
             add(moveDownBtn)
+            if (cryptoStore != null) {
+                add(decryptSelectedBtn)
+            }
         }
         val structuredPanel = JPanel(BorderLayout(0, 4)).apply {
             add(structuredToolbar, BorderLayout.NORTH)
@@ -899,6 +906,17 @@ class DocumentEditDialog(
 
         moveUpBtn.addActionListener { moveSelectedRow(-1) }
         moveDownBtn.addActionListener { moveSelectedRow(1) }
+
+        treeTable.selectionModel.addListSelectionListener {
+            updateDecryptSelectedButtonState()
+        }
+        decryptSelectedBtn.addActionListener {
+            val row = treeTable.selectedRow
+            val node = if (row >= 0) treeTableModel.getNodeAt(row) else null
+            if (node != null && node.type == BsonFieldType.STRING) {
+                revealEncryptedValueTemporarily(node.valueText)
+            }
+        }
 
         deleteDocBtn.addActionListener { performDeleteEntireDocument() }
         saveBtn.addActionListener { performSaveDocument() }
@@ -1140,6 +1158,74 @@ class DocumentEditDialog(
         errorBanner.text = ""
     }
 
+    private fun updateDecryptSelectedButtonState() {
+        val store = cryptoStore
+        if (store == null) {
+            decryptSelectedBtn.isEnabled = false
+            return
+        }
+        val row = treeTable.selectedRow
+        val node = if (row >= 0) treeTableModel.getNodeAt(row) else null
+        decryptSelectedBtn.isEnabled = node != null &&
+            node.type == BsonFieldType.STRING &&
+            CryptoService.isEncryptedCandidate(node.valueText, store.getConfig(profile.profileName))
+    }
+
+    private fun revealEncryptedValueTemporarily(cipherText: String) {
+        val store = cryptoStore ?: return
+        var secret = store.getSecretKey(profile.profileName)
+        if (secret.isBlank()) {
+            val cfgDlg = DecryptConfigDialog(project, projectBasePath, store, profile.profileName)
+            if (!cfgDlg.showAndGet()) return
+            secret = store.getSecretKey(profile.profileName)
+            if (secret.isBlank()) return
+        }
+        val cfg = store.getConfig(profile.profileName)
+        try {
+            val plain = CryptoService.decrypt(cipherText, cfg, secret)
+            var remaining = cfg.clampedRevealSeconds()
+            val textField = JBTextField(plain).apply {
+                isEditable = false
+                font = Font(Font.MONOSPACED, Font.BOLD, 12)
+                preferredSize = Dimension(400, 30)
+            }
+            val popup = com.intellij.openapi.ui.popup.JBPopupFactory.getInstance()
+                .createComponentPopupBuilder(textField, textField)
+                .setTitle(I18n.t("crypto.tempRevealTitle", remaining))
+                .setRequestFocus(true)
+                .setFocusable(true)
+                .setCancelOnClickOutside(true)
+                .setCancelKeyEnabled(true)
+                .createPopup()
+            popup.showInCenterOf(treeTable)
+            textField.selectAll()
+
+            val countdownTimer = javax.swing.Timer(1000, null)
+            countdownTimer.addActionListener {
+                remaining -= 1
+                if (remaining <= 0 || popup.isDisposed) {
+                    countdownTimer.stop()
+                    textField.text = ""
+                    if (!popup.isDisposed) popup.cancel()
+                } else {
+                    popup.setCaption(I18n.t("crypto.tempRevealTitle", remaining))
+                }
+            }
+            com.intellij.openapi.util.Disposer.register(disposable) {
+                countdownTimer.stop()
+                textField.text = ""
+                if (!popup.isDisposed) popup.cancel()
+            }
+            com.intellij.openapi.util.Disposer.register(popup) {
+                countdownTimer.stop()
+                textField.text = ""
+            }
+            countdownTimer.start()
+        } catch (t: Throwable) {
+            showErrorBanner(I18n.t("crypto.decryptFailed", t.message ?: t.javaClass.simpleName))
+        }
+    }
+
     /**
      * Dynamic TableCellEditor for the Value column switching UI by BSON type:
      * - Boolean -> ComboBox(true / false) only
@@ -1186,7 +1272,7 @@ class DocumentEditDialog(
         private val encDecryptBtn = JButton(I18n.t("crypto.btn.decrypt")).apply {
             margin = JBUI.insets(0, 5)
             addActionListener {
-                revealTemporaryPlaintext(encStringField.text)
+                revealEncryptedValueTemporarily(encStringField.text)
             }
         }
         private val encStringComposite = JPanel(BorderLayout(2, 0)).apply {
@@ -1245,44 +1331,6 @@ class DocumentEditDialog(
                 currentType == BsonFieldType.OBJECT_ID -> oidField.text
                 usingEncryptedEditor -> encStringField.text
                 else -> plainField.text
-            }
-        }
-
-        private fun revealTemporaryPlaintext(cipherText: String) {
-            val store = cryptoStore ?: return
-            var secret = store.getSecretKey(profile.profileName)
-            if (secret.isBlank()) {
-                val cfgDlg = DecryptConfigDialog(project, projectBasePath, store, profile.profileName)
-                if (!cfgDlg.showAndGet()) return
-                secret = store.getSecretKey(profile.profileName)
-                if (secret.isBlank()) return
-            }
-            val cfg = store.getConfig(profile.profileName)
-            try {
-                val plain = CryptoService.decrypt(cipherText, cfg, secret)
-                val sec = cfg.clampedRevealSeconds()
-                val textField = JBTextField(plain).apply {
-                    isEditable = false
-                    font = Font(Font.MONOSPACED, Font.BOLD, 12)
-                    preferredSize = Dimension(380, 30)
-                }
-                val popup = com.intellij.openapi.ui.popup.JBPopupFactory.getInstance()
-                    .createComponentPopupBuilder(textField, textField)
-                    .setTitle(I18n.t("crypto.tempRevealTitle", sec))
-                    .setRequestFocus(true)
-                    .setFocusable(true)
-                    .setCancelOnClickOutside(true)
-                    .setCancelKeyEnabled(true)
-                    .createPopup()
-                popup.showInCenterOf(treeTable)
-                textField.selectAll()
-                val closeTimer = javax.swing.Timer(sec * 1000) {
-                    if (!popup.isDisposed) popup.cancel()
-                }
-                closeTimer.isRepeats = false
-                closeTimer.start()
-            } catch (t: Throwable) {
-                showErrorBanner(I18n.t("crypto.decryptFailed", t.message ?: t.javaClass.simpleName))
             }
         }
     }

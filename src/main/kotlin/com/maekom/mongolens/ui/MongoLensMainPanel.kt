@@ -1,17 +1,27 @@
 package com.maekom.mongolens.ui
 
+import com.intellij.icons.AllIcons
+import com.intellij.ide.ActivityTracker
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.actionSystem.ActionToolbar
+import com.intellij.openapi.actionSystem.ActionUpdateThread
+import com.intellij.openapi.actionSystem.AnAction
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.DefaultActionGroup
+import com.intellij.openapi.actionSystem.Presentation
+import com.intellij.openapi.actionSystem.Separator
+import com.intellij.openapi.actionSystem.ex.CustomComponentAction
+import com.intellij.openapi.actionSystem.impl.ActionButtonWithText
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.Task
+import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.util.Disposer
 import com.intellij.ui.JBSplitter
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.tabs.JBTabs
 import com.intellij.ui.tabs.JBTabsFactory
-import com.intellij.util.ui.JBUI
 import com.maekom.mongolens.config.CustomConnectionStore
 import com.maekom.mongolens.config.MongoConnectionProfile
 import com.maekom.mongolens.config.SavedQueryStore
@@ -25,17 +35,12 @@ import com.maekom.mongolens.update.PluginUpdateChecker
 import com.maekom.mongolens.update.ReleaseInfo
 import java.awt.BorderLayout
 import java.awt.CardLayout
-import java.awt.Dimension
-import java.awt.FlowLayout
 import java.awt.Font
 import java.awt.GridBagLayout
 import java.nio.file.Path
 import java.nio.file.Paths
-import javax.swing.BorderFactory
 import javax.swing.Box
 import javax.swing.BoxLayout
-import javax.swing.DefaultComboBoxModel
-import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.SwingUtilities
@@ -45,19 +50,6 @@ class MongoLensMainPanel(
     parentDisposable: Disposable
 ) : JPanel(BorderLayout()), Disposable {
 
-    private sealed class ProfileDropdownItem {
-        object AllProfiles : ProfileDropdownItem() {
-            override fun toString(): String = I18n.t("header.allProfiles")
-        }
-        data class SingleProfile(val profile: MongoConnectionProfile) : ProfileDropdownItem() {
-            override fun toString(): String =
-                if (profile.readOnly) "${profile.displayName} 🔒" else profile.displayName
-        }
-        object AddCustomUri : ProfileDropdownItem() {
-            override fun toString(): String = I18n.t("header.addCustomUri")
-        }
-    }
-
     private val projectBasePath: Path? = project.basePath?.let { Paths.get(it) }
     private val yamlParser = SpringYamlConfigParser()
     private val customStore = CustomConnectionStore(projectBasePath)
@@ -66,44 +58,20 @@ class MongoLensMainPanel(
     private val cryptoStore = CryptoConfigStore(projectBasePath)
     private val connectionManager = MongoConnectionManager(project)
 
+    @Volatile
     private var discoveredProfiles: List<MongoConnectionProfile> = emptyList()
+
+    @Volatile
     private var selectedProfileFilterId: String? = null
-    private var suppressDropdownEvent = false
+
+    @Volatile
     private var availableUpdate: ReleaseInfo? = null
 
-    // Global 1-row header controls
-    private val titleLabel = JBLabel(I18n.t("app.title")).apply {
-        font = font.deriveFont(Font.BOLD, (font.size + 1).toFloat())
-    }
-    private val versionBadge = UiHelpers.createBadgeLabel(
-        "v${PluginUpdateChecker.currentVersionString()}",
-        UiHelpers.COLOR_BLUE_BG,
-        UiHelpers.COLOR_BLUE_FG
-    )
-    private val profileComboModel = DefaultComboBoxModel<ProfileDropdownItem>()
-    private val profileCombo = ComboBox(profileComboModel).apply {
-        preferredSize = Dimension(190, 26)
-    }
-    private val syncYamlBtn = JButton(I18n.t("header.syncYaml")).apply {
-        margin = JBUI.insets(1, 8)
-        toolTipText = I18n.t("header.syncYamlTooltip")
-    }
+    @Volatile
+    private var checkingUpdate: Boolean = false
 
-    private val statusLabel = JBLabel(I18n.t("header.status.idle")).apply {
-        border = JBUI.Borders.empty(0, 6)
-    }
-    private val cryptoConfigBtn = JButton(I18n.t("header.cryptoConfig")).apply {
-        margin = JBUI.insets(1, 8)
-        toolTipText = I18n.t("header.cryptoConfigTooltip")
-    }
-    private val updateBtn = JButton(I18n.t("header.update.check")).apply {
-        margin = JBUI.insets(1, 8)
-        toolTipText = I18n.t("header.update.tooltip")
-    }
-    private val langToggleBtn = JButton(I18n.getLang().code).apply {
-        margin = JBUI.insets(1, 8)
-        toolTipText = I18n.t("header.lang.toggleTooltip")
-    }
+    @Volatile
+    private var currentStatusText: String = I18n.t("header.status.idle")
 
     private val tabs: JBTabs = JBTabsFactory.createTabs(project, this)
     private val rightCardLayout = CardLayout()
@@ -117,7 +85,6 @@ class MongoLensMainPanel(
         alignmentX = JComponent.CENTER_ALIGNMENT
     }
 
-    // Left tree & Right multi-tab manager
     private lateinit var connectionsTree: ConnectionsTreePanel
     private val tabManager: WorkspaceTabManager
 
@@ -133,7 +100,7 @@ class MongoLensMainPanel(
             savedQueryStore = savedQueryStore,
             variableStore = variableStore,
             cryptoStore = cryptoStore,
-            onStatusUpdate = { text, isError -> setStatus(text, isError) },
+            onStatusUpdate = { text, _ -> setStatus(text) },
             onReadOnlyStateChanged = { connectionsTree.repaintTree() },
             onTabCountChanged = { count ->
                 rightCardLayout.show(rightPanel, if (count > 0) "TABS" else "WELCOME")
@@ -144,7 +111,7 @@ class MongoLensMainPanel(
             project = project,
             connectionManager = connectionManager,
             parentDisposable = this,
-            onStatusUpdate = { text, isError -> setStatus(text, isError) },
+            onStatusUpdate = { text, _ -> setStatus(text) },
             onOpenFindTab = { profile, db, coll, forceNew ->
                 if (forceNew) {
                     tabManager.openNewClonedTab(profile, db, coll, CollectionWorkspaceTab.WorkspaceMode.FIND)
@@ -166,91 +133,17 @@ class MongoLensMainPanel(
             }
         )
 
-        buildGlobalHeader()
+        // Body starts immediately with Connections Tree | Collection Workspace Tabs (NO duplicate top header bar)
         buildBody()
 
-        // Watch Spring YAML & .env changes automatically
         YamlConfigWatcher(project, this) {
             reloadProfilesAsync()
         }
 
         I18n.addListener(this) { refreshTexts() }
 
-        // Initial scan & one-time silent GitHub release check (asynchronous, non-blocking)
         reloadProfilesAsync()
         triggerUpdateCheck(silent = true)
-    }
-
-    private fun buildGlobalHeader() {
-        val header = JPanel(BorderLayout(8, 0)).apply {
-            border = BorderFactory.createCompoundBorder(
-                BorderFactory.createMatteBorder(0, 0, 1, 0, JBUI.CurrentTheme.ToolWindow.borderColor()),
-                JBUI.Borders.empty(3, 8)
-            )
-        }
-
-        val left = JPanel(FlowLayout(FlowLayout.LEFT, 6, 1)).apply {
-            add(titleLabel)
-            add(versionBadge)
-            add(profileCombo)
-            add(syncYamlBtn)
-        }
-
-        val right = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 1)).apply {
-            add(statusLabel)
-            add(cryptoConfigBtn)
-            add(updateBtn)
-            add(langToggleBtn)
-        }
-
-        header.add(left, BorderLayout.WEST)
-        header.add(right, BorderLayout.EAST)
-        add(header, BorderLayout.NORTH)
-
-        profileCombo.addActionListener {
-            if (suppressDropdownEvent) return@addActionListener
-            when (val selected = profileCombo.selectedItem as? ProfileDropdownItem) {
-                is ProfileDropdownItem.AllProfiles -> {
-                    selectedProfileFilterId = null
-                    connectionsTree.setProfileFilter(null)
-                }
-                is ProfileDropdownItem.SingleProfile -> {
-                    selectedProfileFilterId = selected.profile.id
-                    connectionsTree.setProfileFilter(selected.profile.id)
-                    if (connectionManager.isEffectivelyReadOnly(selected.profile)) {
-                        setStatus(I18n.t("header.status.readOnly"), false)
-                    }
-                }
-                is ProfileDropdownItem.AddCustomUri -> {
-                    openCustomUriDialog(null)
-                    restoreDropdownSelection()
-                }
-                null -> Unit
-            }
-        }
-
-        syncYamlBtn.addActionListener { reloadProfilesAsync() }
-
-        cryptoConfigBtn.addActionListener {
-            val targetProfileName = tabManager.activeTabProfileName()
-                ?: discoveredProfiles.firstOrNull { it.id == selectedProfileFilterId }?.profileName
-                ?: discoveredProfiles.firstOrNull()?.profileName
-                ?: "default"
-            DecryptConfigDialog(project, projectBasePath, cryptoStore, targetProfileName).show()
-        }
-
-        updateBtn.addActionListener {
-            val pending = availableUpdate
-            if (pending != null) {
-                PluginUpdateChecker.promptAndInstallUpdate(project, pending)
-            } else {
-                triggerUpdateCheck(silent = false)
-            }
-        }
-
-        langToggleBtn.addActionListener {
-            I18n.toggle()
-        }
     }
 
     private fun buildBody() {
@@ -275,7 +168,221 @@ class MongoLensMainPanel(
         add(splitter, BorderLayout.CENTER)
     }
 
-    private fun reloadProfilesAsync() {
+    /**
+     * Builds the lightweight native ToolWindowEx title actions integrated into IntelliJ's
+     * single native ToolWindow title bar (100% IntelliJ New UI compatible).
+     */
+    fun createTitleActions(): List<AnAction> {
+        // 1. Version & Connection Status indicator
+        val versionStatusAction = object : AnAction(), DumbAware, CustomComponentAction {
+            override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+            override fun createCustomComponent(presentation: Presentation, place: String): JComponent {
+                return ActionButtonWithText(this, presentation, place, ActionToolbar.DEFAULT_MINIMUM_BUTTON_SIZE)
+            }
+
+            override fun update(e: AnActionEvent) {
+                val ver = PluginUpdateChecker.currentVersionString()
+                val text = "v$ver · $currentStatusText"
+                e.presentation.text = text
+                e.presentation.description = "${I18n.t("app.title")} $text"
+            }
+
+            override fun actionPerformed(e: AnActionEvent) {
+                val ver = PluginUpdateChecker.currentVersionString()
+                UiHelpers.notify(project, "${I18n.t("app.title")} v$ver · $currentStatusText")
+            }
+        }
+
+        // 2. Profile Selector Dropdown (DefaultActionGroup, isPopup = true)
+        val profileSelectorGroup = object : DefaultActionGroup(), DumbAware, CustomComponentAction {
+            init {
+                isPopup = true
+                templatePresentation.icon = AllIcons.Nodes.DataTables
+            }
+
+            override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+            override fun createCustomComponent(presentation: Presentation, place: String): JComponent {
+                return ActionButtonWithText(this, presentation, place, ActionToolbar.DEFAULT_MINIMUM_BUTTON_SIZE)
+            }
+
+            override fun update(e: AnActionEvent) {
+                val selectedId = selectedProfileFilterId
+                val label = if (selectedId == null) {
+                    I18n.t("header.allProfiles")
+                } else {
+                    val found = discoveredProfiles.firstOrNull { it.id == selectedId }
+                    if (found != null) {
+                        if (found.readOnly) "${found.displayName} 🔒" else found.displayName
+                    } else {
+                        I18n.t("header.allProfiles")
+                    }
+                }
+                e.presentation.text = label
+                e.presentation.icon = AllIcons.Nodes.DataTables
+            }
+
+            override fun getChildren(e: AnActionEvent?): Array<AnAction> {
+                val actions = mutableListOf<AnAction>()
+                val currentFilterId = selectedProfileFilterId
+
+                actions.add(object : AnAction(
+                    I18n.t("header.allProfiles"),
+                    null,
+                    if (currentFilterId == null) AllIcons.Actions.Checked else null
+                ), DumbAware {
+                    override fun actionPerformed(ev: AnActionEvent) {
+                        selectedProfileFilterId = null
+                        connectionsTree.setProfileFilter(null)
+                        refreshTitleToolbar()
+                    }
+                })
+
+                val snapshot = discoveredProfiles
+                if (snapshot.isNotEmpty()) {
+                    actions.add(Separator.getInstance())
+                    for (profile in snapshot) {
+                        val itemText = if (profile.readOnly) "${profile.displayName} 🔒" else profile.displayName
+                        val isSelected = currentFilterId == profile.id
+                        actions.add(object : AnAction(
+                            itemText,
+                            profile.maskedLocation(),
+                            if (isSelected) AllIcons.Actions.Checked else null
+                        ), DumbAware {
+                            override fun actionPerformed(ev: AnActionEvent) {
+                                selectedProfileFilterId = profile.id
+                                connectionsTree.setProfileFilter(profile.id)
+                                if (connectionManager.isEffectivelyReadOnly(profile)) {
+                                    setStatus(I18n.t("header.status.readOnly"))
+                                }
+                                refreshTitleToolbar()
+                            }
+                        })
+                    }
+                }
+
+                actions.add(Separator.getInstance())
+                actions.add(object : AnAction(
+                    I18n.t("header.addCustomUri"),
+                    null,
+                    AllIcons.General.Add
+                ), DumbAware {
+                    override fun actionPerformed(ev: AnActionEvent) {
+                        openCustomUriDialog(null)
+                    }
+                })
+
+                return actions.toTypedArray()
+            }
+        }
+
+        // 3. YAML Sync Action (AllIcons.Actions.Refresh)
+        val syncYamlAction = object : AnAction(AllIcons.Actions.Refresh), DumbAware {
+            override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+            override fun update(e: AnActionEvent) {
+                e.presentation.text = I18n.t("header.syncYaml").removePrefix("↻ ").trim()
+                e.presentation.description = I18n.t("header.syncYamlTooltip")
+                e.presentation.icon = AllIcons.Actions.Refresh
+            }
+
+            override fun actionPerformed(e: AnActionEvent) {
+                reloadProfilesAsync()
+            }
+        }
+
+        // 4. Decrypt Config Action (AllIcons.Nodes.Padlock)
+        val decryptConfigAction = object : AnAction(AllIcons.Nodes.Padlock), DumbAware {
+            override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+            override fun update(e: AnActionEvent) {
+                e.presentation.text = I18n.t("header.cryptoConfig").removePrefix("🔐 ").trim()
+                e.presentation.description = I18n.t("header.cryptoConfigTooltip")
+                e.presentation.icon = AllIcons.Nodes.Padlock
+            }
+
+            override fun actionPerformed(e: AnActionEvent) {
+                openDecryptConfigDialog()
+            }
+        }
+
+        // 5. Update Check / Install Action (AllIcons.Actions.Download)
+        val updateAction = object : AnAction(AllIcons.Actions.Download), DumbAware, CustomComponentAction {
+            override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+            override fun createCustomComponent(presentation: Presentation, place: String): JComponent {
+                return ActionButtonWithText(this, presentation, place, ActionToolbar.DEFAULT_MINIMUM_BUTTON_SIZE)
+            }
+
+            override fun update(e: AnActionEvent) {
+                val pending = availableUpdate
+                e.presentation.isEnabled = !checkingUpdate
+                e.presentation.icon = AllIcons.Actions.Download
+                when {
+                    checkingUpdate -> {
+                        e.presentation.text = I18n.t("header.update.checking")
+                        e.presentation.description = I18n.t("header.update.checking")
+                    }
+                    pending != null -> {
+                        e.presentation.text = "⬆ ${pending.tagName}"
+                        e.presentation.description = I18n.t("header.update.availableTooltip", pending.tagName)
+                    }
+                    else -> {
+                        e.presentation.text = I18n.t("header.update.check").removePrefix("↻ ").trim()
+                        e.presentation.description = I18n.t("header.update.tooltip")
+                    }
+                }
+            }
+
+            override fun actionPerformed(e: AnActionEvent) {
+                val pending = availableUpdate
+                if (pending != null) {
+                    PluginUpdateChecker.promptAndInstallUpdate(project, pending)
+                } else {
+                    triggerUpdateCheck(silent = false)
+                }
+            }
+        }
+
+        // 6. KO / EN Language Toggle Action
+        val langToggleAction = object : AnAction(), DumbAware, CustomComponentAction {
+            override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+            override fun createCustomComponent(presentation: Presentation, place: String): JComponent {
+                return ActionButtonWithText(this, presentation, place, ActionToolbar.DEFAULT_MINIMUM_BUTTON_SIZE)
+            }
+
+            override fun update(e: AnActionEvent) {
+                e.presentation.text = I18n.getLang().code
+                e.presentation.description = I18n.t("header.lang.toggleTooltip")
+            }
+
+            override fun actionPerformed(e: AnActionEvent) {
+                I18n.toggle()
+                refreshTitleToolbar()
+            }
+        }
+
+        return listOf(
+            versionStatusAction,
+            profileSelectorGroup,
+            syncYamlAction,
+            decryptConfigAction,
+            updateAction,
+            langToggleAction
+        )
+    }
+
+    fun openDecryptConfigDialog() {
+        val targetProfileName = tabManager.activeTabProfileName()
+            ?: discoveredProfiles.firstOrNull { it.id == selectedProfileFilterId }?.profileName
+            ?: discoveredProfiles.firstOrNull()?.profileName
+            ?: "default"
+        DecryptConfigDialog(project, projectBasePath, cryptoStore, targetProfileName).show()
+    }
+
+    fun reloadProfilesAsync() {
         object : Task.Backgroundable(project, "Scanning Spring YAML MongoDB configs...", true) {
             override fun run(indicator: ProgressIndicator) {
                 val yamlProfiles = yamlParser.scanProject(projectBasePath)
@@ -288,46 +395,11 @@ class MongoLensMainPanel(
                     if (selectedProfileFilterId != null && merged.none { it.id == selectedProfileFilterId }) {
                         selectedProfileFilterId = null
                     }
-                    rebuildProfileDropdown()
                     connectionsTree.setProfiles(merged, selectedProfileFilterId)
+                    refreshTitleToolbar()
                 }
             }
         }.queue()
-    }
-
-    private fun rebuildProfileDropdown() {
-        suppressDropdownEvent = true
-        try {
-            profileComboModel.removeAllElements()
-            profileComboModel.addElement(ProfileDropdownItem.AllProfiles)
-            discoveredProfiles.forEach { p ->
-                profileComboModel.addElement(ProfileDropdownItem.SingleProfile(p))
-            }
-            profileComboModel.addElement(ProfileDropdownItem.AddCustomUri)
-            restoreDropdownSelection()
-        } finally {
-            suppressDropdownEvent = false
-        }
-    }
-
-    private fun restoreDropdownSelection() {
-        suppressDropdownEvent = true
-        try {
-            if (selectedProfileFilterId == null) {
-                profileCombo.selectedIndex = 0
-            } else {
-                for (i in 0 until profileComboModel.size) {
-                    val item = profileComboModel.getElementAt(i)
-                    if (item is ProfileDropdownItem.SingleProfile && item.profile.id == selectedProfileFilterId) {
-                        profileCombo.selectedIndex = i
-                        return
-                    }
-                }
-                profileCombo.selectedIndex = 0
-            }
-        } finally {
-            suppressDropdownEvent = false
-        }
     }
 
     private fun openCustomUriDialog(existing: MongoConnectionProfile?) {
@@ -342,29 +414,20 @@ class MongoLensMainPanel(
 
     private fun triggerUpdateCheck(silent: Boolean) {
         if (!silent) {
-            updateBtn.isEnabled = false
-            updateBtn.text = I18n.t("header.update.checking")
+            checkingUpdate = true
+            refreshTitleToolbar()
         }
         PluginUpdateChecker.checkLatestReleaseAsync(project, silent) { result ->
-            updateBtn.isEnabled = true
+            checkingUpdate = false
             result.onSuccess { release ->
-                if (release != null) {
-                    availableUpdate = release
-                    applyUpdateAvailableButtonStyle(release)
-                } else {
-                    availableUpdate = null
-                    applyDefaultUpdateButtonStyle()
-                    if (!silent) {
-                        UiHelpers.notify(
-                            project,
-                            I18n.t("header.update.upToDate", "v${PluginUpdateChecker.currentVersionString()}")
-                        )
-                    }
+                availableUpdate = release
+                if (release == null && !silent) {
+                    UiHelpers.notify(
+                        project,
+                        I18n.t("header.update.upToDate", "v${PluginUpdateChecker.currentVersionString()}")
+                    )
                 }
             }.onFailure { err ->
-                if (availableUpdate == null) {
-                    applyDefaultUpdateButtonStyle()
-                }
                 if (!silent) {
                     UiHelpers.notify(
                         project,
@@ -373,31 +436,20 @@ class MongoLensMainPanel(
                     )
                 }
             }
+            refreshTitleToolbar()
         }
     }
 
-    private fun applyUpdateAvailableButtonStyle(release: ReleaseInfo) {
-        updateBtn.text = I18n.t("header.update.available", release.tagName)
-        updateBtn.toolTipText = I18n.t("header.update.availableTooltip", release.tagName)
-        updateBtn.background = UiHelpers.COLOR_GREEN_BG
-        updateBtn.foreground = UiHelpers.COLOR_GREEN_FG
-        updateBtn.font = updateBtn.font.deriveFont(Font.BOLD)
-        updateBtn.isOpaque = true
+    private fun setStatus(text: String) {
+        currentStatusText = text
+        refreshTitleToolbar()
     }
 
-    private fun applyDefaultUpdateButtonStyle() {
-        updateBtn.text = I18n.t("header.update.check")
-        updateBtn.toolTipText = I18n.t("header.update.tooltip")
-        updateBtn.background = null
-        updateBtn.foreground = null
-        updateBtn.font = updateBtn.font.deriveFont(Font.PLAIN)
-        updateBtn.isOpaque = false
-    }
-
-    private fun setStatus(text: String, isError: Boolean) {
-        SwingUtilities.invokeLater {
-            statusLabel.text = text
-            statusLabel.foreground = if (isError) UiHelpers.COLOR_RED_FG else null
+    private fun refreshTitleToolbar() {
+        ApplicationManager.getApplication().invokeLater {
+            if (!project.isDisposed) {
+                ActivityTracker.getInstance().inc()
+            }
         }
     }
 
@@ -407,27 +459,12 @@ class MongoLensMainPanel(
 
     private fun refreshTexts() {
         SwingUtilities.invokeLater {
-            titleLabel.text = I18n.t("app.title")
-            syncYamlBtn.text = I18n.t("header.syncYaml")
-            syncYamlBtn.toolTipText = I18n.t("header.syncYamlTooltip")
-            cryptoConfigBtn.text = I18n.t("header.cryptoConfig")
-            cryptoConfigBtn.toolTipText = I18n.t("header.cryptoConfigTooltip")
-            langToggleBtn.text = I18n.getLang().code
-            langToggleBtn.toolTipText = I18n.t("header.lang.toggleTooltip")
             welcomeTitleLabel.text = I18n.t("workspace.welcome.title")
             welcomeDescLabel.text = formatHtmlCenter(I18n.t("workspace.welcome.desc"))
-
-            val pending = availableUpdate
-            if (pending != null) {
-                applyUpdateAvailableButtonStyle(pending)
-            } else {
-                applyDefaultUpdateButtonStyle()
+            if (currentStatusText == "대기 중" || currentStatusText == "Idle") {
+                currentStatusText = I18n.t("header.status.idle")
             }
-
-            if (statusLabel.text == "대기 중" || statusLabel.text == "Idle") {
-                statusLabel.text = I18n.t("header.status.idle")
-            }
-            profileCombo.repaint()
+            ActivityTracker.getInstance().inc()
         }
     }
 

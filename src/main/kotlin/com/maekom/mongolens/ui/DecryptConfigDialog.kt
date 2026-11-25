@@ -175,12 +175,35 @@ class DecryptConfigDialog(
 
     override fun doValidate(): ValidationInfo? {
         val rawKey = String(secretKeyField.password)
+        val enc = (encodingCombo.selectedItem as? KeyEncoding) ?: KeyEncoding.UTF8
         if (rawKey.isNotBlank()) {
-            val enc = (encodingCombo.selectedItem as? KeyEncoding) ?: KeyEncoding.UTF8
             try {
                 CryptoService.decodeKeyBytes(rawKey, enc)
             } catch (t: Throwable) {
                 return ValidationInfo(t.message ?: "Invalid AES key", secretKeyField)
+            }
+        }
+        val mode = (modeCombo.selectedItem as? DecryptMode) ?: DecryptMode.AES_CBC_IV_PREFIX
+        if (mode == DecryptMode.AES_CBC_FIXED_IV && rawKey.isNotBlank()) {
+            val ivRaw = fixedIvField.text.trim()
+            if (ivRaw.isEmpty()) {
+                return ValidationInfo("Fixed IV (16 bytes) is required for AES/CBC Fixed IV mode.", fixedIvField)
+            }
+            try {
+                val ivBytes = when (enc) {
+                    KeyEncoding.UTF8 -> ivRaw.toByteArray(java.nio.charset.StandardCharsets.UTF_8)
+                    KeyEncoding.BASE64 -> java.util.Base64.getDecoder().decode(ivRaw)
+                    KeyEncoding.HEX -> {
+                        val clean = ivRaw.replace(" ", "").removePrefix("0x").removePrefix("0X")
+                        if (clean.length % 2 != 0) throw IllegalArgumentException("Invalid Hex IV length.")
+                        ByteArray(clean.length / 2) { i -> clean.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
+                    }
+                }
+                if (ivBytes.size != 16) {
+                    return ValidationInfo("Fixed IV must be exactly 16 bytes (got ${ivBytes.size} bytes).", fixedIvField)
+                }
+            } catch (t: Throwable) {
+                return ValidationInfo(t.message ?: "Invalid Fixed IV", fixedIvField)
             }
         }
         return null
