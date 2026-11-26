@@ -7,6 +7,7 @@ import org.bson.BsonDocument
 import org.bson.BsonDouble
 import org.bson.BsonInt32
 import org.bson.BsonInt64
+import org.bson.BsonNull
 import org.bson.BsonObjectId
 import org.bson.BsonString
 import org.bson.BsonValue
@@ -96,9 +97,11 @@ data class JoinSpec(
     }
 
     /**
-     * Builds the safe 3-stage Join Aggregation Pipeline:
+     * Builds the unified AWS DocumentDB & MongoDB compatible 3-stage Join Aggregation Pipeline:
      * 1. Pre-filter & paging compression ($match -> $sort -> $skip -> $limit)
-     * 2. Safe $lookup (LATEST_ONE sub-pipeline with $limit:1 to avoid 16MB BSON limit, or UNWIND_ALL) + $unwind
+     * 2. Standard localField/foreignField $lookup (NO let/pipeline for AWS DocumentDB compatibility):
+     *    - LATEST_ONE: $addFields + $cond/$isArray/$arrayElemAt(-1) to extract latest 1 record safely (LEFT JOIN null if empty)
+     *    - UNWIND_ALL: $unwind with preserveNullAndEmptyArrays: true
      * 3. 1D flat $project with underscore aliases on collision
      */
     fun buildPipeline(
@@ -121,49 +124,46 @@ data class JoinSpec(
         }
         stages.add(BsonDocument("\$limit", BsonInt32(limit.coerceIn(1, 5000))))
 
-        // Stage 2: $lookup + $unwind (preserveNullAndEmptyArrays = LEFT JOIN)
+        // Stage 2: Standard $lookup (localField / foreignField only — AWS DocumentDB compatible)
+        val lookupDoc = BsonDocument()
+            .append("from", BsonString(rightCollection))
+            .append("localField", BsonString(localField))
+            .append("foreignField", BsonString(foreignField))
+            .append("as", BsonString("_joined"))
+        stages.add(BsonDocument("\$lookup", lookupDoc))
+
+        // Stage 2b: Extract latest 1 record via $addFields or unwind all 1:N rows
         when (matchStrategy) {
             JoinMatchStrategy.LATEST_ONE -> {
-                val subMatchExpr = BsonDocument(
-                    "\$expr",
+                val condDoc = BsonDocument()
+                    .append("if", BsonDocument("\$isArray", BsonString("\$_joined")))
+                    .append(
+                        "then",
+                        BsonDocument(
+                            "\$arrayElemAt",
+                            BsonArray(listOf(BsonString("\$_joined"), BsonInt32(-1)))
+                        )
+                    )
+                    .append("else", BsonNull.VALUE)
+                stages.add(
                     BsonDocument(
-                        "\$eq",
-                        BsonArray(listOf(BsonString("\$$foreignField"), BsonString("\$\$joinKey")))
+                        "\$addFields",
+                        BsonDocument("_joined", BsonDocument("\$cond", condDoc))
                     )
                 )
-                val subPipeline = BsonArray(
-                    listOf(
-                        BsonDocument("\$match", subMatchExpr),
-                        BsonDocument("\$sort", BsonDocument("_id", BsonInt32(-1))),
-                        BsonDocument("\$limit", BsonInt32(1))
-                    )
-                )
-                val lookupDoc = BsonDocument()
-                    .append("from", BsonString(rightCollection))
-                    .append("let", BsonDocument("joinKey", BsonString("\$$localField")))
-                    .append("pipeline", subPipeline)
-                    .append("as", BsonString("_joined"))
-                stages.add(BsonDocument("\$lookup", lookupDoc))
             }
 
             JoinMatchStrategy.UNWIND_ALL -> {
-                val lookupDoc = BsonDocument()
-                    .append("from", BsonString(rightCollection))
-                    .append("localField", BsonString(localField))
-                    .append("foreignField", BsonString(foreignField))
-                    .append("as", BsonString("_joined"))
-                stages.add(BsonDocument("\$lookup", lookupDoc))
+                stages.add(
+                    BsonDocument(
+                        "\$unwind",
+                        BsonDocument()
+                            .append("path", BsonString("\$_joined"))
+                            .append("preserveNullAndEmptyArrays", BsonBoolean.TRUE)
+                    )
+                )
             }
         }
-
-        stages.add(
-            BsonDocument(
-                "\$unwind",
-                BsonDocument()
-                    .append("path", BsonString("\$_joined"))
-                    .append("preserveNullAndEmptyArrays", BsonBoolean.TRUE)
-            )
-        )
 
         // Stage 3: Flat 1D $project
         val leftSet = selectedLeftFields.toSet()

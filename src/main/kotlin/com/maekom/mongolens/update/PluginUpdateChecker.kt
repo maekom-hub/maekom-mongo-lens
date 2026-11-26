@@ -45,7 +45,7 @@ object PluginUpdateChecker {
 
     const val PLUGIN_ID = "com.maekom.mongolens"
     const val RELEASES_API_URL = "https://api.github.com/repos/maekom-hub/maekom-mongo-lens/releases/latest"
-    private const val FALLBACK_VERSION = "0.2.0"
+    private const val FALLBACK_VERSION = "0.2.1"
     private const val USER_AGENT = "maekom-mongo-lens"
     private const val STAGING_DIR_NAME = "maekom-mongo-lens-staging"
     private const val LEGACY_TEMP_DIR_NAME = "maekom-mongo-lens-updates"

@@ -283,9 +283,9 @@ class MongoConnectionManager(project: Project) : Disposable {
         val probeCount = probeIterable.into(mutableListOf()).size
         val hasNext = probeCount > safeLimit
 
-        // Step 2: Run the 3-stage Join pipeline capped strictly at `safeLimit` base documents
+        // Step 2: Run the DocumentDB-compatible 3-stage Join pipeline capped at `safeLimit` base documents
         val pipeline = joinSpec.buildPipeline(filter, sort, safeSkip, safeLimit)
-        val aggIterable = coll.aggregate(pipeline).maxTime(15, TimeUnit.SECONDS)
+        val aggIterable = coll.aggregate(pipeline).allowDiskUse(true).maxTime(15, TimeUnit.SECONDS)
         val docs = if (probeCount == 0) mutableListOf() else aggIterable.into(mutableListOf())
         val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs)
 
@@ -399,7 +399,7 @@ class MongoConnectionManager(project: Project) : Disposable {
         val coll = client.getDatabase(database).getCollection(collection, BsonDocument::class.java)
 
         val startNs = System.nanoTime()
-        val iterable = coll.aggregate(pipeline).maxTime(15, TimeUnit.SECONDS)
+        val iterable = coll.aggregate(pipeline).allowDiskUse(true).maxTime(15, TimeUnit.SECONDS)
         val docs = iterable.into(mutableListOf())
         val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs)
 

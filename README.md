@@ -154,7 +154,7 @@ spring:
 ./gradlew buildPlugin
 ```
 
-빌드가 완료되면 `build/distributions/maekom-mongo-lens-0.2.0.zip` 파일이 생성됩니다.
+빌드가 완료되면 `build/distributions/maekom-mongo-lens-0.2.1.zip` 파일이 생성됩니다.
 
 ---
 
