@@ -53,7 +53,8 @@ class MongoShellPanel(
     private val fieldSuggestionsSupplier: () -> List<String>,
     private val onFieldsDiscovered: (List<String>) -> Unit,
     private val onStatusUpdate: (String, Boolean) -> Unit,
-    private val onReadOnlyChanged: () -> Unit
+    private val onReadOnlyChanged: () -> Unit,
+    private val diffBaselineState: DiffBaselineState? = null
 ) : JPanel(BorderLayout()), Disposable {
 
     private var autocomplete: MongoShellAutocomplete? = null
@@ -120,7 +121,8 @@ class MongoShellPanel(
         database = database,
         collection = collection,
         onRequestRefresh = { executeShell() },
-        onReadOnlyChanged = onReadOnlyChanged
+        onReadOnlyChanged = onReadOnlyChanged,
+        diffBaselineState = diffBaselineState
     )
 
     init {

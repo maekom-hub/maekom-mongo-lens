@@ -54,7 +54,8 @@ class AggregationBuilderPanel(
     private val onFieldsDiscovered: (List<String>) -> Unit,
     private val onStatusUpdate: (String, Boolean) -> Unit,
     private val onReadOnlyChanged: () -> Unit,
-    private val onConvertToShell: (String) -> Unit
+    private val onConvertToShell: (String) -> Unit,
+    private val diffBaselineState: DiffBaselineState? = null
 ) : JPanel(BorderLayout()), Disposable {
 
     companion object {
@@ -261,7 +262,8 @@ class AggregationBuilderPanel(
         database = database,
         collection = collection,
         onRequestRefresh = { executePipeline() },
-        onReadOnlyChanged = onReadOnlyChanged
+        onReadOnlyChanged = onReadOnlyChanged,
+        diffBaselineState = diffBaselineState
     )
 
     private var activeSubMode = "UI" // "UI" or "RAW"

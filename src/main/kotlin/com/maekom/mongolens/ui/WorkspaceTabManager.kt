@@ -6,6 +6,7 @@ import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.DefaultActionGroup
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.ui.tabs.JBTabs
@@ -15,7 +16,10 @@ import com.maekom.mongolens.config.SavedQueryStore
 import com.maekom.mongolens.config.VariableStore
 import com.maekom.mongolens.crypto.CryptoConfigStore
 import com.maekom.mongolens.i18n.I18n
+import com.maekom.mongolens.mongo.JoinSpec
 import com.maekom.mongolens.mongo.MongoConnectionManager
+import com.maekom.mongolens.mongo.ReferenceJumpHelper
+import org.bson.BsonValue
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.util.IdentityHashMap
@@ -31,6 +35,7 @@ class WorkspaceTabManager(
     private val savedQueryStore: SavedQueryStore,
     private val variableStore: VariableStore,
     private val cryptoStore: CryptoConfigStore,
+    private val diffBaselineState: DiffBaselineState = DiffBaselineState(),
     private val onStatusUpdate: (String, Boolean) -> Unit,
     private val onReadOnlyStateChanged: () -> Unit,
     private val onTabCountChanged: (Int) -> Unit
@@ -89,14 +94,84 @@ class WorkspaceTabManager(
         return createTab(profile, database, collection, mode)
     }
 
+    /**
+     * Opens a new Find tab on `targetCollection`, samples its schema in the background to match
+     * exact/camel/snake field names & coerce ObjectId <-> 24-hex String, and immediately executes Find.
+     */
+    fun openReferenceJumpTab(
+        profile: MongoConnectionProfile,
+        database: String,
+        targetCollection: String,
+        sourceFieldPath: String,
+        sourceValue: BsonValue
+    ): TabEntry {
+        val entry = createTab(
+            profile = profile,
+            database = database,
+            collection = targetCollection,
+            mode = CollectionWorkspaceTab.WorkspaceMode.FIND,
+            autoExecuteInitialFind = false
+        )
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val (fields, types) = try {
+                connectionManager.sampleSchema(profile, database, targetCollection, 15)
+            } catch (_: Throwable) {
+                emptyList<String>() to emptyMap()
+            }
+            val topFields = fields.map { it.substringBefore('.') }.distinct()
+            val filterJson = ReferenceJumpHelper.buildReferenceFilterQuery(
+                sourceFieldPath = sourceFieldPath,
+                sourceValue = sourceValue,
+                targetTopFields = topFields,
+                targetFieldTypes = types
+            )
+            ApplicationManager.getApplication().invokeLater {
+                if (!project.isDisposed && entriesById.containsKey(entry.tabId)) {
+                    entry.workspaceTab.applyQuickFilterAndRun(filterJson)
+                }
+            }
+        }
+        return entry
+    }
+
+    /**
+     * Opens a new RDB-style Join View tab (`<left> ⋈ <right>`) backed by `JoinSpec`.
+     */
+    fun openJoinTab(
+        profile: MongoConnectionProfile,
+        database: String,
+        joinSpec: JoinSpec,
+        initialFilterText: String = "",
+        initialSortText: String = ""
+    ): TabEntry {
+        return createTab(
+            profile = profile,
+            database = database,
+            collection = joinSpec.leftCollection,
+            mode = CollectionWorkspaceTab.WorkspaceMode.FIND,
+            initialJoinSpec = joinSpec,
+            initialFilterText = initialFilterText,
+            initialSortText = initialSortText,
+            autoExecuteInitialFind = true
+        )
+    }
+
     private fun createTab(
         profile: MongoConnectionProfile,
         database: String,
         collection: String,
-        mode: CollectionWorkspaceTab.WorkspaceMode
+        mode: CollectionWorkspaceTab.WorkspaceMode,
+        initialJoinSpec: JoinSpec? = null,
+        initialFilterText: String = "",
+        initialSortText: String = "",
+        autoExecuteInitialFind: Boolean = true
     ): TabEntry {
         val tabId = UUID.randomUUID().toString()
-        val tabKey = buildTabKey(profile, database, collection)
+        val tabKey = if (initialJoinSpec != null) {
+            "${profile.displayName}:$database:${initialJoinSpec.leftCollection}⋈${initialJoinSpec.rightCollection}"
+        } else {
+            buildTabKey(profile, database, collection)
+        }
         val existingForKey = entriesByKey[tabKey].orEmpty()
         val usedNumbers = existingForKey.map { it.cloneNumber }.toSet()
         var cloneNumber = 1
@@ -119,6 +194,17 @@ class WorkspaceTabManager(
             onReadOnlyStateChanged = {
                 updateAllReadOnlyBadges()
                 onReadOnlyStateChanged()
+            },
+            initialJoinSpec = initialJoinSpec,
+            initialFilterText = initialFilterText,
+            initialSortText = initialSortText,
+            autoExecuteInitialFind = autoExecuteInitialFind,
+            diffBaselineState = diffBaselineState,
+            onOpenReferenceJumpTab = { targetColl, srcField, srcVal ->
+                openReferenceJumpTab(profile, database, targetColl, srcField, srcVal)
+            },
+            onOpenJoinTab = { spec, curFilter, curSort ->
+                openJoinTab(profile, database, spec, curFilter, curSort)
             }
         )
         Disposer.register(parentDisposable, workspaceTab)
@@ -129,11 +215,20 @@ class WorkspaceTabManager(
             CollectionWorkspaceTab.WorkspaceMode.SHELL -> " [Shell]"
             else -> ""
         }
-        val tabTitle = "${profile.displayName}: $collection$numberSuffix$modeSuffix"
+        val displayCollection = if (initialJoinSpec != null) {
+            "${initialJoinSpec.leftCollection} ⋈ ${initialJoinSpec.rightCollection}"
+        } else {
+            collection
+        }
+        val tabTitle = if (initialJoinSpec != null) {
+            "$displayCollection$numberSuffix"
+        } else {
+            "${profile.displayName}: $displayCollection$numberSuffix$modeSuffix"
+        }
 
         val tabInfo = TabInfo(workspaceTab).apply {
             setText(tabTitle)
-            setTooltipText("${profile.displayName} / $database.$collection$numberSuffix")
+            setTooltipText("${profile.displayName} / $database.$displayCollection$numberSuffix")
             setIcon(AllIcons.FileTypes.Json)
         }
 

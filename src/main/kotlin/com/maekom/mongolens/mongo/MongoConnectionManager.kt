@@ -35,7 +35,8 @@ data class QueryExecutionResult(
     val scanType: IndexScanType,
     val indexName: String?,
     val sampledFields: List<String>,
-    val sampledFieldTypes: Map<String, SmartInValueType> = emptyMap()
+    val sampledFieldTypes: Map<String, SmartInValueType> = emptyMap(),
+    val hasNextPage: Boolean? = null
 )
 
 class MongoConnectionManager(project: Project) : Disposable {
@@ -173,6 +174,132 @@ class MongoConnectionManager(project: Project) : Disposable {
             .maxTime(3, TimeUnit.SECONDS)
             .into(mutableListOf())
         return extractFieldSchema(docs)
+    }
+
+    /**
+     * Samples top-level fields and their normalized BSON type categories (ObjectId, String, Number, Date, Boolean, Object, Array)
+     * for Join View field matching & type-mismatch warning detection.
+     */
+    fun sampleCollectionTopLevelTypes(
+        profile: MongoConnectionProfile,
+        database: String,
+        collection: String,
+        sampleSize: Int = 20
+    ): LinkedHashMap<String, String> {
+        val client = getOrCreateClient(profile)
+        val docs = client.getDatabase(database)
+            .getCollection(collection, BsonDocument::class.java)
+            .find()
+            .limit(sampleSize.coerceIn(1, 50))
+            .maxTime(3, TimeUnit.SECONDS)
+            .into(mutableListOf())
+        return extractTopLevelTypeCategories(docs)
+    }
+
+    fun extractTopLevelTypeCategories(docs: List<BsonDocument>): LinkedHashMap<String, String> {
+        val out = linkedMapOf<String, String>()
+        for (doc in docs) {
+            for ((k, v) in doc) {
+                if (v.isNull) {
+                    out.putIfAbsent(k, "Null")
+                } else {
+                    val cat = categorizeBsonType(v)
+                    val prev = out[k]
+                    if (prev == null || prev == "Null") {
+                        out[k] = cat
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    private fun categorizeBsonType(v: BsonValue): String = when {
+        v.isObjectId -> "ObjectId"
+        v.isString -> "String"
+        v.isInt32 || v.isInt64 || v.isDouble || v.isDecimal128 -> "Number"
+        v.isDateTime || v.isTimestamp -> "Date"
+        v.isBoolean -> "Boolean"
+        v.isDocument -> "Object"
+        v.isArray -> "Array"
+        v.isBinary -> "Binary"
+        else -> v.bsonType.name
+    }
+
+    /**
+     * Executes a safe RDB-style Join View (`JoinSpec`):
+     * 1. Probes `limit + 1` base documents BEFORE `$lookup`/`$unwind` so `hasNextPage` is 100% accurate even under 1:N unwind.
+     * 2. Slices to `limit` base documents and executes `$lookup` + `$unwind` + flat 1D `$project`.
+     */
+    fun executeJoin(
+        profile: MongoConnectionProfile,
+        database: String,
+        joinSpec: JoinSpec,
+        filterRaw: String?,
+        sortRaw: String?,
+        skip: Int,
+        limit: Int
+    ): QueryExecutionResult {
+        val safeSkip = skip.coerceAtLeast(0)
+        val safeLimit = limit.coerceIn(1, 5000)
+        val filter = MongoShellNormalizer.parseBsonDocument(filterRaw?.trim().orEmpty().ifEmpty { "{}" })
+        val sort = MongoShellNormalizer.parseBsonDocument(sortRaw?.trim().orEmpty().ifEmpty { "{}" })
+
+        val client = getOrCreateClient(profile)
+        val coll = client.getDatabase(database).getCollection(joinSpec.leftCollection, BsonDocument::class.java)
+
+        val startNs = System.nanoTime()
+
+        // Step 1: Probe `limit + 1` base documents to determine exact `hasNextPage` prior to $lookup/$unwind
+        val probeIterable = coll.find(filter)
+            .projection(BsonDocument("_id", org.bson.BsonInt32(1)))
+            .skip(safeSkip)
+            .limit(safeLimit + 1)
+            .maxTime(10, TimeUnit.SECONDS)
+        if (!sort.isEmpty()) {
+            probeIterable.sort(sort)
+        }
+        val probeCount = probeIterable.into(mutableListOf()).size
+        val hasNext = probeCount > safeLimit
+
+        // Step 2: Run the 3-stage Join pipeline capped strictly at `safeLimit` base documents
+        val pipeline = joinSpec.buildPipeline(filter, sort, safeSkip, safeLimit)
+        val aggIterable = coll.aggregate(pipeline).maxTime(15, TimeUnit.SECONDS)
+        val docs = if (probeCount == 0) mutableListOf() else aggIterable.into(mutableListOf())
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs)
+
+        var isApprox = false
+        val totalCount: Long = try {
+            if (filter.isEmpty()) {
+                coll.estimatedDocumentCount()
+            } else {
+                coll.countDocuments(filter, CountOptions().maxTime(2, TimeUnit.SECONDS))
+            }
+        } catch (_: Throwable) {
+            isApprox = true
+            -1L
+        }
+
+        val (scanType, indexName) = try {
+            val explainDoc = aggIterable.explain(ExplainVerbosity.QUERY_PLANNER)
+            parseExplainPlan(explainDoc)
+        } catch (_: Throwable) {
+            IndexScanType.UNKNOWN to null
+        }
+
+        val (sampledFields, sampledFieldTypes) = extractFieldSchema(docs.take(30))
+
+        return QueryExecutionResult(
+            documents = docs,
+            totalCount = totalCount,
+            isApproximateCount = isApprox,
+            elapsedMs = elapsedMs,
+            scanType = scanType,
+            indexName = indexName,
+            sampledFields = sampledFields,
+            sampledFieldTypes = sampledFieldTypes,
+            hasNextPage = hasNext
+        )
     }
 
     fun executeFind(

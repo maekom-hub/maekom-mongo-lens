@@ -56,6 +56,7 @@ class MongoLensMainPanel(
     private val savedQueryStore = SavedQueryStore(projectBasePath)
     private val variableStore = VariableStore(projectBasePath)
     private val cryptoStore = CryptoConfigStore(projectBasePath)
+    private val diffBaselineState = DiffBaselineState()
     private val connectionManager = MongoConnectionManager(project)
 
     @Volatile
@@ -99,6 +100,7 @@ class MongoLensMainPanel(
             savedQueryStore = savedQueryStore,
             variableStore = variableStore,
             cryptoStore = cryptoStore,
+            diffBaselineState = diffBaselineState,
             onStatusUpdate = { text, _ -> setStatus(text) },
             onReadOnlyStateChanged = { connectionsTree.repaintTree() },
             onTabCountChanged = { count ->
@@ -176,7 +178,7 @@ class MongoLensMainPanel(
 
     /**
      * Simplified native ToolWindow title bar actions: ONLY 2 items:
-     * 1. Version & Connection Status ("v0.1.7 · 연결됨 (126ms)")
+     * 1. Version & Connection Status ("v0.1.8 · 연결됨 (126ms)")
      * 2. [⚙ 설정 / Settings] popup group (Decrypt Config, Check/Install Update, Language Switch)
      */
     fun createTitleActions(): List<AnAction> {

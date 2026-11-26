@@ -15,9 +15,11 @@ import com.maekom.mongolens.config.SavedQuery
 import com.maekom.mongolens.config.SavedQueryStore
 import com.maekom.mongolens.crypto.CryptoConfigStore
 import com.maekom.mongolens.i18n.I18n
+import com.maekom.mongolens.mongo.JoinSpec
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import com.maekom.mongolens.mongo.MongoShellNormalizer
 import com.maekom.mongolens.mongo.SmartInValueType
+import org.bson.BsonValue
 import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.FlowLayout
@@ -47,8 +49,21 @@ class FindQueryPanel(
     private val onFieldsDiscovered: (List<String>, Map<String, SmartInValueType>) -> Unit,
     private val onStatusUpdate: (String, Boolean) -> Unit,
     private val onReadOnlyChanged: () -> Unit,
-    private val onConvertToShell: (String) -> Unit
+    private val onConvertToShell: (String) -> Unit,
+    initialJoinSpec: JoinSpec? = null,
+    initialFilterText: String = "",
+    initialSortText: String = "",
+    private val diffBaselineState: DiffBaselineState? = null,
+    private val collectionsSupplier: () -> List<String> = { emptyList() },
+    private val onOpenReferenceJumpTab: ((targetCollection: String, sourceFieldPath: String, sourceValue: BsonValue) -> Unit)? = null,
+    private val onOpenJoinTab: ((joinSpec: JoinSpec, currentFilter: String, currentSort: String) -> Unit)? = null
 ) : JPanel(BorderLayout()), Disposable {
+
+    private val initialJoinSpecRef: JoinSpec? = initialJoinSpec
+
+    @Volatile
+    private var activeJoinSpec: JoinSpec? = initialJoinSpec
+    val isJoinTab: Boolean get() = activeJoinSpec != null
 
     private val limitPresets = arrayOf(20, 50, 100, 500, 1000)
     private val unifiedInputHeight = JBUI.scale(32)
@@ -181,7 +196,7 @@ class FindQueryPanel(
         cryptoStore = cryptoStore,
         profile = profile,
         database = database,
-        collection = collection,
+        collection = if (initialJoinSpec != null) "${initialJoinSpec.leftCollection}⋈${initialJoinSpec.rightCollection}" else collection,
         onRequestRefresh = { executeFind() },
         onPrevPage = {
             val lim = currentLimit()
@@ -194,11 +209,32 @@ class FindQueryPanel(
             skipSpinner.value = currentSkip() + lim
             executeFind()
         },
-        onReadOnlyChanged = onReadOnlyChanged
+        onReadOnlyChanged = onReadOnlyChanged,
+        diffBaselineState = diffBaselineState,
+        isJoinView = initialJoinSpec != null,
+        initialView = if (initialJoinSpec != null) "TABLE" else "TREE",
+        availableColumnsSupplier = { resolveAvailableProjectionColumns() },
+        onApplyColumnSelection = { selectedCols, allSelected ->
+            handleColumnSelectionApplied(selectedCols, allSelected)
+        },
+        onApplyQuickFilter = { filterJson ->
+            applyQuickFilterAndRun(filterJson)
+        },
+        collectionsSupplier = collectionsSupplier,
+        onJumpToReferenceCollection = onOpenReferenceJumpTab,
+        onRequestOpenJoinDialog = if (onOpenJoinTab != null) { initialField ->
+            openJoinConfigurationDialog(initialField)
+        } else null
     )
 
     init {
         Disposer.register(this, resultViewer)
+        if (initialFilterText.isNotBlank() && initialFilterText.trim() != "{}") {
+            filterEditor.text = initialFilterText.trim()
+        }
+        if (initialSortText.isNotBlank() && initialSortText.trim() != "{}") {
+            sortEditor.text = initialSortText.trim()
+        }
         buildCompactQueryBar()
         add(resultViewer, BorderLayout.CENTER)
         I18n.addListener(this) { refreshTexts() }
@@ -317,7 +353,17 @@ class FindQueryPanel(
 
     private fun wireListeners() {
         projectToggleBtn.addActionListener {
-            setProjectRowVisible(!projectExpanded)
+            val joinSpec = activeJoinSpec
+            if (joinSpec != null) {
+                val allCols = joinSpec.allCandidateOutputColumns()
+                val visibleCols = joinSpec.visibleOutputColumns()
+                val dlg = ColumnSelectDialog(project, allCols, visibleCols)
+                if (dlg.showAndGet()) {
+                    handleColumnSelectionApplied(dlg.getSelectedColumns(), dlg.isAllColumnsSelected())
+                }
+            } else {
+                setProjectRowVisible(!projectExpanded)
+            }
         }
 
         limitCombo.addActionListener {
@@ -350,6 +396,9 @@ class FindQueryPanel(
 
         resetBtn.addActionListener {
             resultViewer.resetTableBatchDecryption()
+            if (initialJoinSpecRef != null) {
+                activeJoinSpec = initialJoinSpecRef
+            }
             filterEditor.text = ""
             projectEditor.text = ""
             sortEditor.text = ""
@@ -383,6 +432,16 @@ class FindQueryPanel(
     }
 
     private fun buildDirectShellFindCommand(): String {
+        val joinSpec = activeJoinSpec
+        if (joinSpec != null) {
+            return joinSpec.toMongoshScript(
+                filterRaw = filterEditor.safeText(),
+                sortRaw = sortEditor.safeText(),
+                skip = currentSkip(),
+                limit = currentLimit()
+            )
+        }
+
         val f = filterEditor.safeText().ifEmpty { "{}" }
         val p = projectEditor.safeText()
         val s = sortEditor.safeText()
@@ -407,6 +466,98 @@ class FindQueryPanel(
         return sb.toString()
     }
 
+    private fun resolveAvailableProjectionColumns(): List<String> {
+        val joinSpec = activeJoinSpec
+        if (joinSpec != null) {
+            return joinSpec.allCandidateOutputColumns()
+        }
+        return fieldSuggestionsSupplier()
+            .map { it.substringBefore('.') }
+            .filter { it.isNotBlank() }
+            .distinct()
+    }
+
+    private fun handleColumnSelectionApplied(selectedColumns: List<String>, allSelected: Boolean) {
+        if (selectedColumns.isEmpty()) return
+        val joinSpec = activeJoinSpec
+        if (joinSpec != null) {
+            // Join Tab: update JoinSpec selected columns without overwriting Project with { field: 1 }
+            activeJoinSpec = joinSpec.updateFromVisibleColumnSelection(selectedColumns)
+            executeFind()
+            return
+        }
+
+        val allKnown = resolveAvailableProjectionColumns()
+        val effectivelyAllSelected = allSelected && allKnown.isNotEmpty() && selectedColumns.size >= allKnown.size
+        if (effectivelyAllSelected) {
+            projectEditor.text = ""
+        } else {
+            val entries = mutableListOf<String>()
+            if ("_id" !in selectedColumns) {
+                entries.add("\"_id\": 0")
+            }
+            for (col in selectedColumns) {
+                val escaped = MongoShellNormalizer.escapeJsonString(col)
+                entries.add("\"$escaped\": 1")
+            }
+            projectEditor.text = "{ ${entries.joinToString(", ")} }"
+            if (!projectExpanded) {
+                setProjectRowVisible(true)
+            } else {
+                projectEditor.refreshAutoHeightNow()
+                revalidateHierarchy()
+            }
+        }
+        executeFind()
+    }
+
+    fun applyQuickFilterAndRun(filterJson: String) {
+        filterEditor.text = filterJson.trim()
+        filterEditor.refreshAutoHeightNow()
+        skipSpinner.value = 0
+        revalidateHierarchy()
+        executeFind()
+    }
+
+    private fun openJoinConfigurationDialog(initialLocalField: String?) {
+        val joinLauncher = onOpenJoinTab ?: return
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val allCollections = try {
+                val cached = collectionsSupplier()
+                if (cached.size > 1) cached else connectionManager.listCollections(profile, database)
+            } catch (_: Throwable) {
+                collectionsSupplier()
+            }
+            val sourceCategories: Map<String, String> = try {
+                connectionManager.sampleCollectionTopLevelTypes(profile, database, collection, 20)
+            } catch (_: Throwable) {
+                emptyMap()
+            }
+            val topFields = buildList {
+                addAll(sourceCategories.keys)
+                fieldSuggestionsSupplier().forEach { add(it.substringBefore('.')) }
+            }.filter { it.isNotBlank() }.distinct().ifEmpty { listOf("_id") }
+
+            ApplicationManager.getApplication().invokeLater {
+                if (project.isDisposed) return@invokeLater
+                val dlg = JoinViewDialog(
+                    project = project,
+                    connectionManager = connectionManager,
+                    profile = profile,
+                    database = database,
+                    sourceCollection = collection,
+                    initialLocalField = initialLocalField,
+                    sourceTopFields = topFields,
+                    sourceFieldCategories = sourceCategories,
+                    allCollectionsInDb = allCollections
+                )
+                if (dlg.showAndGet()) {
+                    joinLauncher.invoke(dlg.buildJoinSpec(), filterEditor.safeText(), sortEditor.safeText())
+                }
+            }
+        }
+    }
+
     private fun currentLimit(): Int = (limitCombo.selectedItem as? Int) ?: 50
 
     private fun currentSkip(): Int = (skipSpinner.value as? Int) ?: 0
@@ -423,40 +574,61 @@ class FindQueryPanel(
         val sortRaw = sortEditor.safeText().ifEmpty { "{}" }
         val limit = currentLimit()
         val skip = currentSkip()
+        val joinSpecSnapshot = activeJoinSpec
 
         runBtn.isEnabled = false
         onStatusUpdate(I18n.t("header.status.querying"), false)
 
-        object : Task.Backgroundable(project, "Finding documents in $database.$collection...", true) {
+        val taskTitle = if (joinSpecSnapshot != null) {
+            "Joining ${joinSpecSnapshot.leftCollection} ⋈ ${joinSpecSnapshot.rightCollection}..."
+        } else {
+            "Finding documents in $database.$collection..."
+        }
+
+        object : Task.Backgroundable(project, taskTitle, true) {
             override fun run(indicator: ProgressIndicator) {
                 try {
-                    val result = connectionManager.executeFind(
-                        profile = profile,
-                        database = database,
-                        collection = collection,
-                        filterRaw = filterRaw,
-                        projectionRaw = projRaw,
-                        sortRaw = sortRaw,
-                        skip = skip,
-                        limit = limit
-                    )
-
-                    savedQueryStore.recordHistory(
-                        SavedQuery(
-                            id = UUID.randomUUID().toString(),
-                            name = filterRaw.take(50).ifEmpty { "{}" },
-                            profileId = profile.id,
+                    val result = if (joinSpecSnapshot != null) {
+                        connectionManager.executeJoin(
+                            profile = profile,
+                            database = database,
+                            joinSpec = joinSpecSnapshot,
+                            filterRaw = filterRaw,
+                            sortRaw = sortRaw,
+                            skip = skip,
+                            limit = limit
+                        )
+                    } else {
+                        connectionManager.executeFind(
+                            profile = profile,
                             database = database,
                             collection = collection,
-                            mode = "FIND",
-                            filter = filterRaw,
-                            projection = projRaw,
-                            sort = sortRaw,
-                            limit = limit,
+                            filterRaw = filterRaw,
+                            projectionRaw = projRaw,
+                            sortRaw = sortRaw,
                             skip = skip,
-                            isHistory = true
+                            limit = limit
                         )
-                    )
+                    }
+
+                    if (joinSpecSnapshot == null) {
+                        savedQueryStore.recordHistory(
+                            SavedQuery(
+                                id = UUID.randomUUID().toString(),
+                                name = filterRaw.take(50).ifEmpty { "{}" },
+                                profileId = profile.id,
+                                database = database,
+                                collection = collection,
+                                mode = "FIND",
+                                filter = filterRaw,
+                                projection = projRaw,
+                                sort = sortRaw,
+                                limit = limit,
+                                skip = skip,
+                                isHistory = true
+                            )
+                        )
+                    }
 
                     ApplicationManager.getApplication().invokeLater {
                         runBtn.isEnabled = true

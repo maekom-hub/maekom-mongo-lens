@@ -41,6 +41,11 @@ object UiHelpers {
     private val kstZone: ZoneId = ZoneId.of("Asia/Seoul")
     private val utcZone: ZoneId = ZoneId.of("UTC")
     private val kstFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS 'KST'")
+    private val kstDateTimeSecFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+    private val utcTimeSecFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss")
+    private val kstMillisNoSuffixFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+    private val utcMillisTimeFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
+    private val utcIsoMillisFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
     private val isoFormatter: DateTimeFormatter = DateTimeFormatter.ISO_INSTANT
     private val numberFormat: NumberFormat = NumberFormat.getNumberInstance(Locale.US)
 
@@ -66,7 +71,66 @@ object UiHelpers {
 
     fun formatIsoUtc(epochMillis: Long): String = isoFormatter.format(Instant.ofEpochMilli(epochMillis))
 
+    fun formatStrictIsoUtcMillis(epochMillis: Long): String =
+        utcIsoMillisFormatter.format(Instant.ofEpochMilli(epochMillis).atZone(utcZone))
+
     fun formatKst(epochMillis: Long): String = kstFormatter.format(Instant.ofEpochMilli(epochMillis).atZone(kstZone))
+
+    /** Tree inline auxiliary text for ObjectId: `2026-11-26 10:30:15 KST (UTC 01:30:15)` */
+    fun formatObjectIdInlineTime(oid: org.bson.types.ObjectId): String {
+        val epochSec = oid.timestamp.toLong() and 0xFFFFFFFFL
+        val inst = Instant.ofEpochSecond(epochSec)
+        val kstStr = kstDateTimeSecFormatter.format(inst.atZone(kstZone))
+        val utcTimeStr = utcTimeSecFormatter.format(inst.atZone(utcZone))
+        return "$kstStr KST (UTC $utcTimeStr)"
+    }
+
+    /** Table/Tree tooltip for ObjectId: `생성 시각: 2026-11-26 10:30:15 KST (UTC: 2026-11-26 01:30:15)` */
+    fun formatObjectIdTooltip(oid: org.bson.types.ObjectId): String {
+        val epochSec = oid.timestamp.toLong() and 0xFFFFFFFFL
+        val inst = Instant.ofEpochSecond(epochSec)
+        val kstStr = kstDateTimeSecFormatter.format(inst.atZone(kstZone))
+        val utcStr = kstDateTimeSecFormatter.format(inst.atZone(utcZone))
+        return I18n.t("result.oid.tooltip", kstStr, utcStr)
+    }
+
+    /** Tree inline auxiliary text for BsonDateTime: `2026-11-26 10:30:15.123 KST (UTC 01:30:15.123)` */
+    fun formatDateInlineTime(epochMillis: Long): String {
+        val inst = Instant.ofEpochMilli(epochMillis)
+        val kstStr = kstMillisNoSuffixFormatter.format(inst.atZone(kstZone))
+        val utcTimeStr = utcMillisTimeFormatter.format(inst.atZone(utcZone))
+        return "$kstStr KST (UTC $utcTimeStr)"
+    }
+
+    /** Table/Tree tooltip for BsonDateTime showing both KST and UTC */
+    fun formatDateDualTooltip(epochMillis: Long): String {
+        val inst = Instant.ofEpochMilli(epochMillis)
+        val kstStr = kstMillisNoSuffixFormatter.format(inst.atZone(kstZone))
+        val utcIso = utcIsoMillisFormatter.format(inst.atZone(utcZone))
+        return I18n.t("result.date.dualTooltip", kstStr, utcIso)
+    }
+
+    /**
+     * Builds a pure UTC-epoch-based ObjectId range filter without any KST offset arithmetic:
+     * - `$gte`: `<8-hex-sec>0000000000000000`
+     * - `$lte`: `<8-hex-sec>ffffffffffffffff`
+     */
+    fun buildObjectIdTimeRangeFilter(fieldPath: String, oid: org.bson.types.ObjectId, isGte: Boolean): String {
+        val epochSec = oid.timestamp.toLong() and 0xFFFFFFFFL
+        val hex8 = java.lang.Long.toHexString(epochSec).padStart(8, '0').lowercase(Locale.ROOT)
+        val suffix = if (isGte) "0000000000000000" else "ffffffffffffffff"
+        val op = if (isGte) "\$gte" else "\$lte"
+        val escapedField = com.maekom.mongolens.mongo.MongoShellNormalizer.escapeJsonString(fieldPath)
+        return """{ "$escapedField": { "$op": ObjectId("$hex8$suffix") } }"""
+    }
+
+    /** Builds a pure UTC ISO-8601 ISODate range filter (`$gte` / `$lte`) */
+    fun buildDateTimeRangeFilter(fieldPath: String, epochMillis: Long, isGte: Boolean): String {
+        val utcIso = formatStrictIsoUtcMillis(epochMillis)
+        val op = if (isGte) "\$gte" else "\$lte"
+        val escapedField = com.maekom.mongolens.mongo.MongoShellNormalizer.escapeJsonString(fieldPath)
+        return """{ "$escapedField": { "$op": ISODate("$utcIso") } }"""
+    }
 
     fun copyToClipboard(text: String) {
         CopyPasteManager.getInstance().setContents(StringSelection(text))
@@ -163,7 +227,7 @@ object UiHelpers {
 
     fun bsonDisplayValue(value: BsonValue): String {
         return when (value) {
-            is BsonObjectId -> value.value.toHexString()
+            is BsonObjectId -> "ObjectId(\"${value.value.toHexString()}\")"
             is BsonDateTime -> formatIsoUtc(value.value)
             is BsonInt32 -> value.value.toString()
             is BsonInt64 -> value.value.toString()

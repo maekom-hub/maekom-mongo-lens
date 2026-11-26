@@ -27,9 +27,11 @@ import com.maekom.mongolens.mongo.IndexScanType
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import com.maekom.mongolens.mongo.MongoShellNormalizer
 import com.maekom.mongolens.mongo.QueryExecutionResult
+import com.maekom.mongolens.mongo.ReferenceJumpHelper
 import org.bson.BsonArray
 import org.bson.BsonDateTime
 import org.bson.BsonDocument
+import org.bson.BsonObjectId
 import org.bson.BsonString
 import org.bson.BsonValue
 import org.bson.Document
@@ -55,6 +57,7 @@ import java.nio.file.Path
 import javax.swing.BorderFactory
 import javax.swing.JButton
 import javax.swing.JComponent
+import javax.swing.JMenu
 import javax.swing.JMenuItem
 import javax.swing.JPanel
 import javax.swing.JPopupMenu
@@ -73,6 +76,7 @@ import javax.swing.table.TableRowSorter
 import javax.swing.tree.DefaultMutableTreeNode
 import javax.swing.tree.DefaultTreeModel
 import javax.swing.tree.TreePath
+import javax.swing.tree.TreeSelectionModel
 
 class ResultViewerPanel(
     private val project: Project,
@@ -85,7 +89,16 @@ class ResultViewerPanel(
     private val onRequestRefresh: () -> Unit,
     private val onPrevPage: (() -> Unit)? = null,
     private val onNextPage: (() -> Unit)? = null,
-    private val onReadOnlyChanged: () -> Unit = {}
+    private val onReadOnlyChanged: () -> Unit = {},
+    private val diffBaselineState: DiffBaselineState? = null,
+    private val isJoinView: Boolean = false,
+    private val initialView: String = "TREE",
+    private val availableColumnsSupplier: (() -> List<String>)? = null,
+    private val onApplyColumnSelection: ((selectedColumns: List<String>, allSelected: Boolean) -> Unit)? = null,
+    private val onApplyQuickFilter: ((filterJson: String) -> Unit)? = null,
+    private val collectionsSupplier: (() -> List<String>)? = null,
+    private val onJumpToReferenceCollection: ((targetCollection: String, sourceFieldPath: String, sourceValue: BsonValue) -> Unit)? = null,
+    private val onRequestOpenJoinDialog: ((initialLocalField: String?) -> Unit)? = null
 ) : JPanel(BorderLayout()), Disposable {
 
     /**
@@ -149,12 +162,21 @@ class ResultViewerPanel(
         add(batchDecryptBtn)
         add(batchCountdownBadge)
     }
+    private val baselineBadgeLabel = UiHelpers.createBadgeLabel("", UiHelpers.COLOR_BLUE_BG, UiHelpers.COLOR_BLUE_FG).apply {
+        isVisible = false
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+    }
     private val previewBannerLabel = UiHelpers.createBadgeLabel("", UiHelpers.COLOR_BLUE_BG, UiHelpers.COLOR_BLUE_FG).apply {
         isVisible = false
     }
 
     private val expandCollapseToggleBtn = JButton(I18n.t("result.tree.expandAll")).apply {
         margin = JBUI.insets(1, 6)
+    }
+
+    private val exportBtn = JButton(I18n.t("result.export.btn")).apply {
+        margin = JBUI.insets(1, 6)
+        isEnabled = false
     }
 
     private val treeViewBtn = JToggleButton(I18n.t("result.view.tree"), true).apply { margin = JBUI.insets(1, 6) }
@@ -174,9 +196,17 @@ class ResultViewerPanel(
         override fun getToolTipText(event: MouseEvent?): String? {
             if (event == null) return null
             val path = getPathForLocation(event.x, event.y) ?: return null
-            val node = path.lastPathComponent as? FieldTreeNode ?: return null
-            val dt = node.bsonValue as? BsonDateTime ?: return null
-            return I18n.t("result.date.kstTooltip", UiHelpers.formatKst(dt.value))
+            return when (val comp = path.lastPathComponent) {
+                is FieldTreeNode -> when (val bv = comp.bsonValue) {
+                    is BsonObjectId -> UiHelpers.formatObjectIdTooltip(bv.value)
+                    is BsonDateTime -> UiHelpers.formatDateDualTooltip(bv.value)
+                    else -> null
+                }
+                is DocTreeNode -> (comp.bsonDocument["_id"] as? BsonObjectId)?.let {
+                    UiHelpers.formatObjectIdTooltip(it.value)
+                }
+                else -> null
+            }
         }
     }
     private val treeScrollPane = JBScrollPane(resultTree)
@@ -199,7 +229,7 @@ class ResultViewerPanel(
         }
     }
 
-    // 3. Table View (quote-free cells + single-cell selection + pure text/plain TransferHandler)
+    // 3. Table View (quote-free cells + multi-row selection + pure text/plain TransferHandler)
     private val tableModel = MongoResultTableModel()
     private val resultTable = object : JBTable(tableModel) {
         override fun getToolTipText(event: MouseEvent?): String? {
@@ -209,11 +239,11 @@ class ResultViewerPanel(
             if (row < 0 || col < 0) return null
             val modelRow = convertRowIndexToModel(row)
             val modelCol = convertColumnIndexToModel(col)
-            val bsonVal = tableModel.getEffectiveBsonValueAt(modelRow, modelCol)
-            return if (bsonVal is BsonDateTime) {
-                I18n.t("result.date.kstTooltip", UiHelpers.formatKst(bsonVal.value))
-            } else {
-                bsonVal?.let { "${UiHelpers.bsonTypeTag(it)}: ${UiHelpers.bsonPureTextValue(it)}" }
+            val bsonVal = tableModel.getEffectiveBsonValueAt(modelRow, modelCol) ?: return null
+            return when (bsonVal) {
+                is BsonObjectId -> UiHelpers.formatObjectIdTooltip(bsonVal.value)
+                is BsonDateTime -> UiHelpers.formatDateDualTooltip(bsonVal.value)
+                else -> "${UiHelpers.bsonTypeTag(bsonVal)}: ${UiHelpers.bsonPureTextValue(bsonVal)}"
             }
         }
     }
@@ -231,6 +261,9 @@ class ResultViewerPanel(
         cardsPanel.add(tableScrollPane, "TABLE")
 
         add(cardsPanel, BorderLayout.CENTER)
+        if (initialView != "TREE") {
+            switchView(initialView)
+        }
         com.intellij.openapi.util.Disposer.register(this) { clearAllDecryptedPlaintext(repaintTable = false) }
         cryptoStore.addChangeListener(this) {
             val refresh = Runnable {
@@ -244,6 +277,10 @@ class ResultViewerPanel(
                 SwingUtilities.invokeLater(refresh)
             }
         }
+        diffBaselineState?.addListener(this) {
+            updateBaselineBadge()
+        }
+        updateBaselineBadge()
         I18n.addListener(this) { refreshTexts() }
     }
 
@@ -257,11 +294,20 @@ class ResultViewerPanel(
             add(summaryLabel)
             add(indexBadge)
             add(tableBatchDecryptPanel)
+            add(baselineBadgeLabel)
             add(previewBannerLabel)
             add(expandCollapseToggleBtn)
         }
 
         batchDecryptBtn.addActionListener { handleTableBatchDecryptClick() }
+        baselineBadgeLabel.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                if (SwingUtilities.isLeftMouseButton(e)) {
+                    diffBaselineState?.clear()
+                    UiHelpers.notify(project, I18n.t("diff.unpinnedToast"))
+                }
+            }
+        })
 
         expandCollapseToggleBtn.addActionListener {
             if (isTreeFullyExpanded) {
@@ -271,7 +317,10 @@ class ResultViewerPanel(
             }
         }
 
+        exportBtn.addActionListener { showExportMenu() }
+
         val rightBar = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 2)).apply {
+            add(exportBtn)
             if (onPrevPage != null && onNextPage != null) {
                 prevBtn.isEnabled = false
                 nextBtn.isEnabled = false
@@ -304,6 +353,7 @@ class ResultViewerPanel(
         resultTree.isRootVisible = false
         resultTree.showsRootHandles = true
         resultTree.toggleClickCount = 0
+        resultTree.selectionModel.selectionMode = TreeSelectionModel.DISCONTIGUOUS_TREE_SELECTION
         ToolTipManager.sharedInstance().registerComponent(resultTree)
 
         resultTree.cellRenderer = object : ColoredTreeCellRenderer() {
@@ -361,13 +411,29 @@ class ResultViewerPanel(
                                 "  [${UiHelpers.bsonTypeTag(value.bsonValue)}]",
                                 SimpleTextAttributes(SimpleTextAttributes.STYLE_ITALIC, UiHelpers.BSON_NULL_COLOR)
                             )
-                            val strVal = (value.bsonValue as? BsonString)?.value
-                            if (strVal != null && CryptoService.isEncryptedCandidate(strVal, cryptoStore.getConfig(profile.profileName))) {
-                                append("  ", SimpleTextAttributes.REGULAR_ATTRIBUTES)
-                                append(
-                                    "[${I18n.t("crypto.btn.decrypt")}]",
-                                    SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, UiHelpers.COLOR_BLUE_FG)
-                                )
+                            when (val bv = value.bsonValue) {
+                                is BsonObjectId -> {
+                                    append(
+                                        "  ${UiHelpers.formatObjectIdInlineTime(bv.value)}",
+                                        SimpleTextAttributes.GRAYED_ATTRIBUTES
+                                    )
+                                }
+                                is BsonDateTime -> {
+                                    append(
+                                        "  ${UiHelpers.formatDateInlineTime(bv.value)}",
+                                        SimpleTextAttributes.GRAYED_ATTRIBUTES
+                                    )
+                                }
+                                is BsonString -> {
+                                    if (CryptoService.isEncryptedCandidate(bv.value, cryptoStore.getConfig(profile.profileName))) {
+                                        append("  ", SimpleTextAttributes.REGULAR_ATTRIBUTES)
+                                        append(
+                                            "[${I18n.t("crypto.btn.decrypt")}]",
+                                            SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, UiHelpers.COLOR_BLUE_FG)
+                                        )
+                                    }
+                                }
+                                else -> Unit
                             }
                         }
                     }
@@ -421,20 +487,37 @@ class ResultViewerPanel(
                     if (e.y in bounds.y..(bounds.y + bounds.height)) closest else return
                 }
 
-                resultTree.selectionPath = resolvedPath
                 val clickedNode = resolvedPath.lastPathComponent
+                val clickedDocIdx = when (clickedNode) {
+                    is DocTreeNode -> clickedNode.docIndex
+                    is FieldTreeNode -> clickedNode.rootDocNode.docIndex
+                    else -> return
+                }
 
-                val (targetDocNode, focusFieldPath, copyText) = when (clickedNode) {
-                    is DocTreeNode -> Triple(
+                // Preserve existing multi-selection when right-clicking a node inside already-selected documents
+                val existingPaths = resultTree.selectionPaths.orEmpty()
+                val existingDocIndices = selectedTreeDocIndices()
+                if (resolvedPath !in existingPaths && !(existingDocIndices.size >= 2 && clickedDocIdx in existingDocIndices)) {
+                    resultTree.selectionPath = resolvedPath
+                }
+
+                val (targetDocNode, focusFieldPath, clickedBsonVal, copyText) = when (clickedNode) {
+                    is DocTreeNode -> Quadruple(
                         clickedNode,
-                        null,
+                        "_id".takeIf { clickedNode.bsonDocument.containsKey("_id") },
+                        clickedNode.bsonDocument["_id"],
                         MongoShellNormalizer.formatPrettyExtended(clickedNode.bsonDocument)
                     )
-                    is FieldTreeNode -> Triple(
-                        clickedNode.rootDocNode,
-                        clickedNode.fieldPath,
-                        "${clickedNode.keyLabel}: ${UiHelpers.bsonPureTextValue(clickedNode.bsonValue)}"
-                    )
+                    is FieldTreeNode -> {
+                        val plain = decryptedFields[decryptKeyFor(clickedNode)]?.plaintext
+                        val valText = plain ?: UiHelpers.bsonPureTextValue(clickedNode.bsonValue)
+                        Quadruple(
+                            clickedNode.rootDocNode,
+                            clickedNode.fieldPath,
+                            clickedNode.bsonValue,
+                            "${clickedNode.keyLabel}: $valText"
+                        )
+                    }
                     else -> return
                 }
 
@@ -443,13 +526,27 @@ class ResultViewerPanel(
                     x = e.x,
                     y = e.y,
                     docIndex = targetDocNode.docIndex,
+                    selectedDocIndices = selectedTreeDocIndices(),
                     targetBsonDoc = targetDocNode.bsonDocument,
                     targetRawDoc = targetDocNode.rawDocument,
                     focusFieldPath = focusFieldPath,
+                    clickedBsonValue = clickedBsonVal,
                     copyKeyValueText = copyText
                 )
             }
         })
+    }
+
+    private data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
+
+    private fun selectedTreeDocIndices(): List<Int> {
+        return resultTree.selectionPaths.orEmpty().mapNotNull { path ->
+            when (val n = path.lastPathComponent) {
+                is DocTreeNode -> n.docIndex
+                is FieldTreeNode -> n.rootDocNode.docIndex
+                else -> null
+            }
+        }.filter { it in currentDocs.indices }.distinct()
     }
 
     private fun handleTreeDoubleClickCopyOverlay(e: MouseEvent) {
@@ -546,11 +643,25 @@ class ResultViewerPanel(
         resultTable.cellSelectionEnabled = true
         resultTable.rowSelectionAllowed = true
         resultTable.columnSelectionAllowed = true
-        resultTable.selectionModel.selectionMode = ListSelectionModel.SINGLE_INTERVAL_SELECTION
-        resultTable.columnModel.selectionModel.selectionMode = ListSelectionModel.SINGLE_INTERVAL_SELECTION
+        resultTable.selectionModel.selectionMode = ListSelectionModel.MULTIPLE_INTERVAL_SELECTION
+        resultTable.columnModel.selectionModel.selectionMode = ListSelectionModel.MULTIPLE_INTERVAL_SELECTION
         resultTable.rowSorter = TableRowSorter(tableModel)
         resultTable.rowHeight = 24
         ToolTipManager.sharedInstance().registerComponent(resultTable)
+
+        // Table Header right-click: Fast Column Selection (SELECT col1, col2) & Hide Column
+        resultTable.tableHeader.addMouseListener(object : MouseAdapter() {
+            override fun mousePressed(e: MouseEvent) = maybeShowHeaderContextMenu(e)
+            override fun mouseReleased(e: MouseEvent) = maybeShowHeaderContextMenu(e)
+
+            private fun maybeShowHeaderContextMenu(e: MouseEvent) {
+                if (!e.isPopupTrigger) return
+                val viewCol = resultTable.tableHeader.columnAtPoint(e.point)
+                if (viewCol < 0) return
+                val clickedColName = resultTable.getColumnName(viewCol)
+                showTableHeaderContextMenu(e.x, e.y, clickedColName)
+            }
+        })
 
         resultTable.transferHandler = object : TransferHandler() {
             override fun getSourceActions(c: JComponent?): Int = COPY
@@ -627,23 +738,33 @@ class ResultViewerPanel(
                 val row = resultTable.rowAtPoint(e.point)
                 val col = resultTable.columnAtPoint(e.point)
                 if (row < 0 || col < 0) return
-                resultTable.changeSelection(row, col, false, false)
+                // Preserve existing multi-row selection if right-clicked row is already selected
+                if (row !in resultTable.selectedRows) {
+                    resultTable.changeSelection(row, col, false, false)
+                }
 
                 val modelRow = resultTable.convertRowIndexToModel(row)
                 val modelCol = resultTable.convertColumnIndexToModel(col)
                 val colName = tableModel.getColumnName(modelCol)
                 val pureVal = tableModel.getPureCopyValueAt(modelRow, modelCol)
+                val clickedBsonVal = tableModel.getBsonValueAt(modelRow, modelCol)
                 val bsonDoc = currentDocs.getOrNull(modelRow) ?: return
                 val rawDoc = toRawDocument(bsonDoc)
+                val selectedDocIndices = resultTable.selectedRows
+                    .map { resultTable.convertRowIndexToModel(it) }
+                    .filter { it in currentDocs.indices }
+                    .distinct()
 
                 showUnifiedContextMenu(
                     invoker = resultTable,
                     x = e.x,
                     y = e.y,
                     docIndex = modelRow,
+                    selectedDocIndices = selectedDocIndices,
                     targetBsonDoc = bsonDoc,
                     targetRawDoc = rawDoc,
                     focusFieldPath = colName,
+                    clickedBsonValue = clickedBsonVal,
                     copyKeyValueText = pureVal,
                     copyLabelKey = "result.table.copyCell"
                 )
@@ -651,28 +772,81 @@ class ResultViewerPanel(
         })
     }
 
+    private fun showTableHeaderContextMenu(x: Int, y: Int, clickedColName: String) {
+        val visibleCols = tableModel.getColumnNames()
+        val menu = JPopupMenu()
+
+        if (onApplyColumnSelection != null) {
+            val canHide = visibleCols.size >= 2
+            menu.add(JMenuItem(I18n.t("result.table.hideColumn", clickedColName)).apply {
+                isEnabled = canHide
+                if (!canHide) {
+                    toolTipText = I18n.t("result.table.hideColumnDisabledTooltip")
+                }
+                addActionListener {
+                    val remaining = visibleCols.filter { it != clickedColName }
+                    if (remaining.isNotEmpty()) {
+                        onApplyColumnSelection.invoke(remaining, false)
+                    }
+                }
+            })
+
+            menu.add(JMenuItem(I18n.t("result.table.selectColumns")).apply {
+                font = font.deriveFont(Font.BOLD)
+                addActionListener {
+                    val schemaCols = availableColumnsSupplier?.invoke().orEmpty()
+                    val allCols = buildList {
+                        addAll(visibleCols)
+                        schemaCols.forEach { add(it) }
+                    }.distinct()
+                    val dlg = ColumnSelectDialog(project, allCols, visibleCols)
+                    if (dlg.showAndGet()) {
+                        onApplyColumnSelection.invoke(dlg.getSelectedColumns(), dlg.isAllColumnsSelected())
+                    }
+                }
+            })
+            menu.addSeparator()
+        }
+
+        menu.add(JMenuItem(I18n.t("result.table.copyColumn")).apply {
+            addActionListener {
+                UiHelpers.copyToClipboard(clickedColName)
+                UiHelpers.notify(project, I18n.t("result.copied"))
+            }
+        })
+
+        menu.show(resultTable.tableHeader, x, y)
+    }
+
     private fun showUnifiedContextMenu(
         invoker: Component,
         x: Int,
         y: Int,
         docIndex: Int,
+        selectedDocIndices: List<Int>,
         targetBsonDoc: BsonDocument,
         targetRawDoc: Document,
         focusFieldPath: String?,
+        clickedBsonValue: BsonValue?,
         copyKeyValueText: String,
         copyLabelKey: String = "result.doc.copyKeyValue"
     ) {
         val menu = JPopupMenu()
 
+        // 1. Edit Data (disabled with tooltip in Join View)
         menu.add(JMenuItem(I18n.t("result.doc.editData")).apply {
             font = font.deriveFont(Font.BOLD)
+            isEnabled = !isJoinView
+            if (isJoinView) {
+                toolTipText = I18n.t("join.editDisabledTooltip")
+            }
             addActionListener {
+                if (isJoinView) return@addActionListener
                 ApplicationManager.getApplication().invokeLater {
                     openDocumentEditDialog(docIndex, targetBsonDoc, targetRawDoc, focusFieldPath)
                 }
             }
         })
-        menu.addSeparator()
         menu.add(JMenuItem(I18n.t(copyLabelKey)).apply {
             addActionListener {
                 UiHelpers.copyToClipboard(copyKeyValueText)
@@ -680,7 +854,272 @@ class ResultViewerPanel(
             }
         })
 
+        // 2. Reference Jump / Join View / Time Range Filters
+        var addedRelationalSection = false
+        if (onJumpToReferenceCollection != null &&
+            focusFieldPath != null &&
+            clickedBsonValue != null &&
+            ReferenceJumpHelper.isReferenceCandidate(focusFieldPath, clickedBsonValue)
+        ) {
+            menu.addSeparator()
+            addedRelationalSection = true
+            menu.add(JMenuItem(I18n.t("result.ref.jumpToCollection")).apply {
+                addActionListener {
+                    showReferenceCollectionPopup(invoker, Point(x, y), focusFieldPath, clickedBsonValue)
+                }
+            })
+        }
+
+        if (onRequestOpenJoinDialog != null) {
+            if (!addedRelationalSection) {
+                menu.addSeparator()
+                addedRelationalSection = true
+            }
+            menu.add(JMenuItem(I18n.t("result.join.openDialog")).apply {
+                addActionListener {
+                    onRequestOpenJoinDialog.invoke(focusFieldPath)
+                }
+            })
+        }
+
+        if (onApplyQuickFilter != null && focusFieldPath != null && clickedBsonValue != null) {
+            when (clickedBsonValue) {
+                is BsonObjectId -> {
+                    if (!addedRelationalSection) {
+                        menu.addSeparator()
+                        addedRelationalSection = true
+                    }
+                    val oidMenu = JMenu(I18n.t("result.timeFilter.menu")).apply {
+                        add(JMenuItem(I18n.t("result.timeFilter.gte")).apply {
+                            addActionListener {
+                                onApplyQuickFilter.invoke(
+                                    UiHelpers.buildObjectIdTimeRangeFilter(focusFieldPath, clickedBsonValue.value, isGte = true)
+                                )
+                            }
+                        })
+                        add(JMenuItem(I18n.t("result.timeFilter.lte")).apply {
+                            addActionListener {
+                                onApplyQuickFilter.invoke(
+                                    UiHelpers.buildObjectIdTimeRangeFilter(focusFieldPath, clickedBsonValue.value, isGte = false)
+                                )
+                            }
+                        })
+                    }
+                    menu.add(oidMenu)
+                }
+                is BsonDateTime -> {
+                    if (!addedRelationalSection) {
+                        menu.addSeparator()
+                        addedRelationalSection = true
+                    }
+                    val dateMenu = JMenu(I18n.t("result.dateFilter.menu")).apply {
+                        add(JMenuItem(I18n.t("result.dateFilter.gte")).apply {
+                            addActionListener {
+                                onApplyQuickFilter.invoke(
+                                    UiHelpers.buildDateTimeRangeFilter(focusFieldPath, clickedBsonValue.value, isGte = true)
+                                )
+                            }
+                        })
+                        add(JMenuItem(I18n.t("result.dateFilter.lte")).apply {
+                            addActionListener {
+                                onApplyQuickFilter.invoke(
+                                    UiHelpers.buildDateTimeRangeFilter(focusFieldPath, clickedBsonValue.value, isGte = false)
+                                )
+                            }
+                        })
+                    }
+                    menu.add(dateMenu)
+                }
+                else -> Unit
+            }
+        }
+
+        // 3. Diff Comparison (2 Selected Documents + Baseline Snapshot)
+        if (diffBaselineState != null) {
+            menu.addSeparator()
+            val canCompareTwo = selectedDocIndices.size == 2
+            menu.add(JMenuItem(I18n.t("diff.menu.compareTwo")).apply {
+                isEnabled = canCompareTwo
+                if (!canCompareTwo) {
+                    toolTipText = I18n.t("diff.menu.compareTwoHint")
+                }
+                addActionListener {
+                    if (selectedDocIndices.size != 2) return@addActionListener
+                    val leftIdx = selectedDocIndices[0]
+                    val rightIdx = selectedDocIndices[1]
+                    val leftDoc = resolveDocSnapshotForDiff(leftIdx) ?: return@addActionListener
+                    val rightDoc = resolveDocSnapshotForDiff(rightIdx) ?: return@addActionListener
+                    DocumentDiffHelper.showDiff(
+                        project = project,
+                        contextTitle = "$database.$collection",
+                        leftTitle = buildDocDiffTitle(leftIdx, leftDoc),
+                        leftDoc = leftDoc,
+                        rightTitle = buildDocDiffTitle(rightIdx, rightDoc),
+                        rightDoc = rightDoc
+                    )
+                }
+            })
+
+            menu.add(JMenuItem(I18n.t("diff.menu.pinBaseline")).apply {
+                addActionListener {
+                    val snapDoc = resolveDocSnapshotForDiff(docIndex) ?: return@addActionListener
+                    val shortId = shortDocId(snapDoc, docIndex)
+                    val fullLabel = "${profile.displayName}/$database.$collection [$shortId]"
+                    diffBaselineState.pin(fullLabel, shortId, snapDoc)
+                    UiHelpers.notify(project, I18n.t("diff.pinnedToast", shortId))
+                }
+            })
+
+            val pinned = diffBaselineState.current
+            if (pinned != null) {
+                menu.add(JMenuItem(I18n.t("diff.menu.compareWithBaseline", pinned.shortId)).apply {
+                    font = font.deriveFont(Font.BOLD)
+                    addActionListener {
+                        val currentSnap = resolveDocSnapshotForDiff(docIndex) ?: return@addActionListener
+                        DocumentDiffHelper.showDiff(
+                            project = project,
+                            contextTitle = "${pinned.shortId} ↔ ${shortDocId(currentSnap, docIndex)}",
+                            leftTitle = I18n.t("diff.baselineLabel", pinned.fullLabel),
+                            leftDoc = pinned.canonicalDoc,
+                            rightTitle = "${profile.displayName}/$database.$collection ${buildDocDiffTitle(docIndex, currentSnap)}",
+                            rightDoc = currentSnap
+                        )
+                    }
+                })
+            }
+        }
+
         menu.show(invoker, x, y)
+    }
+
+    private fun showReferenceCollectionPopup(
+        invoker: Component,
+        point: Point,
+        sourceFieldPath: String,
+        sourceValue: BsonValue
+    ) {
+        val jumpHandler = onJumpToReferenceCollection ?: return
+        val cached = collectionsSupplier?.invoke().orEmpty().filter { it.isNotBlank() }
+
+        fun displayPopup(allColls: List<String>) {
+            if (allColls.isEmpty()) {
+                UiHelpers.notify(project, I18n.t("result.ref.noCollections"), NotificationType.WARNING)
+                return
+            }
+            val ranked = ReferenceJumpHelper.rankCollections(database, collection, sourceFieldPath, allColls)
+            val step = object : com.intellij.openapi.ui.popup.util.BaseListPopupStep<ReferenceJumpHelper.RankedCollectionItem>(
+                I18n.t("result.ref.popupTitle", sourceFieldPath),
+                ranked
+            ) {
+                override fun getTextFor(value: ReferenceJumpHelper.RankedCollectionItem): String {
+                    val badge = value.badgeKey?.let { "  [${I18n.t(it)}]" }.orEmpty()
+                    return "${value.name}$badge"
+                }
+
+                override fun isSpeedSearchEnabled(): Boolean = true
+
+                override fun onChosen(
+                    selectedValue: ReferenceJumpHelper.RankedCollectionItem?,
+                    finalChoice: Boolean
+                ): com.intellij.openapi.ui.popup.PopupStep<*>? {
+                    if (selectedValue != null && finalChoice) {
+                        ApplicationManager.getApplication().invokeLater {
+                            ReferenceJumpHelper.recordSelection(database, sourceFieldPath, selectedValue.name)
+                            jumpHandler.invoke(selectedValue.name, sourceFieldPath, sourceValue)
+                        }
+                    }
+                    return FINAL_CHOICE
+                }
+            }
+            JBPopupFactory.getInstance().createListPopup(step).show(RelativePoint(invoker, point))
+        }
+
+        if (cached.size > 1) {
+            displayPopup(cached)
+        } else {
+            ApplicationManager.getApplication().executeOnPooledThread {
+                val fetched = try {
+                    connectionManager.listCollections(profile, database)
+                } catch (_: Throwable) {
+                    cached
+                }
+                ApplicationManager.getApplication().invokeLater {
+                    displayPopup(fetched)
+                }
+            }
+        }
+    }
+
+    private fun resolveDocSnapshotForDiff(docIndex: Int): BsonDocument? {
+        val raw = currentDocs.getOrNull(docIndex) ?: return null
+        val prefix = "$docIndex:"
+        val perFieldPlain = linkedMapOf<String, String>()
+        for ((k, entry) in decryptedFields) {
+            if (k.startsWith(prefix)) {
+                perFieldPlain[k.removePrefix(prefix)] = entry.plaintext
+            }
+        }
+        val cfg = cryptoStore.getConfig(profile.profileName)
+        val secretKey = if (isTableBatchDecrypted) cryptoStore.getSecretKey(profile.profileName) else ""
+        return DocumentDiffHelper.resolveDocumentForDiff(
+            rawDoc = raw,
+            isBatchDecrypted = isTableBatchDecrypted,
+            cryptoConfig = cfg,
+            secretKey = secretKey,
+            perFieldPlaintexts = perFieldPlain
+        )
+    }
+
+    private fun shortDocId(doc: BsonDocument, docIndex: Int): String {
+        val idVal = doc["_id"] ?: return "#${currentSkip + docIndex + 1}"
+        val raw = UiHelpers.bsonIdRawText(idVal)
+        return if (raw.length > 14) "${raw.take(6)}…${raw.takeLast(4)}" else raw
+    }
+
+    private fun buildDocDiffTitle(docIndex: Int, doc: BsonDocument): String {
+        val idText = doc["_id"]?.let { UiHelpers.bsonIdRawText(it) } ?: "doc"
+        return "[${currentSkip + docIndex + 1}] $idText"
+    }
+
+    private fun updateBaselineBadge() {
+        val pinned = diffBaselineState?.current
+        if (pinned == null) {
+            baselineBadgeLabel.isVisible = false
+        } else {
+            baselineBadgeLabel.text = I18n.t("diff.badge.pinned", pinned.shortId)
+            baselineBadgeLabel.toolTipText = I18n.t("diff.badge.pinnedTooltip", pinned.fullLabel)
+            baselineBadgeLabel.isVisible = true
+        }
+        headerLeftBar.revalidate()
+        headerLeftBar.repaint()
+    }
+
+    private fun showExportMenu() {
+        if (currentDocs.isEmpty()) return
+        val menu = JPopupMenu()
+        menu.add(JMenuItem(I18n.t("result.export.csv")).apply {
+            addActionListener {
+                val cols = tableModel.getColumnNames()
+                ResultExportHelper.exportCsv(
+                    project = project,
+                    suggestedBaseName = collection,
+                    columns = cols,
+                    rowCount = tableModel.rowCount,
+                    cellTextProvider = { r, c -> tableModel.getPureCopyValueAt(r, c) }
+                )
+            }
+        })
+        menu.add(JMenuItem(I18n.t("result.export.json")).apply {
+            addActionListener {
+                val docsToExport = currentDocs.indices.mapNotNull { resolveDocSnapshotForDiff(it) }
+                ResultExportHelper.exportJson(
+                    project = project,
+                    suggestedBaseName = collection,
+                    documents = docsToExport
+                )
+            }
+        })
+        menu.show(exportBtn, 0, exportBtn.height)
     }
 
     private fun resolveTreePathAtPoint(x: Int, y: Int): TreePath? {
@@ -1125,8 +1564,10 @@ class ResultViewerPanel(
             previewBannerLabel.isVisible = false
         }
 
+        exportBtn.isEnabled = docs.isNotEmpty()
         prevBtn.isEnabled = currentSkip > 0
-        nextBtn.isEnabled = docs.size >= currentLimit && (result.totalCount < 0 || currentSkip + docs.size < result.totalCount)
+        nextBtn.isEnabled = result.hasNextPage
+            ?: (docs.size >= currentLimit && (result.totalCount < 0 || currentSkip + docs.size < result.totalCount))
     }
 
     private fun populateTree(docs: List<BsonDocument>) {
@@ -1268,6 +1709,7 @@ class ResultViewerPanel(
 
     private fun refreshTexts() {
         SwingUtilities.invokeLater {
+            exportBtn.text = I18n.t("result.export.btn")
             treeViewBtn.text = I18n.t("result.view.tree")
             jsonViewBtn.text = I18n.t("result.view.json")
             tableViewBtn.text = I18n.t("result.view.table")
@@ -1276,6 +1718,7 @@ class ResultViewerPanel(
             updateExpandCollapseToggleButton()
             updateSummaryAndBadges()
             updateBatchDecryptControls()
+            updateBaselineBadge()
         }
     }
 
@@ -1354,6 +1797,8 @@ class ResultViewerPanel(
         override fun getColumnCount(): Int = columns.size
 
         override fun getColumnName(column: Int): String = columns[column]
+
+        fun getColumnNames(): List<String> = columns.toList()
 
         override fun getValueAt(rowIndex: Int, columnIndex: Int): Any {
             decryptedCells[rowIndex to columnIndex]?.let { return it.displayText }

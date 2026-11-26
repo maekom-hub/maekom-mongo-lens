@@ -13,8 +13,10 @@ import com.maekom.mongolens.config.SavedQueryStore
 import com.maekom.mongolens.config.VariableStore
 import com.maekom.mongolens.crypto.CryptoConfigStore
 import com.maekom.mongolens.i18n.I18n
+import com.maekom.mongolens.mongo.JoinSpec
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import com.maekom.mongolens.mongo.SmartInValueType
+import org.bson.BsonValue
 import java.awt.BorderLayout
 import java.awt.CardLayout
 import java.awt.Cursor
@@ -41,7 +43,14 @@ class CollectionWorkspaceTab(
     val collection: String,
     initialMode: WorkspaceMode = WorkspaceMode.FIND,
     private val onStatusUpdate: (String, Boolean) -> Unit,
-    private val onReadOnlyStateChanged: () -> Unit
+    private val onReadOnlyStateChanged: () -> Unit,
+    initialJoinSpec: JoinSpec? = null,
+    initialFilterText: String = "",
+    initialSortText: String = "",
+    autoExecuteInitialFind: Boolean = true,
+    diffBaselineState: DiffBaselineState? = null,
+    onOpenReferenceJumpTab: ((targetCollection: String, sourceFieldPath: String, sourceValue: BsonValue) -> Unit)? = null,
+    onOpenJoinTab: ((joinSpec: JoinSpec, currentFilter: String, currentSort: String) -> Unit)? = null
 ) : JPanel(BorderLayout()), Disposable {
 
     enum class WorkspaceMode {
@@ -64,8 +73,22 @@ class CollectionWorkspaceTab(
         margin = JBUI.insets(2, 8)
     }
 
-    private val breadcrumbLabel = JBLabel("${profile.displayName}  /  $database.$collection").apply {
+    private val breadcrumbLabel = JBLabel(
+        if (initialJoinSpec != null) {
+            "${profile.displayName}  /  $database.${initialJoinSpec.leftCollection} ⋈ ${initialJoinSpec.rightCollection}"
+        } else {
+            "${profile.displayName}  /  $database.$collection"
+        }
+    ).apply {
         font = font.deriveFont(Font.BOLD)
+    }
+
+    private val joinModeBadge = UiHelpers.createBadgeLabel(
+        I18n.t("join.badge"),
+        UiHelpers.COLOR_BLUE_BG,
+        UiHelpers.COLOR_BLUE_FG
+    ).apply {
+        isVisible = initialJoinSpec != null
     }
 
     private val readOnlyBadge = UiHelpers.createBadgeLabel(
@@ -96,7 +119,8 @@ class CollectionWorkspaceTab(
         onReadOnlyChanged = {
             updateReadOnlyBadge()
             onReadOnlyStateChanged()
-        }
+        },
+        diffBaselineState = diffBaselineState
     )
 
     private val findPanel = FindQueryPanel(
@@ -119,7 +143,14 @@ class CollectionWorkspaceTab(
         onConvertToShell = { script ->
             shellPanel.setScriptText(script)
             switchMode(WorkspaceMode.SHELL)
-        }
+        },
+        initialJoinSpec = initialJoinSpec,
+        initialFilterText = initialFilterText,
+        initialSortText = initialSortText,
+        diffBaselineState = diffBaselineState,
+        collectionsSupplier = { cachedCollections.toList() },
+        onOpenReferenceJumpTab = onOpenReferenceJumpTab,
+        onOpenJoinTab = onOpenJoinTab
     )
 
     private val aggregationPanel = AggregationBuilderPanel(
@@ -141,7 +172,8 @@ class CollectionWorkspaceTab(
         onConvertToShell = { script ->
             shellPanel.setScriptText(script)
             switchMode(WorkspaceMode.SHELL)
-        }
+        },
+        diffBaselineState = diffBaselineState
     )
 
     init {
@@ -157,6 +189,7 @@ class CollectionWorkspaceTab(
                 add(shellModeBtn)
             }
             val right = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 2)).apply {
+                add(joinModeBadge)
                 add(breadcrumbLabel)
                 add(readOnlyBadge)
             }
@@ -196,11 +229,16 @@ class CollectionWorkspaceTab(
 
         // Pre-sample 30 documents + collection names asynchronously for autocomplete
         sampleMetadataInBackground()
-        if (initialMode == WorkspaceMode.FIND) {
+        if (initialMode == WorkspaceMode.FIND && autoExecuteInitialFind) {
             findPanel.executeFind()
         }
 
         I18n.addListener(this) { refreshTexts() }
+    }
+
+    fun applyQuickFilterAndRun(filterJson: String) {
+        switchMode(WorkspaceMode.FIND)
+        findPanel.applyQuickFilterAndRun(filterJson)
     }
 
     fun switchMode(mode: WorkspaceMode) {
