@@ -264,6 +264,7 @@ class MongoConnectionManager(project: Project) : Disposable {
         val safeSkip = skip.coerceAtLeast(0)
         val safeLimit = limit.coerceIn(1, 5000)
         val filter = MongoShellNormalizer.parseBsonDocument(filterRaw?.trim().orEmpty().ifEmpty { "{}" })
+        val effectiveLeftFilter = joinSpec.buildEffectiveLeftFilter(filter)
         val sort = MongoShellNormalizer.parseBsonDocument(sortRaw?.trim().orEmpty().ifEmpty { "{}" })
 
         val client = getOrCreateClient(profile)
@@ -271,8 +272,8 @@ class MongoConnectionManager(project: Project) : Disposable {
 
         val startNs = System.nanoTime()
 
-        // Step 1: Probe `limit + 1` base documents to determine exact `hasNextPage` prior to $lookup/$unwind
-        val probeIterable = coll.find(filter)
+        // Step 1: Probe `limit + 1` base documents using merged left filter to determine exact `hasNextPage`
+        val probeIterable = coll.find(effectiveLeftFilter)
             .projection(BsonDocument("_id", org.bson.BsonInt32(1)))
             .skip(safeSkip)
             .limit(safeLimit + 1)
@@ -291,10 +292,10 @@ class MongoConnectionManager(project: Project) : Disposable {
 
         var isApprox = false
         val totalCount: Long = try {
-            if (filter.isEmpty()) {
+            if (effectiveLeftFilter.isEmpty()) {
                 coll.estimatedDocumentCount()
             } else {
-                coll.countDocuments(filter, CountOptions().maxTime(2, TimeUnit.SECONDS))
+                coll.countDocuments(effectiveLeftFilter, CountOptions().maxTime(2, TimeUnit.SECONDS))
             }
         } catch (_: Throwable) {
             isApprox = true

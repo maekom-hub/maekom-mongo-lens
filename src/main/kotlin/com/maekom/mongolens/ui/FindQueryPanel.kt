@@ -56,7 +56,8 @@ class FindQueryPanel(
     private val diffBaselineState: DiffBaselineState? = null,
     private val collectionsSupplier: () -> List<String> = { emptyList() },
     private val onOpenReferenceJumpTab: ((targetCollection: String, sourceFieldPath: String, sourceValue: BsonValue) -> Unit)? = null,
-    private val onOpenJoinTab: ((joinSpec: JoinSpec, currentFilter: String, currentSort: String) -> Unit)? = null
+    private val onOpenJoinTab: ((joinSpec: JoinSpec, currentFilter: String, currentSort: String) -> Unit)? = null,
+    private val onJoinSpecUpdated: ((updatedSpec: JoinSpec) -> Unit)? = null
 ) : JPanel(BorderLayout()), Disposable {
 
     private val initialJoinSpecRef: JoinSpec? = initialJoinSpec
@@ -196,7 +197,7 @@ class FindQueryPanel(
         cryptoStore = cryptoStore,
         profile = profile,
         database = database,
-        collection = if (initialJoinSpec != null) "${initialJoinSpec.leftCollection}⋈${initialJoinSpec.rightCollection}" else collection,
+        collection = initialJoinSpec?.compactTabKeySegment() ?: collection,
         onRequestRefresh = { executeFind() },
         onPrevPage = {
             val lim = currentLimit()
@@ -213,6 +214,7 @@ class FindQueryPanel(
         diffBaselineState = diffBaselineState,
         isJoinView = initialJoinSpec != null,
         initialView = if (initialJoinSpec != null) "TABLE" else "TREE",
+        initialJoinColumnOrigins = initialJoinSpec?.columnOriginsByResultKey().orEmpty(),
         availableColumnsSupplier = { resolveAvailableProjectionColumns() },
         onApplyColumnSelection = { selectedCols, allSelected ->
             handleColumnSelectionApplied(selectedCols, allSelected)
@@ -224,7 +226,9 @@ class FindQueryPanel(
         onJumpToReferenceCollection = onOpenReferenceJumpTab,
         onRequestOpenJoinDialog = if (onOpenJoinTab != null) { initialField ->
             openJoinConfigurationDialog(initialField)
-        } else null
+        } else null,
+        onRequestEditJoin = if (initialJoinSpec != null) ({ openEditCurrentJoinDialog() }) else null,
+        onCopyJoinPipeline = if (initialJoinSpec != null) ({ copyCurrentJoinPipeline() }) else null
     )
 
     init {
@@ -398,6 +402,8 @@ class FindQueryPanel(
             resultViewer.resetTableBatchDecryption()
             if (initialJoinSpecRef != null) {
                 activeJoinSpec = initialJoinSpecRef
+                resultViewer.setJoinColumnOrigins(initialJoinSpecRef.columnOriginsByResultKey())
+                onJoinSpecUpdated?.invoke(initialJoinSpecRef)
             }
             filterEditor.text = ""
             projectEditor.text = ""
@@ -482,7 +488,9 @@ class FindQueryPanel(
         val joinSpec = activeJoinSpec
         if (joinSpec != null) {
             // Join Tab: update JoinSpec selected columns without overwriting Project with { field: 1 }
-            activeJoinSpec = joinSpec.updateFromVisibleColumnSelection(selectedColumns)
+            val updated = joinSpec.updateFromVisibleColumnSelection(selectedColumns)
+            activeJoinSpec = updated
+            resultViewer.setJoinColumnOrigins(updated.columnOriginsByResultKey())
             executeFind()
             return
         }
@@ -558,6 +566,64 @@ class FindQueryPanel(
         }
     }
 
+    private fun copyCurrentJoinPipeline() {
+        val spec = activeJoinSpec ?: return
+        val jsonArray = spec.formatPipelineJsonArray(
+            filterRaw = filterEditor.safeText(),
+            sortRaw = sortEditor.safeText(),
+            skip = currentSkip(),
+            limit = currentLimit()
+        )
+        UiHelpers.copyToClipboard(jsonArray)
+        UiHelpers.notify(project, I18n.t("join.tab.pipelineCopied"))
+    }
+
+    private fun openEditCurrentJoinDialog() {
+        val currentSpec = activeJoinSpec ?: return
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val allCollections = try {
+                val cached = collectionsSupplier()
+                if (cached.size > 1) cached else connectionManager.listCollections(profile, database)
+            } catch (_: Throwable) {
+                collectionsSupplier()
+            }
+            val sourceCategories: Map<String, String> = try {
+                connectionManager.sampleCollectionTopLevelTypes(profile, database, currentSpec.leftCollection, 10)
+            } catch (_: Throwable) {
+                emptyMap()
+            }
+            val topFields = buildList {
+                addAll(sourceCategories.keys)
+                addAll(currentSpec.allLeftFields)
+                addAll(currentSpec.selectedLeftFields)
+            }.filter { it.isNotBlank() }.distinct().ifEmpty { listOf("_id") }
+
+            ApplicationManager.getApplication().invokeLater {
+                if (project.isDisposed) return@invokeLater
+                val dlg = JoinViewDialog(
+                    project = project,
+                    connectionManager = connectionManager,
+                    profile = profile,
+                    database = database,
+                    sourceCollection = currentSpec.leftCollection,
+                    initialLocalField = currentSpec.targets.firstOrNull()?.localField,
+                    sourceTopFields = topFields,
+                    sourceFieldCategories = sourceCategories,
+                    allCollectionsInDb = allCollections,
+                    existingJoinSpec = currentSpec
+                )
+                if (dlg.showAndGet()) {
+                    val updatedSpec = dlg.buildJoinSpec()
+                    activeJoinSpec = updatedSpec
+                    resultViewer.setJoinColumnOrigins(updatedSpec.columnOriginsByResultKey())
+                    onJoinSpecUpdated?.invoke(updatedSpec)
+                    skipSpinner.value = 0
+                    executeFind()
+                }
+            }
+        }
+    }
+
     private fun currentLimit(): Int = (limitCombo.selectedItem as? Int) ?: 50
 
     private fun currentSkip(): Int = (skipSpinner.value as? Int) ?: 0
@@ -580,7 +646,7 @@ class FindQueryPanel(
         onStatusUpdate(I18n.t("header.status.querying"), false)
 
         val taskTitle = if (joinSpecSnapshot != null) {
-            "Joining ${joinSpecSnapshot.leftCollection} ⋈ ${joinSpecSnapshot.rightCollection}..."
+            "Joining ${joinSpecSnapshot.displayTitle()}..."
         } else {
             "Finding documents in $database.$collection..."
         }

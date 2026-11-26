@@ -50,7 +50,8 @@ class CollectionWorkspaceTab(
     autoExecuteInitialFind: Boolean = true,
     diffBaselineState: DiffBaselineState? = null,
     onOpenReferenceJumpTab: ((targetCollection: String, sourceFieldPath: String, sourceValue: BsonValue) -> Unit)? = null,
-    onOpenJoinTab: ((joinSpec: JoinSpec, currentFilter: String, currentSort: String) -> Unit)? = null
+    onOpenJoinTab: ((joinSpec: JoinSpec, currentFilter: String, currentSort: String) -> Unit)? = null,
+    private val onJoinTitleUpdated: ((displayJoinTitle: String) -> Unit)? = null
 ) : JPanel(BorderLayout()), Disposable {
 
     enum class WorkspaceMode {
@@ -75,7 +76,7 @@ class CollectionWorkspaceTab(
 
     private val breadcrumbLabel = JBLabel(
         if (initialJoinSpec != null) {
-            "${profile.displayName}  /  $database.${initialJoinSpec.leftCollection} ⋈ ${initialJoinSpec.rightCollection}"
+            "${profile.displayName}  /  $database.${initialJoinSpec.displayTitle()}"
         } else {
             "${profile.displayName}  /  $database.$collection"
         }
@@ -150,7 +151,12 @@ class CollectionWorkspaceTab(
         diffBaselineState = diffBaselineState,
         collectionsSupplier = { cachedCollections.toList() },
         onOpenReferenceJumpTab = onOpenReferenceJumpTab,
-        onOpenJoinTab = onOpenJoinTab
+        onOpenJoinTab = onOpenJoinTab,
+        onJoinSpecUpdated = { updatedSpec ->
+            val joinDisplay = updatedSpec.displayTitle()
+            breadcrumbLabel.text = "${profile.displayName}  /  $database.$joinDisplay"
+            onJoinTitleUpdated?.invoke(joinDisplay)
+        }
     )
 
     private val aggregationPanel = AggregationBuilderPanel(

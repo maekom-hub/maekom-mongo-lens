@@ -24,6 +24,7 @@ import com.maekom.mongolens.crypto.CryptoConfigStore
 import com.maekom.mongolens.crypto.CryptoService
 import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.IndexScanType
+import com.maekom.mongolens.mongo.JoinColumnOrigin
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import com.maekom.mongolens.mongo.MongoShellNormalizer
 import com.maekom.mongolens.mongo.QueryExecutionResult
@@ -93,12 +94,15 @@ class ResultViewerPanel(
     private val diffBaselineState: DiffBaselineState? = null,
     private val isJoinView: Boolean = false,
     private val initialView: String = "TREE",
+    initialJoinColumnOrigins: Map<String, JoinColumnOrigin> = emptyMap(),
     private val availableColumnsSupplier: (() -> List<String>)? = null,
     private val onApplyColumnSelection: ((selectedColumns: List<String>, allSelected: Boolean) -> Unit)? = null,
     private val onApplyQuickFilter: ((filterJson: String) -> Unit)? = null,
     private val collectionsSupplier: (() -> List<String>)? = null,
     private val onJumpToReferenceCollection: ((targetCollection: String, sourceFieldPath: String, sourceValue: BsonValue) -> Unit)? = null,
-    private val onRequestOpenJoinDialog: ((initialLocalField: String?) -> Unit)? = null
+    private val onRequestOpenJoinDialog: ((initialLocalField: String?) -> Unit)? = null,
+    private val onRequestEditJoin: (() -> Unit)? = null,
+    private val onCopyJoinPipeline: (() -> Unit)? = null
 ) : JPanel(BorderLayout()), Disposable {
 
     /**
@@ -143,6 +147,7 @@ class ResultViewerPanel(
     private var previewBannerText: String? = null
     private var activeCopyOverlayPopup: JBPopup? = null
     private var isTreeFullyExpanded: Boolean = false
+    private var joinColumnOrigins: Map<String, JoinColumnOrigin> = initialJoinColumnOrigins
 
     private val headerLeftBar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
     private val summaryLabel = JBLabel(" ")
@@ -172,6 +177,16 @@ class ResultViewerPanel(
 
     private val expandCollapseToggleBtn = JButton(I18n.t("result.tree.expandAll")).apply {
         margin = JBUI.insets(1, 6)
+    }
+    private val editJoinBtn = JButton(I18n.t("join.tab.editBtn"), AllIcons.General.Settings).apply {
+        margin = JBUI.insets(1, 6)
+        toolTipText = I18n.t("join.tab.editBtnTooltip")
+        isVisible = isJoinView && onRequestEditJoin != null
+    }
+    private val copyJoinPipelineBtn = JButton(I18n.t("join.tab.copyPipelineBtn"), AllIcons.Actions.Copy).apply {
+        margin = JBUI.insets(1, 6)
+        toolTipText = I18n.t("join.tab.copyPipelineTooltip")
+        isVisible = isJoinView && onCopyJoinPipeline != null
     }
 
     private val exportBtn = JButton(I18n.t("result.export.btn")).apply {
@@ -232,6 +247,20 @@ class ResultViewerPanel(
     // 3. Table View (quote-free cells + multi-row selection + pure text/plain TransferHandler)
     private val tableModel = MongoResultTableModel()
     private val resultTable = object : JBTable(tableModel) {
+        override fun createDefaultTableHeader(): javax.swing.table.JTableHeader {
+            return object : javax.swing.table.JTableHeader(columnModel) {
+                override fun getToolTipText(event: MouseEvent?): String? {
+                    if (event == null) return null
+                    val viewCol = columnAtPoint(event.point)
+                    if (viewCol < 0) return null
+                    val modelCol = convertColumnIndexToModel(viewCol)
+                    val rawKey = tableModel.getColumnName(modelCol)
+                    val origin = joinColumnOrigins[rawKey] ?: return rawKey
+                    return I18n.t("join.origin.tooltip", origin.collectionName, origin.originalFieldName)
+                }
+            }
+        }
+
         override fun getToolTipText(event: MouseEvent?): String? {
             if (event == null) return null
             val row = rowAtPoint(event.point)
@@ -297,9 +326,13 @@ class ResultViewerPanel(
             add(baselineBadgeLabel)
             add(previewBannerLabel)
             add(expandCollapseToggleBtn)
+            add(editJoinBtn)
+            add(copyJoinPipelineBtn)
         }
 
         batchDecryptBtn.addActionListener { handleTableBatchDecryptClick() }
+        editJoinBtn.addActionListener { onRequestEditJoin?.invoke() }
+        copyJoinPipelineBtn.addActionListener { onCopyJoinPipeline?.invoke() }
         baselineBadgeLabel.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
                 if (SwingUtilities.isLeftMouseButton(e)) {
@@ -434,6 +467,23 @@ class ResultViewerPanel(
                                     }
                                 }
                                 else -> Unit
+                            }
+                        }
+
+                        // In Join View Tree, append `[<collection>.<originalField>]` origin badge at end (renderer-only)
+                        if (isJoinView) {
+                            val topKey = value.fieldPath.substringBefore('.')
+                            val origin = joinColumnOrigins[topKey]
+                            if (origin != null) {
+                                val subSuffix = if (value.fieldPath.contains('.')) {
+                                    value.fieldPath.substring(topKey.length)
+                                } else {
+                                    ""
+                                }
+                                append(
+                                    "  [${origin.collectionName}.${origin.originalFieldName}$subSuffix]",
+                                    SimpleTextAttributes.GRAYED_ATTRIBUTES
+                                )
                             }
                         }
                     }
@@ -648,6 +698,7 @@ class ResultViewerPanel(
         resultTable.rowSorter = TableRowSorter(tableModel)
         resultTable.rowHeight = 24
         ToolTipManager.sharedInstance().registerComponent(resultTable)
+        ToolTipManager.sharedInstance().registerComponent(resultTable.tableHeader)
 
         // Table Header right-click: Fast Column Selection (SELECT col1, col2) & Hide Column
         resultTable.tableHeader.addMouseListener(object : MouseAdapter() {
@@ -658,7 +709,9 @@ class ResultViewerPanel(
                 if (!e.isPopupTrigger) return
                 val viewCol = resultTable.tableHeader.columnAtPoint(e.point)
                 if (viewCol < 0) return
-                val clickedColName = resultTable.getColumnName(viewCol)
+                // Always resolve pure internal `resultFieldKey` from tableModel (never visual headerValue)
+                val modelCol = resultTable.convertColumnIndexToModel(viewCol)
+                val clickedColName = tableModel.getColumnName(modelCol)
                 showTableHeaderContextMenu(e.x, e.y, clickedColName)
             }
         })
@@ -1699,17 +1752,47 @@ class ResultViewerPanel(
         }
     }
 
+    fun setJoinColumnOrigins(origins: Map<String, JoinColumnOrigin>) {
+        this.joinColumnOrigins = origins
+        applyTableHeaderDisplayLabelsAndWidths()
+        resultTree.repaint()
+    }
+
     private fun populateTable(docs: List<BsonDocument>) {
         tableModel.setDocuments(docs)
+        applyTableHeaderDisplayLabelsAndWidths()
+    }
+
+    private fun applyTableHeaderDisplayLabelsAndWidths() {
         val cm = resultTable.columnModel
+        val header = resultTable.tableHeader
+        val fm = header.getFontMetrics(header.font)
         for (i in 0 until cm.columnCount) {
-            cm.getColumn(i).preferredWidth = if (i == 0) 210 else 150
+            val column = cm.getColumn(i)
+            val modelCol = resultTable.convertColumnIndexToModel(i)
+            val rawKey = tableModel.getColumnName(modelCol)
+            val origin = joinColumnOrigins[rawKey]
+            val displayHeader = if (origin != null) {
+                "${origin.originalFieldName} (${origin.collectionName}.${origin.originalFieldName})"
+            } else {
+                rawKey
+            }
+            column.headerValue = displayHeader
+            val headerWidth = fm.stringWidth(displayHeader) + JBUI.scale(32)
+            val baseMin = if (i == 0) 210 else 150
+            column.preferredWidth = maxOf(baseMin, headerWidth)
         }
+        header.revalidate()
+        header.repaint()
     }
 
     private fun refreshTexts() {
         SwingUtilities.invokeLater {
             exportBtn.text = I18n.t("result.export.btn")
+            editJoinBtn.text = I18n.t("join.tab.editBtn")
+            editJoinBtn.toolTipText = I18n.t("join.tab.editBtnTooltip")
+            copyJoinPipelineBtn.text = I18n.t("join.tab.copyPipelineBtn")
+            copyJoinPipelineBtn.toolTipText = I18n.t("join.tab.copyPipelineTooltip")
             treeViewBtn.text = I18n.t("result.view.tree")
             jsonViewBtn.text = I18n.t("result.view.json")
             tableViewBtn.text = I18n.t("result.view.table")
@@ -1719,6 +1802,9 @@ class ResultViewerPanel(
             updateSummaryAndBadges()
             updateBatchDecryptControls()
             updateBaselineBadge()
+            if (joinColumnOrigins.isNotEmpty()) {
+                applyTableHeaderDisplayLabelsAndWidths()
+            }
         }
     }
 

@@ -168,7 +168,7 @@ class WorkspaceTabManager(
     ): TabEntry {
         val tabId = UUID.randomUUID().toString()
         val tabKey = if (initialJoinSpec != null) {
-            "${profile.displayName}:$database:${initialJoinSpec.leftCollection}⋈${initialJoinSpec.rightCollection}"
+            "${profile.displayName}:$database:${initialJoinSpec.compactTabKeySegment()}"
         } else {
             buildTabKey(profile, database, collection)
         }
@@ -178,6 +178,9 @@ class WorkspaceTabManager(
         while (cloneNumber in usedNumbers) {
             cloneNumber++
         }
+
+        var tabInfoRef: TabInfo? = null
+        val numberSuffix = if (cloneNumber >= 2) " ($cloneNumber)" else ""
 
         val workspaceTab = CollectionWorkspaceTab(
             project = project,
@@ -205,21 +208,22 @@ class WorkspaceTabManager(
             },
             onOpenJoinTab = { spec, curFilter, curSort ->
                 openJoinTab(profile, database, spec, curFilter, curSort)
+            },
+            onJoinTitleUpdated = { updatedDisplay ->
+                tabInfoRef?.apply {
+                    setText("$updatedDisplay$numberSuffix")
+                    setTooltipText("${profile.displayName} / $database.$updatedDisplay$numberSuffix")
+                }
             }
         )
         Disposer.register(parentDisposable, workspaceTab)
 
-        val numberSuffix = if (cloneNumber >= 2) " ($cloneNumber)" else ""
         val modeSuffix = when (mode) {
             CollectionWorkspaceTab.WorkspaceMode.AGGREGATION -> " [Agg]"
             CollectionWorkspaceTab.WorkspaceMode.SHELL -> " [Shell]"
             else -> ""
         }
-        val displayCollection = if (initialJoinSpec != null) {
-            "${initialJoinSpec.leftCollection} ⋈ ${initialJoinSpec.rightCollection}"
-        } else {
-            collection
-        }
+        val displayCollection = initialJoinSpec?.displayTitle() ?: collection
         val tabTitle = if (initialJoinSpec != null) {
             "$displayCollection$numberSuffix"
         } else {
@@ -231,6 +235,7 @@ class WorkspaceTabManager(
             setTooltipText("${profile.displayName} / $database.$displayCollection$numberSuffix")
             setIcon(AllIcons.FileTypes.Json)
         }
+        tabInfoRef = tabInfo
 
         // Close path #1: Right-side '✕' button delegates directly to unified closeTab(tabId)
         val closeAction = object : AnAction(I18n.t("tab.close"), I18n.t("tab.close"), AllIcons.Actions.Close) {
