@@ -4,15 +4,18 @@ import com.google.gson.JsonParser
 import com.intellij.ide.plugins.PluginInstaller
 import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.ide.startup.StartupActionScriptManager
+import com.intellij.notification.NotificationType
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.PathManager
 import com.intellij.openapi.application.ex.ApplicationManagerEx
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.extensions.PluginId
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.maekom.mongolens.i18n.I18n
+import com.maekom.mongolens.ui.UiHelpers
 import java.io.IOException
 import java.net.URI
 import java.net.http.HttpClient
@@ -21,7 +24,10 @@ import java.net.http.HttpResponse
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.nio.file.StandardOpenOption
 import java.time.Duration
+import java.util.Comparator
+import java.util.Locale
 import java.util.zip.ZipFile
 
 data class ReleaseInfo(
@@ -35,9 +41,17 @@ data class ReleaseInfo(
 )
 
 object PluginUpdateChecker {
+    private val LOG = Logger.getInstance(PluginUpdateChecker::class.java)
+
     const val PLUGIN_ID = "com.maekom.mongolens"
     const val RELEASES_API_URL = "https://api.github.com/repos/maekom-hub/maekom-mongo-lens/releases/latest"
-    private const val FALLBACK_VERSION = "0.1.8"
+    private const val FALLBACK_VERSION = "0.1.9"
+    private const val USER_AGENT = "maekom-mongo-lens"
+    private const val TEMP_DIR_PREFIX = "maekom-mongo-lens-update-"
+    private const val ASSET_PREFIX = "maekom-mongo-lens-"
+    private const val MIN_PLUGIN_ZIP_BYTES = 10_240L
+
+    private val ZIP_MAGIC_BYTES = byteArrayOf(0x50, 0x4B, 0x03, 0x04)
 
     private val httpClient: HttpClient by lazy {
         HttpClient.newBuilder()
@@ -81,21 +95,18 @@ object PluginUpdateChecker {
 
     fun fetchLatestRelease(): Result<ReleaseInfo?> {
         return try {
+            val apiUri = validateTrustedHttpsUri(RELEASES_API_URL, allowApiHost = true)
             val request = HttpRequest.newBuilder()
-                .uri(URI.create(RELEASES_API_URL))
-                .timeout(Duration.ofSeconds(12))
+                .uri(apiUri)
+                .timeout(Duration.ofSeconds(30))
                 .header("Accept", "application/vnd.github+json")
-                .header("User-Agent", "maekom-mongo-lens/${currentVersionString()}")
+                .header("User-Agent", USER_AGENT)
                 .GET()
                 .build()
 
             val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
-            if (response.statusCode() == 404) {
-                // Repository exists but no release published yet
-                return Result.success(null)
-            }
-            if (response.statusCode() !in 200..299) {
-                return Result.failure(IOException("GitHub API HTTP ${response.statusCode()}"))
+            if (response.statusCode() != 200) {
+                return Result.failure(IOException(I18n.t("update.error.httpStatus", response.statusCode())))
             }
 
             val json = JsonParser.parseString(response.body()).asJsonObject
@@ -112,10 +123,10 @@ object PluginUpdateChecker {
             if (assets != null) {
                 for (elem in assets) {
                     val obj = elem.asJsonObject
-                    val name = obj.get("name")?.asString ?: continue
-                    if (name.endsWith(".zip", ignoreCase = true)) {
+                    val name = obj.get("name")?.asString?.trim() ?: continue
+                    if (name.startsWith(ASSET_PREFIX) && name.endsWith(".zip", ignoreCase = true)) {
                         assetName = name
-                        assetUrl = obj.get("browser_download_url")?.asString
+                        assetUrl = obj.get("browser_download_url")?.asString?.trim()
                         assetSize = obj.get("size")?.asLong ?: -1L
                         break
                     }
@@ -138,6 +149,7 @@ object PluginUpdateChecker {
                 Result.success(null)
             }
         } catch (t: Throwable) {
+            LOG.warn("Failed to check latest GitHub release", t)
             Result.failure(t)
         }
     }
@@ -160,13 +172,22 @@ object PluginUpdateChecker {
         )
         if (confirm != Messages.YES) return
 
-        val downloadUrl = release.assetDownloadUrl
-        if (downloadUrl.isNullOrBlank()) {
-            Messages.showErrorDialog(
-                project,
-                I18n.t("update.dialog.error", "Release ${release.tagName} does not contain a .zip plugin asset."),
-                I18n.t("update.dialog.title")
-            )
+        val assetName = release.assetName?.trim().orEmpty()
+        val downloadUrl = release.assetDownloadUrl?.trim().orEmpty()
+        if (assetName.isEmpty() || downloadUrl.isEmpty()) {
+            val msg = I18n.t("update.error.noAsset", release.tagName)
+            LOG.warn(msg)
+            UiHelpers.notify(project, msg, NotificationType.ERROR)
+            return
+        }
+
+        // Pre-validate HTTPS and trusted GitHub domain before queuing background download
+        val validatedUri = try {
+            validateTrustedHttpsUri(downloadUrl, allowApiHost = false)
+        } catch (t: Throwable) {
+            val msg = t.message ?: I18n.t("update.error.untrustedUrl", downloadUrl)
+            LOG.warn(msg, t)
+            UiHelpers.notify(project, msg, NotificationType.ERROR)
             return
         }
 
@@ -179,44 +200,57 @@ object PluginUpdateChecker {
                 try {
                     indicator.isIndeterminate = false
                     indicator.fraction = 0.05
+                    indicator.text = I18n.t("update.dialog.downloading", assetName)
 
-                    val stagingDir = Paths.get(PathManager.getTempPath(), "maekom-mongo-lens-updates")
-                    Files.createDirectories(stagingDir)
-                    val zipFileName = release.assetName ?: "maekom-mongo-lens-${release.version}.zip"
-                    val targetZip = stagingDir.resolve(zipFileName)
+                    // 1. Clean up stale update temp dirs from previous runs (never use deleteOnExit)
+                    cleanupPreviousUpdateTempDirs()
 
-                    downloadFileWithProgress(downloadUrl, targetZip, release.assetSize, indicator)
+                    // 2. Preserve original release asset filename inside a fresh temp directory
+                    val tempDir = Files.createTempDirectory(TEMP_DIR_PREFIX)
+                    val safeFileName = Paths.get(assetName).fileName.toString()
+                    val targetZip = tempDir.resolve(safeFileName)
 
+                    // 3. Download completely and ensure OutputStream is flushed & closed before verifying/installing
+                    downloadFileWithProgress(validatedUri, targetZip, release.assetSize, indicator)
+
+                    // 4. 3-point ZIP integrity & plugin package structure verification
                     indicator.text = I18n.t("update.dialog.verifying")
-                    indicator.fraction = 0.85
+                    indicator.fraction = 0.88
                     verifyPluginZipIntegrity(targetZip, release.assetSize)
 
+                    // 5. Schedule official IntelliJ restart installation on EDT only after all checks pass
                     indicator.text = I18n.t("update.dialog.scheduling")
-                    indicator.fraction = 0.95
-                    schedulePluginInstall(targetZip)
-
-                    indicator.fraction = 1.0
+                    indicator.fraction = 0.96
                     ApplicationManager.getApplication().invokeLater {
                         if (project.isDisposed) return@invokeLater
-                        val restartChoice = Messages.showYesNoDialog(
-                            project,
-                            I18n.t("update.dialog.restartMessage", release.tagName),
-                            I18n.t("update.dialog.restartTitle"),
-                            I18n.t("update.dialog.restartNow"),
-                            I18n.t("update.dialog.restartLater"),
-                            Messages.getInformationIcon()
-                        )
-                        if (restartChoice == Messages.YES) {
-                            ApplicationManagerEx.getApplicationEx().restart(true)
+                        val installed = scheduleVerifiedPluginInstall(targetZip)
+                        if (installed) {
+                            val restartChoice = Messages.showYesNoDialog(
+                                project,
+                                I18n.t("update.dialog.restartMessage", release.tagName),
+                                I18n.t("update.dialog.restartTitle"),
+                                I18n.t("update.dialog.restartNow"),
+                                I18n.t("update.dialog.restartLater"),
+                                Messages.getInformationIcon()
+                            )
+                            if (restartChoice == Messages.YES) {
+                                ApplicationManagerEx.getApplicationEx().restart(true)
+                            }
+                        } else {
+                            val errMsg = I18n.t("update.error.installFailed", safeFileName)
+                            UiHelpers.notify(project, errMsg, NotificationType.ERROR)
                         }
                     }
+                    indicator.fraction = 1.0
                 } catch (t: Throwable) {
+                    val detail = t.message ?: t.javaClass.simpleName
+                    LOG.warn("In-app plugin update failed for ${release.tagName}: $detail", t)
                     ApplicationManager.getApplication().invokeLater {
                         if (!project.isDisposed) {
-                            Messages.showErrorDialog(
+                            UiHelpers.notify(
                                 project,
-                                I18n.t("update.dialog.error", t.message ?: t.javaClass.simpleName),
-                                I18n.t("update.dialog.title")
+                                I18n.t("update.dialog.error", detail),
+                                NotificationType.ERROR
                             )
                         }
                     }
@@ -225,30 +259,84 @@ object PluginUpdateChecker {
         }.queue()
     }
 
+    private fun validateTrustedHttpsUri(rawUrl: String, allowApiHost: Boolean): URI {
+        val uri = try {
+            URI.create(rawUrl.trim())
+        } catch (t: Throwable) {
+            throw SecurityException(I18n.t("update.error.untrustedUrl", rawUrl), t)
+        }
+        val scheme = uri.scheme?.lowercase(Locale.ROOT)
+        val host = uri.host?.lowercase(Locale.ROOT)
+        val isHttps = scheme == "https"
+        val isTrustedHost = when {
+            host.isNullOrBlank() -> false
+            allowApiHost && host == "api.github.com" -> true
+            host == "github.com" -> true
+            host.endsWith(".githubusercontent.com") -> true
+            else -> false
+        }
+        if (!isHttps || !isTrustedHost) {
+            throw SecurityException(I18n.t("update.error.untrustedUrl", rawUrl))
+        }
+        return uri
+    }
+
+    private fun cleanupPreviousUpdateTempDirs() {
+        val tmpRoot = runCatching { Paths.get(System.getProperty("java.io.tmpdir")) }.getOrNull() ?: return
+        if (!Files.isDirectory(tmpRoot)) return
+        runCatching {
+            Files.list(tmpRoot).use { stream ->
+                stream.filter { path ->
+                    Files.isDirectory(path) && path.fileName?.toString()?.startsWith(TEMP_DIR_PREFIX) == true
+                }.forEach { staleDir ->
+                    deleteDirectoryRecursivelyQuietly(staleDir)
+                }
+            }
+        }
+    }
+
+    private fun deleteDirectoryRecursivelyQuietly(dir: Path) {
+        runCatching {
+            Files.walk(dir).use { walk ->
+                walk.sorted(Comparator.reverseOrder()).forEach { p ->
+                    runCatching { Files.deleteIfExists(p) }
+                }
+            }
+        }
+    }
+
     private fun downloadFileWithProgress(
-        url: String,
+        uri: URI,
         targetFile: Path,
         expectedSize: Long,
         indicator: ProgressIndicator
     ) {
         val request = HttpRequest.newBuilder()
-            .uri(URI.create(url))
-            .timeout(Duration.ofSeconds(60))
-            .header("User-Agent", "maekom-mongo-lens/${currentVersionString()}")
+            .uri(uri)
+            .timeout(Duration.ofSeconds(30))
+            .header("User-Agent", USER_AGENT)
             .GET()
             .build()
 
         val response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream())
-        if (response.statusCode() !in 200..299) {
-            throw IOException("Download failed with HTTP ${response.statusCode()}")
+        if (response.statusCode() != 200) {
+            runCatching { response.body().close() }
+            throw IOException(I18n.t("update.error.httpStatus", response.statusCode()))
         }
+
+        // Verify final redirected URI also remains on HTTPS + trusted GitHub domain
+        validateTrustedHttpsUri(response.uri().toString(), allowApiHost = false)
 
         val contentLength = response.headers().firstValueAsLong("Content-Length").orElse(expectedSize)
         var downloaded = 0L
         val buffer = ByteArray(16 * 1024)
 
         response.body().use { input ->
-            Files.newOutputStream(targetFile).use { output ->
+            Files.newOutputStream(
+                targetFile,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING
+            ).use { output ->
                 while (true) {
                     indicator.checkCanceled()
                     val read = input.read(buffer)
@@ -257,41 +345,103 @@ object PluginUpdateChecker {
                     downloaded += read
                     if (contentLength > 0) {
                         val pct = (downloaded.toDouble() / contentLength.toDouble()).coerceIn(0.0, 1.0)
-                        indicator.fraction = 0.05 + pct * 0.78
+                        indicator.fraction = 0.05 + pct * 0.80
                     }
                 }
+                output.flush()
             }
         }
     }
 
     private fun verifyPluginZipIntegrity(zipPath: Path, expectedSize: Long) {
+        // 1. Existence & minimum file size check (> 10 KB)
+        if (!Files.isRegularFile(zipPath)) {
+            throw IOException(I18n.t("update.error.zipIntegrity", "File does not exist"))
+        }
         val actualSize = Files.size(zipPath)
-        if (actualSize <= 0L) {
-            Files.deleteIfExists(zipPath)
-            throw IOException("Downloaded ZIP archive is empty.")
+        if (actualSize <= MIN_PLUGIN_ZIP_BYTES) {
+            runCatching { Files.deleteIfExists(zipPath) }
+            throw IOException(I18n.t("update.error.zipIntegrity", "File too small ($actualSize bytes)"))
         }
         if (expectedSize > 0L && actualSize != expectedSize) {
-            Files.deleteIfExists(zipPath)
-            throw IOException("ZIP size mismatch: expected $expectedSize bytes, got $actualSize bytes.")
+            runCatching { Files.deleteIfExists(zipPath) }
+            throw IOException(
+                I18n.t("update.error.zipIntegrity", "Size mismatch (expected $expectedSize, got $actualSize)")
+            )
         }
 
-        var hasJarEntry = false
-        ZipFile(zipPath.toFile()).use { zf ->
-            val entries = zf.entries()
-            var entryCount = 0
-            while (entries.hasMoreElements()) {
-                val entry = entries.nextElement()
-                entryCount++
-                if (entry.name.contains("..")) {
-                    throw IOException("Unsafe ZIP entry detected: ${entry.name}")
-                }
-                if (!entry.isDirectory && entry.name.endsWith(".jar", ignoreCase = true)) {
-                    hasJarEntry = true
+        // 2. ZIP magic header bytes check (0x50, 0x4B, 0x03, 0x04)
+        val header = ByteArray(4)
+        val bytesRead = Files.newInputStream(zipPath).use { it.read(header) }
+        if (bytesRead < 4 || !header.contentEquals(ZIP_MAGIC_BYTES)) {
+            runCatching { Files.deleteIfExists(zipPath) }
+            throw IOException(I18n.t("update.error.zipIntegrity", "Invalid ZIP magic header"))
+        }
+
+        // 3. ZipFile structure check: must contain maekom-mongo-lens/lib/*.jar and zero ZipSlip paths
+        var hasExpectedPluginJar = false
+        try {
+            ZipFile(zipPath.toFile()).use { zf ->
+                val entries = zf.entries()
+                while (entries.hasMoreElements()) {
+                    val entry = entries.nextElement()
+                    val entryName = entry.name.replace('\\', '/')
+                    if (entryName.contains("..")) {
+                        throw IOException(I18n.t("update.error.zipIntegrity", "Unsafe ZIP entry: $entryName"))
+                    }
+                    if (!entry.isDirectory &&
+                        entryName.startsWith("maekom-mongo-lens/lib/") &&
+                        entryName.endsWith(".jar", ignoreCase = true)
+                    ) {
+                        hasExpectedPluginJar = true
+                    }
                 }
             }
-            if (entryCount == 0 || !hasJarEntry) {
-                throw IOException("Invalid IntelliJ plugin archive: no plugin JAR found inside ZIP.")
+        } catch (t: IOException) {
+            runCatching { Files.deleteIfExists(zipPath) }
+            throw t
+        } catch (t: Throwable) {
+            runCatching { Files.deleteIfExists(zipPath) }
+            throw IOException(I18n.t("update.error.zipIntegrity", t.message ?: t.javaClass.simpleName), t)
+        }
+
+        if (!hasExpectedPluginJar) {
+            runCatching { Files.deleteIfExists(zipPath) }
+            throw IOException(
+                I18n.t("update.error.zipIntegrity", "Missing maekom-mongo-lens/lib/*.jar entry")
+            )
+        }
+    }
+
+    /**
+     * Schedules the verified plugin ZIP for atomic installation on IDE restart using IntelliJ's
+     * official `PluginInstaller.installAfterRestart` (identical to "Install Plugin from Disk...").
+     */
+    private fun scheduleVerifiedPluginInstall(targetZip: Path): Boolean {
+        return try {
+            val currentDescriptor = PluginManagerCore.getPlugin(PluginId.getId(PLUGIN_ID))
+            if (currentDescriptor != null) {
+                PluginInstaller.installAfterRestart(
+                    currentDescriptor,
+                    targetZip,
+                    currentDescriptor.pluginPath,
+                    true
+                )
+            } else {
+                val pluginsDir = Paths.get(PathManager.getPluginsPath())
+                val defaultPluginDir = pluginsDir.resolve("maekom-mongo-lens")
+                val commands = mutableListOf<StartupActionScriptManager.ActionCommand>()
+                if (Files.exists(defaultPluginDir) && defaultPluginDir.normalize().startsWith(pluginsDir.normalize())) {
+                    commands.add(StartupActionScriptManager.DeleteCommand(defaultPluginDir))
+                }
+                commands.add(StartupActionScriptManager.UnzipCommand(targetZip, pluginsDir))
+                commands.add(StartupActionScriptManager.DeleteCommand(targetZip))
+                StartupActionScriptManager.addActionCommands(commands)
             }
+            true
+        } catch (t: Throwable) {
+            LOG.warn("Failed to schedule plugin install for $targetZip", t)
+            false
         }
     }
 
@@ -305,41 +455,6 @@ object PluginUpdateChecker {
         } else {
             joined
         }
-    }
-
-    private fun schedulePluginInstall(stagedZip: Path) {
-        val pluginsDir = Paths.get(PathManager.getPluginsPath())
-        val commands = mutableListOf<StartupActionScriptManager.ActionCommand>()
-
-        val installedPath = PluginManagerCore.getPlugin(PluginId.getId(PLUGIN_ID))?.pluginPath
-        val defaultPluginDir = pluginsDir.resolve("maekom-mongo-lens")
-        val targetDeleteDir = installedPath ?: defaultPluginDir
-
-        // Validate & unpack via official PluginInstaller.unpackPlugin into a clean staging directory first
-        val unpackStagingRoot = stagedZip.parent.resolve("unpacked-${System.currentTimeMillis()}")
-        var unpackedPluginDir: Path? = null
-        try {
-            Files.createDirectories(unpackStagingRoot)
-            unpackedPluginDir = PluginInstaller.unpackPlugin(stagedZip, unpackStagingRoot)
-        } catch (_: Throwable) {
-            // Fall back directly to StartupActionScriptManager UnzipCommand below
-            unpackedPluginDir = null
-        }
-
-        if (Files.exists(targetDeleteDir) && targetDeleteDir.normalize().startsWith(pluginsDir.normalize())) {
-            commands.add(StartupActionScriptManager.DeleteCommand(targetDeleteDir))
-        }
-        if (unpackedPluginDir != null && Files.exists(unpackedPluginDir)) {
-            val destDir = pluginsDir.resolve(unpackedPluginDir.fileName)
-            commands.add(StartupActionScriptManager.CopyCommand(unpackedPluginDir, destDir))
-            commands.add(StartupActionScriptManager.DeleteCommand(unpackStagingRoot))
-            commands.add(StartupActionScriptManager.DeleteCommand(stagedZip))
-        } else {
-            commands.add(StartupActionScriptManager.UnzipCommand(stagedZip, pluginsDir))
-            commands.add(StartupActionScriptManager.DeleteCommand(stagedZip))
-        }
-
-        StartupActionScriptManager.addActionCommands(commands)
     }
 }
 

@@ -176,6 +176,34 @@ class MongoConnectionManager(project: Project) : Disposable {
         return extractFieldSchema(docs)
     }
 
+    data class SampledTopLevelSchema(
+        val documentCount: Int,
+        val fieldTypes: LinkedHashMap<String, String>
+    )
+
+    /**
+     * Samples up to `sampleSize` documents (default 10) and merges all top-level keys with their
+     * most frequent non-null BSON type category (ObjectId, String, Number, Date, Boolean, Object, Array).
+     */
+    fun sampleCollectionTopLevelSchema(
+        profile: MongoConnectionProfile,
+        database: String,
+        collection: String,
+        sampleSize: Int = 10
+    ): SampledTopLevelSchema {
+        val client = getOrCreateClient(profile)
+        val docs = client.getDatabase(database)
+            .getCollection(collection, BsonDocument::class.java)
+            .find()
+            .limit(sampleSize.coerceIn(1, 50))
+            .maxTime(5, TimeUnit.SECONDS)
+            .into(mutableListOf())
+        return SampledTopLevelSchema(
+            documentCount = docs.size,
+            fieldTypes = extractTopLevelTypeCategories(docs)
+        )
+    }
+
     /**
      * Samples top-level fields and their normalized BSON type categories (ObjectId, String, Number, Date, Boolean, Object, Array)
      * for Join View field matching & type-mismatch warning detection.
@@ -184,32 +212,25 @@ class MongoConnectionManager(project: Project) : Disposable {
         profile: MongoConnectionProfile,
         database: String,
         collection: String,
-        sampleSize: Int = 20
-    ): LinkedHashMap<String, String> {
-        val client = getOrCreateClient(profile)
-        val docs = client.getDatabase(database)
-            .getCollection(collection, BsonDocument::class.java)
-            .find()
-            .limit(sampleSize.coerceIn(1, 50))
-            .maxTime(3, TimeUnit.SECONDS)
-            .into(mutableListOf())
-        return extractTopLevelTypeCategories(docs)
-    }
+        sampleSize: Int = 10
+    ): LinkedHashMap<String, String> = sampleCollectionTopLevelSchema(profile, database, collection, sampleSize).fieldTypes
 
     fun extractTopLevelTypeCategories(docs: List<BsonDocument>): LinkedHashMap<String, String> {
-        val out = linkedMapOf<String, String>()
+        val typeCountsByField = linkedMapOf<String, LinkedHashMap<String, Int>>()
         for (doc in docs) {
             for ((k, v) in doc) {
-                if (v.isNull) {
-                    out.putIfAbsent(k, "Null")
-                } else {
-                    val cat = categorizeBsonType(v)
-                    val prev = out[k]
-                    if (prev == null || prev == "Null") {
-                        out[k] = cat
-                    }
-                }
+                val counts = typeCountsByField.computeIfAbsent(k) { linkedMapOf() }
+                val cat = if (v.isNull) "Null" else categorizeBsonType(v)
+                counts[cat] = (counts[cat] ?: 0) + 1
             }
+        }
+        val out = linkedMapOf<String, String>()
+        for ((field, counts) in typeCountsByField) {
+            val nonNullWinner = counts.entries
+                .filter { it.key != "Null" }
+                .maxByOrNull { it.value }
+                ?.key
+            out[field] = nonNullWinner ?: "Null"
         }
         return out
     }

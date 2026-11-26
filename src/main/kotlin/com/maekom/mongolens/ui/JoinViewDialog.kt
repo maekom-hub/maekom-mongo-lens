@@ -1,11 +1,13 @@
 package com.maekom.mongolens.ui
 
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.ValidationInfo
 import com.intellij.ui.ComboboxSpeedSearch
+import com.intellij.ui.DocumentAdapter
 import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBRadioButton
@@ -23,7 +25,7 @@ import java.awt.Dimension
 import java.awt.FlowLayout
 import java.awt.Font
 import java.awt.GridLayout
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.swing.BorderFactory
 import javax.swing.BoxLayout
 import javax.swing.ButtonGroup
@@ -31,6 +33,9 @@ import javax.swing.DefaultComboBoxModel
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
+import javax.swing.SwingUtilities
+import javax.swing.event.DocumentEvent
+import javax.swing.text.JTextComponent
 
 class JoinViewDialog(
     private val project: Project,
@@ -46,15 +51,22 @@ class JoinViewDialog(
 
     private val leftFields: List<String> = sourceTopFields
         .map { it.substringBefore('.') }
+        .filter { it.isNotBlank() }
         .distinct()
         .ifEmpty { listOf("_id") }
 
-    private val candidateCollections: List<String> = ReferenceJumpHelper.rankCollections(
-        database = database,
-        currentCollection = sourceCollection,
-        fieldPath = initialLocalField,
-        allCollections = allCollectionsInDb.filter { it != sourceCollection }.ifEmpty { allCollectionsInDb }
-    ).map { it.name }
+    // Keep ALL collections (including sourceCollection for self-join), preferring a non-self collection as default
+    private val candidateCollections: List<String> = run {
+        val ranked = ReferenceJumpHelper.rankCollections(
+            database = database,
+            currentCollection = sourceCollection,
+            fieldPath = initialLocalField,
+            allCollections = (allCollectionsInDb + sourceCollection).filter { it.isNotBlank() }.distinct()
+        ).map { it.name }
+        val nonSelf = ranked.filter { it != sourceCollection }
+        val selfOnly = ranked.filter { it == sourceCollection }
+        nonSelf + selfOnly
+    }
 
     private val localFieldCombo = ComboBox(leftFields.toTypedArray()).apply {
         val cleanInitial = initialLocalField?.substringBefore('.')?.takeIf { it in leftFields }
@@ -63,9 +75,18 @@ class JoinViewDialog(
         selectedItem = cleanInitial
     }
 
-    private val targetCollectionCombo = ComboBox(candidateCollections.toTypedArray())
+    private val targetCollectionCombo = ComboBox(candidateCollections.toTypedArray()).apply {
+        val preferredDefault = candidateCollections.firstOrNull { it != sourceCollection }
+            ?: candidateCollections.firstOrNull()
+        if (preferredDefault != null) {
+            selectedItem = preferredDefault
+        }
+    }
+
     private val foreignFieldModel = DefaultComboBoxModel<String>()
-    private val foreignFieldCombo = ComboBox(foreignFieldModel)
+    private val foreignFieldCombo = ComboBox(foreignFieldModel).apply {
+        isEditable = true
+    }
 
     private val statusOrMismatchLabel = JBLabel(" ").apply {
         font = font.deriveFont(Font.BOLD)
@@ -73,6 +94,8 @@ class JoinViewDialog(
 
     private var rightFields: List<String> = emptyList()
     private var rightFieldCategories: Map<String, String> = emptyMap()
+    private var targetCollectionEmpty: Boolean = false
+    private var lastSchemaError: String? = null
 
     private val leftCheckBoxes = linkedMapOf<String, JBCheckBox>()
     private val rightCheckBoxes = linkedMapOf<String, JBCheckBox>()
@@ -85,6 +108,9 @@ class JoinViewDialog(
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
         border = JBUI.Borders.empty(4)
     }
+    private val rightScrollPane = JBScrollPane(rightListPanel).apply {
+        preferredSize = Dimension(290, 210)
+    }
     private val rightHeaderLabel = JBLabel(I18n.t("join.dialog.rightColsHeader", "-")).apply {
         font = font.deriveFont(Font.BOLD)
     }
@@ -92,7 +118,7 @@ class JoinViewDialog(
     private val latestOneRadio = JBRadioButton(I18n.t("join.dialog.strategyLatestOne"), true)
     private val unwindAllRadio = JBRadioButton(I18n.t("join.dialog.strategyUnwindAll"), false)
 
-    private val sampleSeq = AtomicInteger(0)
+    private val schemaRequestSeq = AtomicLong(0L)
     private var suppressForeignComboEvent = false
 
     init {
@@ -103,8 +129,6 @@ class JoinViewDialog(
         ComboboxSpeedSearch(targetCollectionCombo)
         @Suppress("DEPRECATION")
         ComboboxSpeedSearch(localFieldCombo)
-        @Suppress("DEPRECATION")
-        ComboboxSpeedSearch(foreignFieldCombo)
 
         ButtonGroup().apply {
             add(latestOneRadio)
@@ -115,10 +139,14 @@ class JoinViewDialog(
         wireListeners()
         init()
 
-        // Immediately sample the pre-selected target collection in the background
-        val firstTarget = targetCollectionCombo.selectedItem?.toString()
-        if (!firstTarget.isNullOrBlank()) {
-            loadTargetCollectionSchemaAsync(firstTarget)
+        // Force initial schema load immediately after DialogWrapper initialization without waiting for ActionListener
+        SwingUtilities.invokeLater {
+            if (!isDisposed) {
+                val initialTarget = targetCollectionCombo.selectedItem?.toString()?.trim().orEmpty()
+                if (initialTarget.isNotEmpty()) {
+                    loadTargetCollectionSchemaAsync(initialTarget)
+                }
+            }
         }
     }
 
@@ -145,7 +173,14 @@ class JoinViewDialog(
         }
 
         localFieldCombo.addActionListener {
-            autoMatchForeignField()
+            if (rightFields.isNotEmpty()) {
+                suppressForeignComboEvent = true
+                try {
+                    autoMatchForeignField()
+                } finally {
+                    suppressForeignComboEvent = false
+                }
+            }
             updateTypeMismatchWarning()
         }
 
@@ -154,38 +189,113 @@ class JoinViewDialog(
                 updateTypeMismatchWarning()
             }
         }
+
+        (foreignFieldCombo.editor?.editorComponent as? JTextComponent)?.document?.addDocumentListener(
+            object : DocumentAdapter() {
+                override fun textChanged(e: DocumentEvent) {
+                    if (!suppressForeignComboEvent) {
+                        updateTypeMismatchWarning()
+                    }
+                }
+            }
+        )
+    }
+
+    private fun currentForeignFieldText(): String {
+        val editorComp = foreignFieldCombo.editor?.editorComponent as? JTextComponent
+        if (editorComp != null) {
+            return (editorComp.text as String?)?.trim().orEmpty()
+        }
+        return (foreignFieldCombo.editor?.item?.toString() ?: foreignFieldCombo.selectedItem?.toString())?.trim().orEmpty()
     }
 
     private fun loadTargetCollectionSchemaAsync(targetColl: String) {
-        val seq = sampleSeq.incrementAndGet()
+        val reqSeq = schemaRequestSeq.incrementAndGet()
+        targetCollectionEmpty = false
+        lastSchemaError = null
+
         rightHeaderLabel.text = I18n.t("join.dialog.rightColsHeader", targetColl)
         statusOrMismatchLabel.text = I18n.t("join.dialog.loadingTarget")
         statusOrMismatchLabel.foreground = UiHelpers.BSON_NULL_COLOR
+        foreignFieldCombo.isEnabled = false
+        isOKActionEnabled = false
 
         ApplicationManager.getApplication().executeOnPooledThread {
-            val sampledTypes: LinkedHashMap<String, String> = try {
-                connectionManager.sampleCollectionTopLevelTypes(profile, database, targetColl, 20)
-            } catch (_: Throwable) {
-                linkedMapOf("_id" to "ObjectId")
-            }
+            var sampledSchema: MongoConnectionManager.SampledTopLevelSchema? = null
+            var loadError: Throwable? = null
 
-            ApplicationManager.getApplication().invokeLater {
-                if (isDisposed || seq != sampleSeq.get()) return@invokeLater
-                val fields = sampledTypes.keys.toList().ifEmpty { listOf("_id") }
-                rightFields = fields
-                rightFieldCategories = sampledTypes
+            try {
+                sampledSchema = connectionManager.sampleCollectionTopLevelSchema(
+                    profile = profile,
+                    database = database,
+                    collection = targetColl,
+                    sampleSize = 10
+                )
+            } catch (t: Throwable) {
+                loadError = t
+            } finally {
+                // CRITICAL: Use ModalityState.any() so EDT callback runs immediately INSIDE this modal DialogWrapper!
+                ApplicationManager.getApplication().invokeLater({
+                    if (isDisposed || reqSeq != schemaRequestSeq.get()) return@invokeLater
 
-                suppressForeignComboEvent = true
-                try {
-                    foreignFieldModel.removeAllElements()
-                    fields.forEach { foreignFieldModel.addElement(it) }
-                    autoMatchForeignField()
-                } finally {
-                    suppressForeignComboEvent = false
-                }
+                    // Always restore interactive controls so the dialog can NEVER remain stuck
+                    foreignFieldCombo.isEnabled = true
+                    isOKActionEnabled = true
 
-                rebuildRightCheckBoxes()
-                updateTypeMismatchWarning()
+                    val err = loadError
+                    val schema = sampledSchema
+                    if (err != null || schema == null) {
+                        val errMsg = err?.message ?: err?.javaClass?.simpleName ?: "Unknown error"
+                        lastSchemaError = errMsg
+                        targetCollectionEmpty = false
+                        rightFields = emptyList()
+                        rightFieldCategories = emptyMap()
+                        suppressForeignComboEvent = true
+                        try {
+                            foreignFieldModel.removeAllElements()
+                            foreignFieldCombo.editor?.item = ""
+                        } finally {
+                            suppressForeignComboEvent = false
+                        }
+                        rebuildRightCheckBoxes()
+                        statusOrMismatchLabel.text = I18n.t("join.dialog.schemaLoadFailed", errMsg)
+                        statusOrMismatchLabel.foreground = UiHelpers.COLOR_RED_FG
+                    } else if (schema.documentCount == 0 || schema.fieldTypes.isEmpty()) {
+                        lastSchemaError = null
+                        targetCollectionEmpty = true
+                        rightFields = emptyList()
+                        rightFieldCategories = emptyMap()
+                        suppressForeignComboEvent = true
+                        try {
+                            foreignFieldModel.removeAllElements()
+                            val localHint = localFieldCombo.selectedItem?.toString()?.trim().orEmpty()
+                            foreignFieldCombo.editor?.item = localHint.ifEmpty { "_id" }
+                        } finally {
+                            suppressForeignComboEvent = false
+                        }
+                        rebuildRightCheckBoxes()
+                        statusOrMismatchLabel.text = I18n.t("join.dialog.targetEmpty")
+                        statusOrMismatchLabel.foreground = UiHelpers.COLOR_ORANGE_FG
+                    } else {
+                        lastSchemaError = null
+                        targetCollectionEmpty = false
+                        val fields = schema.fieldTypes.keys.toList()
+                        rightFields = fields
+                        rightFieldCategories = schema.fieldTypes
+
+                        suppressForeignComboEvent = true
+                        try {
+                            foreignFieldModel.removeAllElements()
+                            fields.forEach { foreignFieldModel.addElement(it) }
+                            autoMatchForeignField()
+                        } finally {
+                            suppressForeignComboEvent = false
+                        }
+
+                        rebuildRightCheckBoxes()
+                        updateTypeMismatchWarning()
+                    }
+                }, ModalityState.any())
             }
         }
     }
@@ -204,6 +314,7 @@ class JoinViewDialog(
             else -> rightFields.first()
         }
         foreignFieldCombo.selectedItem = matched
+        foreignFieldCombo.editor?.item = matched
     }
 
     private fun rebuildRightCheckBoxes() {
@@ -219,6 +330,8 @@ class JoinViewDialog(
         refreshRightAliasPreviews()
         rightListPanel.revalidate()
         rightListPanel.repaint()
+        rightScrollPane.revalidate()
+        rightScrollPane.repaint()
     }
 
     private fun refreshRightAliasPreviews() {
@@ -238,8 +351,20 @@ class JoinViewDialog(
     }
 
     private fun updateTypeMismatchWarning() {
+        val err = lastSchemaError
+        if (err != null) {
+            statusOrMismatchLabel.text = I18n.t("join.dialog.schemaLoadFailed", err)
+            statusOrMismatchLabel.foreground = UiHelpers.COLOR_RED_FG
+            return
+        }
+        if (targetCollectionEmpty) {
+            statusOrMismatchLabel.text = I18n.t("join.dialog.targetEmpty")
+            statusOrMismatchLabel.foreground = UiHelpers.COLOR_ORANGE_FG
+            return
+        }
+
         val local = localFieldCombo.selectedItem?.toString()?.trim().orEmpty()
-        val foreign = foreignFieldCombo.selectedItem?.toString()?.trim().orEmpty()
+        val foreign = currentForeignFieldText()
         val localCat = sourceFieldCategories[local] ?: if (local == "_id") "ObjectId" else null
         val foreignCat = rightFieldCategories[foreign]
 
@@ -263,7 +388,7 @@ class JoinViewDialog(
             headerComponent = JBLabel(I18n.t("join.dialog.leftColsHeader", sourceCollection)).apply {
                 font = font.deriveFont(Font.BOLD)
             },
-            listPanel = leftListPanel,
+            scrollPane = JBScrollPane(leftListPanel).apply { preferredSize = Dimension(290, 210) },
             onToggleAll = { checked ->
                 leftCheckBoxes.values.forEach { it.isSelected = checked }
                 refreshRightAliasPreviews()
@@ -272,7 +397,7 @@ class JoinViewDialog(
 
         val rightColBox = buildColumnSelectionCard(
             headerComponent = rightHeaderLabel,
-            listPanel = rightListPanel,
+            scrollPane = rightScrollPane,
             onToggleAll = { checked ->
                 rightCheckBoxes.values.forEach { it.isSelected = checked }
             }
@@ -311,7 +436,7 @@ class JoinViewDialog(
 
     private fun buildColumnSelectionCard(
         headerComponent: JBLabel,
-        listPanel: JPanel,
+        scrollPane: JBScrollPane,
         onToggleAll: (Boolean) -> Unit
     ): JPanel {
         val allBtn = JButton(I18n.t("colSelect.dialog.selectAll")).apply {
@@ -332,7 +457,7 @@ class JoinViewDialog(
         }
         return JPanel(BorderLayout(0, 4)).apply {
             add(headerBar, BorderLayout.NORTH)
-            add(JBScrollPane(listPanel).apply { preferredSize = Dimension(290, 210) }, BorderLayout.CENTER)
+            add(scrollPane, BorderLayout.CENTER)
         }
     }
 
@@ -342,9 +467,12 @@ class JoinViewDialog(
             return ValidationInfo(I18n.t("join.dialog.validationTargetRequired"), targetCollectionCombo)
         }
         val local = localFieldCombo.selectedItem?.toString()?.trim().orEmpty()
-        val foreign = foreignFieldCombo.selectedItem?.toString()?.trim().orEmpty()
-        if (local.isEmpty() || foreign.isEmpty()) {
-            return ValidationInfo(I18n.t("join.dialog.validationFieldsRequired"), foreignFieldCombo)
+        if (local.isEmpty()) {
+            return ValidationInfo(I18n.t("join.dialog.validationFieldsRequired"), localFieldCombo)
+        }
+        val foreign = currentForeignFieldText()
+        if (foreign.isEmpty()) {
+            return ValidationInfo(I18n.t("join.dialog.validationForeignFieldRequired"), foreignFieldCombo)
         }
         val anySelected = leftCheckBoxes.values.any { it.isSelected } || rightCheckBoxes.values.any { it.isSelected }
         if (!anySelected) {
@@ -356,9 +484,10 @@ class JoinViewDialog(
     fun buildJoinSpec(): JoinSpec {
         val target = targetCollectionCombo.selectedItem?.toString()?.trim().orEmpty()
         val local = localFieldCombo.selectedItem?.toString()?.trim().orEmpty()
-        val foreign = foreignFieldCombo.selectedItem?.toString()?.trim().orEmpty()
+        val foreign = currentForeignFieldText()
         val selectedLeft = leftFields.filter { leftCheckBoxes[it]?.isSelected == true }
         val selectedRight = rightFields.filter { rightCheckBoxes[it]?.isSelected == true }
+        val allRight = (rightFields + foreign).filter { it.isNotBlank() }.distinct()
         val strategy = if (latestOneRadio.isSelected) JoinMatchStrategy.LATEST_ONE else JoinMatchStrategy.UNWIND_ALL
 
         ReferenceJumpHelper.recordSelection(database, local, target)
@@ -370,7 +499,7 @@ class JoinViewDialog(
             foreignField = foreign,
             matchStrategy = strategy,
             allLeftFields = leftFields,
-            allRightFields = rightFields,
+            allRightFields = allRight,
             selectedLeftFields = selectedLeft,
             selectedRightFields = selectedRight
         )
