@@ -2,10 +2,12 @@ package com.maekom.mongolens.ui
 
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.progress.ProgressIndicator
-import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
+import com.intellij.util.concurrency.AppExecutorUtil
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.util.ui.JBUI
@@ -68,6 +70,8 @@ class CollectionWorkspaceTab(
     private val sampledFields = CopyOnWriteArrayList<String>()
     private val sampledFieldTypes = ConcurrentHashMap<String, SmartInValueType>()
     private val cachedCollections = CopyOnWriteArrayList<String>(listOf(collection))
+    private val isDisposedFlag = AtomicBoolean(false)
+    private val metadataFuture = AtomicReference<Future<*>?>(null)
 
     private class ModeTabButton(text: String, selected: Boolean) : JToggleButton(text, selected) {
         private var hovered = false
@@ -291,13 +295,22 @@ class CollectionWorkspaceTab(
         updateReadOnlyBadge()
         switchMode(initialMode)
 
-        // Pre-sample 30 documents + collection names asynchronously for autocomplete
-        sampleMetadataInBackground()
+        // UI-First Zero-Overhead open:
+        // When Find executes immediately, it already discovers field schema from its returned docs —
+        // do NOT fire a duplicate `sampleSchema(30)` query in parallel!
         if (initialMode == WorkspaceMode.FIND && autoExecuteInitialFind) {
-            findPanel.executeFind()
+            findPanel.executeFind(resetJoinPage = false, forceMetaRefresh = false)
+        } else {
+            sampleMetadataInBackground(includeSchemaSample = true)
         }
 
         I18n.addListener(this) { refreshTexts() }
+    }
+
+    fun ensureLoadedIfNeeded() {
+        if (!isDisposedFlag.get()) {
+            findPanel.ensureLoadedIfNeeded()
+        }
     }
 
     fun applyQuickFilterAndRun(filterJson: String) {
@@ -352,28 +365,35 @@ class CollectionWorkspaceTab(
         types.forEach { (k, v) -> sampledFieldTypes.putIfAbsent(k, v) }
     }
 
-    private fun sampleMetadataInBackground() {
-        object : Task.Backgroundable(project, "Sampling schema for $collection...", true) {
-            override fun run(indicator: ProgressIndicator) {
-                try {
-                    val (fields, types) = connectionManager.sampleSchema(profile, database, collection, 30)
-                    val colls = try {
-                        connectionManager.listCollections(profile, database)
-                    } catch (_: Throwable) {
-                        listOf(collection)
-                    }
-                    ApplicationManager.getApplication().invokeLater {
-                        mergeSampledSchema(fields, types)
-                        if (colls.isNotEmpty()) {
-                            cachedCollections.clear()
-                            cachedCollections.addAll(colls)
-                        }
-                    }
-                } catch (_: Throwable) {
-                    // Non-fatal background metadata sampling error
+    private fun sampleMetadataInBackground(includeSchemaSample: Boolean) {
+        metadataFuture.getAndSet(null)?.cancel(true)
+        val future = AppExecutorUtil.getAppExecutorService().submit {
+            if (isDisposedFlag.get() || project.isDisposed) return@submit
+            try {
+                val (fields, types) = if (includeSchemaSample) {
+                    connectionManager.sampleSchema(profile, database, collection, 20)
+                } else {
+                    emptyList<String>() to emptyMap()
                 }
+                val colls = runCatching {
+                    connectionManager.listCollections(profile, database)
+                }.getOrDefault(listOf(collection))
+                if (isDisposedFlag.get() || project.isDisposed) return@submit
+                ApplicationManager.getApplication().invokeLater {
+                    if (isDisposedFlag.get() || project.isDisposed) return@invokeLater
+                    if (fields.isNotEmpty()) {
+                        mergeSampledSchema(fields, types)
+                    }
+                    if (colls.isNotEmpty()) {
+                        cachedCollections.clear()
+                        cachedCollections.addAll(colls)
+                    }
+                }
+            } catch (_: Throwable) {
+                // Non-fatal background metadata sampling error
             }
-        }.queue()
+        }
+        metadataFuture.set(future)
     }
 
     private fun refreshTexts() {
@@ -386,6 +406,7 @@ class CollectionWorkspaceTab(
     }
 
     override fun dispose() {
-        // Child panels disposed via Disposer
+        isDisposedFlag.set(true)
+        metadataFuture.getAndSet(null)?.cancel(true)
     }
 }

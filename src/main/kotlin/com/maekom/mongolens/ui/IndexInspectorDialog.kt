@@ -339,11 +339,14 @@ class IndexInspectorDialog(
                 diagnosisBadge.isVisible = true
                 sb.appendLine(I18n.t("index.guide.unknownSummary", explainError ?: "-"))
             }
-            null -> {
+            IndexScanType.NO_FILTER_PREVIEW, null -> {
                 diagnosisBadge.text = I18n.t("index.guide.collectionSummaryBadge", indexes.size)
                 diagnosisBadge.background = UiHelpers.COLOR_BLUE_BG
                 diagnosisBadge.foreground = UiHelpers.COLOR_BLUE_FG
                 diagnosisBadge.isVisible = true
+                if (currentScanType == IndexScanType.NO_FILTER_PREVIEW) {
+                    sb.appendLine(I18n.t("index.guide.noFilterPreviewSummary"))
+                }
             }
         }
 

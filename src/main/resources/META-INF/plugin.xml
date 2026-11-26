@@ -15,6 +15,13 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>v0.2.4</h3>
+        <ul>
+            <li><b>Zero-Overhead Initial Collection Open:</b> Completely skips <code>explain()</code> and <code>listIndexes()</code> when opening a collection without Filter/Sort, displaying a neutral <code>No Filter (Preview)</code> badge (click to inspect indexes anytime).</li>
+            <li><b>Driver &amp; Metadata Performance:</b> Added <code>.limit(N).batchSize(N)</code> single-roundtrip reads, removed full-scan-inducing <code>EXECUTION_STATS</code> fallbacks (<code>QUERY_PLANNER</code> + 1,500ms <code>maxTimeMS</code> only), added 60s TTL caching for <code>estimatedDocumentCount()</code> &amp; <code>listIndexes()</code>, and isolated View/restricted-permission errors safely.</li>
+            <li><b>UI-First Instant Tab Open, Lazy View Rendering &amp; Single-Flight Control:</b> Opens tabs immediately on first click with an animated loading spinner, builds only the active view (<code>Tree</code>/<code>Table</code>/<code>JSON</code>) off-EDT with safe display truncation for huge strings/arrays/binaries, updates count/explain asynchronously, and cancels stale requests via <code>AtomicLong</code> generation + <code>Future.cancel(true)</code>.</li>
+            <li><b>IntelliJ New UI Native Context Menus &amp; <code>AllIcons</code>:</b> Replaced Swing <code>JPopupMenu</code> with native <code>ActionPopupMenu</code> (<code>setTargetComponent</code>) and crisp 16×16 <code>AllIcons</code> across all Result Tree/Table and Connections Tree menus.</li>
+        </ul>
         <h3>v0.2.3</h3>
         <ul>
             <li><b>Explain &amp; Unified Index Cache:</b> Hardened multi-tier MongoDB &amp; AWS DocumentDB <code>explain()</code> parsing, explicit <code>UNKNOWN</code> badge with failure tooltip when explain fails, and unified 60s cached index metadata (including index sizes).</li>

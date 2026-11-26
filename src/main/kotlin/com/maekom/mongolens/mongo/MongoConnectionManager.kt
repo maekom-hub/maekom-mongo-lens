@@ -24,8 +24,18 @@ import java.util.concurrent.atomic.AtomicBoolean
 enum class IndexScanType {
     IXSCAN,
     COLLSCAN,
+    NO_FILTER_PREVIEW,
     UNKNOWN
 }
+
+data class TrailingQueryMetadata(
+    val totalCount: Long?,
+    val isApproximateCount: Boolean,
+    val scanType: IndexScanType?,
+    val indexName: String?,
+    val explainError: String?,
+    val detailedIndexes: List<CollectionIndexInfo>?
+)
 
 data class CollectionIndexInfo(
     val name: String,
@@ -66,13 +76,20 @@ data class QueryExecutionResult(
 )
 
 class MongoConnectionManager(project: Project) : Disposable {
+    companion object {
+        private const val META_CACHE_TTL_MS = 60_000L
+        private const val META_QUERY_MAX_TIME_MS = 1_500L
+    }
+
     private data class CachedIndexEntry(val fetchedAtMs: Long, val indexes: List<CollectionIndexInfo>)
+    private data class CachedCountEntry(val fetchedAtMs: Long, val count: Long)
     private data class ExplainOutcome(val scanType: IndexScanType, val indexName: String?, val errorMessage: String?)
 
     private val clients = ConcurrentHashMap<String, MongoClient>()
     private val clientUris = ConcurrentHashMap<String, String>()
     private val unlockedReadOnlyProfiles = ConcurrentHashMap.newKeySet<String>()
     private val indexCache = ConcurrentHashMap<String, CachedIndexEntry>()
+    private val estimatedCountCache = ConcurrentHashMap<String, CachedCountEntry>()
     private val disposed = AtomicBoolean(false)
 
     init {
@@ -127,10 +144,17 @@ class MongoConnectionManager(project: Project) : Disposable {
     fun closeClient(profileId: String) {
         clientUris.remove(profileId)
         indexCache.keys.removeIf { it.startsWith("$profileId:") }
+        estimatedCountCache.keys.removeIf { it.startsWith("$profileId:") }
         val old = clients.remove(profileId)
         if (old != null) {
             safeClose(old)
         }
+    }
+
+    fun invalidateCollectionMetaCache(profileId: String, database: String, collection: String) {
+        val cacheKey = "$profileId:$database:$collection"
+        indexCache.remove(cacheKey)
+        estimatedCountCache.remove(cacheKey)
     }
 
     fun ping(profile: MongoConnectionProfile): Long {
@@ -177,11 +201,44 @@ class MongoConnectionManager(project: Project) : Disposable {
             .sorted()
     }
 
-    fun getEstimatedCount(profile: MongoConnectionProfile, database: String, collection: String): Long {
+    fun getEstimatedCount(
+        profile: MongoConnectionProfile,
+        database: String,
+        collection: String,
+        forceRefresh: Boolean = false
+    ): Long {
+        val cacheKey = "${profile.id}:$database:$collection"
+        val now = System.currentTimeMillis()
+        if (!forceRefresh) {
+            val cached = estimatedCountCache[cacheKey]
+            if (cached != null && now - cached.fetchedAtMs < META_CACHE_TTL_MS) {
+                return cached.count
+            }
+        }
         val client = getOrCreateClient(profile)
-        return client.getDatabase(database)
+        val count = client.getDatabase(database)
             .getCollection(collection, BsonDocument::class.java)
             .estimatedDocumentCount()
+        estimatedCountCache[cacheKey] = CachedCountEntry(now, count)
+        return count
+    }
+
+    fun getEstimatedCountSafe(
+        profile: MongoConnectionProfile,
+        database: String,
+        collection: String,
+        forceRefresh: Boolean = false
+    ): Long? = runCatching {
+        getEstimatedCount(profile, database, collection, forceRefresh)
+    }.getOrNull()
+
+    fun getCachedEstimatedCountIfWarm(
+        profileId: String,
+        database: String,
+        collection: String
+    ): Long? {
+        val cached = estimatedCountCache["$profileId:$database:$collection"] ?: return null
+        return if (System.currentTimeMillis() - cached.fetchedAtMs < META_CACHE_TTL_MS) cached.count else null
     }
 
     fun sampleFieldNames(
@@ -197,11 +254,13 @@ class MongoConnectionManager(project: Project) : Disposable {
         collection: String,
         sampleSize: Int = 30
     ): Pair<List<String>, Map<String, SmartInValueType>> {
+        val safeSample = sampleSize.coerceIn(1, 50)
         val client = getOrCreateClient(profile)
         val docs = client.getDatabase(database)
             .getCollection(collection, BsonDocument::class.java)
             .find()
-            .limit(sampleSize)
+            .limit(safeSample)
+            .batchSize(safeSample)
             .maxTime(3, TimeUnit.SECONDS)
             .into(mutableListOf())
         return extractFieldSchema(docs)
@@ -225,11 +284,13 @@ class MongoConnectionManager(project: Project) : Disposable {
         collection: String,
         sampleSize: Int = 10
     ): SampledTopLevelSchema {
+        val safeSample = sampleSize.coerceIn(1, 50)
         val client = getOrCreateClient(profile)
         val docs = client.getDatabase(database)
             .getCollection(collection, BsonDocument::class.java)
             .find()
-            .limit(sampleSize.coerceIn(1, 50))
+            .limit(safeSample)
+            .batchSize(safeSample)
             .maxTime(5, TimeUnit.SECONDS)
             .into(mutableListOf())
         return SampledTopLevelSchema(
@@ -326,12 +387,11 @@ class MongoConnectionManager(project: Project) : Disposable {
     }
 
     /**
-     * Executes a safe, AWS DocumentDB-compatible RDB-style Join View (`JoinSpec`):
-     * - Pipeline order: Base `$match` -> Deterministic `$sort` -> `$lookup` + Right Filters + Exclusion `$match`
-     *   -> Post-Join `$skip` -> Post-Join `$limit(pageSize + 1)` (or `5001` in Unlimited mode) -> `$project`.
-     * - Guarantees exact page sizes even when `excludeUnmatched` or `UNWIND_ALL` filters rows, with ZERO `$facet`.
+     * Phase 1 (Zero-Overhead Primary Fetch) for Join View:
+     * Runs ONLY the DocumentDB-compatible Join aggregation pipeline (`$limit(pageSize + 1)`),
+     * deferring optional `explain()` to Phase 2 (`fetchJoinTrailingMetadata`) so rows appear immediately.
      */
-    fun executeJoin(
+    fun executeJoinPrimary(
         profile: MongoConnectionProfile,
         database: String,
         joinSpec: JoinSpec,
@@ -383,35 +443,121 @@ class MongoConnectionManager(project: Project) : Disposable {
             -1L
         }
 
-        val explainOutcome = explainAggregateSafe(
-            db = db,
-            collection = joinSpec.leftCollection,
-            pipeline = pipeline,
-            aggIterable = aggIterable
-        )
-        val detailedIndexes = listCollectionIndexInfos(profile, database, joinSpec.leftCollection)
-        val collectionIndexes = detailedIndexes.map { it.summaryLine() }
-
-        val (sampledFields, sampledFieldTypes) = extractFieldSchema(docs.take(30))
+        val effectiveLeftFilter = joinSpec.buildEffectiveLeftFilter(filter)
+        val isUnfilteredPreview = effectiveLeftFilter.isEmpty() && sort.isEmpty()
+        val (sampledFields, sampledFieldTypes) = extractFieldSchema(docs.take(20))
 
         return QueryExecutionResult(
             documents = docs,
             totalCount = totalCount,
             isApproximateCount = isApprox,
             elapsedMs = elapsedMs,
-            scanType = explainOutcome.scanType,
-            indexName = explainOutcome.indexName,
+            scanType = if (isUnfilteredPreview) IndexScanType.NO_FILTER_PREVIEW else IndexScanType.UNKNOWN,
+            indexName = null,
             sampledFields = sampledFields,
             sampledFieldTypes = sampledFieldTypes,
             hasNextPage = hasNext,
-            collectionIndexes = collectionIndexes,
-            detailedIndexes = detailedIndexes,
-            explainError = explainOutcome.errorMessage,
             unlimitedCapHit = capHit
         )
     }
 
-    fun executeFind(
+    /**
+     * Phase 2 (Trailing Async Metadata) for Join View:
+     * Skips `explain()` and `listIndexes()` completely when there is no base Filter and no Sort.
+     */
+    fun fetchJoinTrailingMetadata(
+        profile: MongoConnectionProfile,
+        database: String,
+        joinSpec: JoinSpec,
+        filterRaw: String?,
+        sortRaw: String?,
+        pageIndex: Int,
+        pageSize: Int?,
+        forceRefresh: Boolean = false
+    ): TrailingQueryMetadata {
+        val filter = runCatching {
+            MongoShellNormalizer.parseBsonDocument(filterRaw?.trim().orEmpty().ifEmpty { "{}" })
+        }.getOrDefault(BsonDocument())
+        val sort = runCatching {
+            MongoShellNormalizer.parseBsonDocument(sortRaw?.trim().orEmpty().ifEmpty { "{}" })
+        }.getOrDefault(BsonDocument())
+        val effectiveLeftFilter = joinSpec.buildEffectiveLeftFilter(filter)
+
+        if (effectiveLeftFilter.isEmpty() && sort.isEmpty()) {
+            return TrailingQueryMetadata(
+                totalCount = null,
+                isApproximateCount = false,
+                scanType = IndexScanType.NO_FILTER_PREVIEW,
+                indexName = null,
+                explainError = null,
+                detailedIndexes = null
+            )
+        }
+
+        val pipeline = joinSpec.buildPipeline(
+            filter = filter,
+            sort = sort,
+            pageIndex = pageIndex.coerceAtLeast(0),
+            pageSize = pageSize?.coerceIn(1, JoinSpec.MAX_UNLIMITED_DOCS),
+            probeForNextPage = false
+        )
+        val explainOutcome = runCatching {
+            val client = getOrCreateClient(profile)
+            val db = client.getDatabase(database)
+            val coll = db.getCollection(joinSpec.leftCollection, BsonDocument::class.java)
+            val explainIterable = coll.aggregate(pipeline)
+                .allowDiskUse(true)
+                .maxTime(META_QUERY_MAX_TIME_MS, TimeUnit.MILLISECONDS)
+            explainAggregateSafe(db, joinSpec.leftCollection, pipeline, explainIterable)
+        }.getOrElse { t ->
+            ExplainOutcome(IndexScanType.UNKNOWN, null, summarizeExplainError(t))
+        }
+
+        val detailedIndexes = listCollectionIndexInfos(
+            profile = profile,
+            database = database,
+            collection = joinSpec.leftCollection,
+            forceRefresh = forceRefresh
+        )
+
+        return TrailingQueryMetadata(
+            totalCount = null,
+            isApproximateCount = false,
+            scanType = explainOutcome.scanType,
+            indexName = explainOutcome.indexName,
+            explainError = explainOutcome.errorMessage,
+            detailedIndexes = detailedIndexes
+        )
+    }
+
+    fun executeJoin(
+        profile: MongoConnectionProfile,
+        database: String,
+        joinSpec: JoinSpec,
+        filterRaw: String?,
+        sortRaw: String?,
+        pageIndex: Int,
+        pageSize: Int?
+    ): QueryExecutionResult {
+        val primary = executeJoinPrimary(profile, database, joinSpec, filterRaw, sortRaw, pageIndex, pageSize)
+        val trailing = fetchJoinTrailingMetadata(profile, database, joinSpec, filterRaw, sortRaw, pageIndex, pageSize)
+        val indexes = trailing.detailedIndexes ?: emptyList()
+        return primary.copy(
+            scanType = trailing.scanType ?: primary.scanType,
+            indexName = trailing.indexName,
+            explainError = trailing.explainError,
+            detailedIndexes = indexes,
+            collectionIndexes = indexes.map { it.summaryLine() }
+        )
+    }
+
+    /**
+     * Phase 1 (Zero-Overhead Primary Fetch) for Find:
+     * - Single network roundtrip with `.limit(safeLimit).batchSize(safeLimit)` so server cursor closes immediately.
+     * - Runs ZERO `countDocuments`, ZERO `explain`, and ZERO `listIndexes` on the critical render path.
+     * - When both Filter and Sort are empty, marks scanType as `NO_FILTER_PREVIEW`.
+     */
+    fun executeFindPrimary(
         profile: MongoConnectionProfile,
         database: String,
         collection: String,
@@ -435,6 +581,7 @@ class MongoConnectionManager(project: Project) : Disposable {
         val iterable = coll.find(filter)
             .skip(safeSkip)
             .limit(safeLimit)
+            .batchSize(safeLimit)
             .maxTime(15, TimeUnit.SECONDS)
 
         if (!projection.isEmpty()) {
@@ -447,45 +594,160 @@ class MongoConnectionManager(project: Project) : Disposable {
         val docs = iterable.into(mutableListOf())
         val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs)
 
-        var isApprox = false
-        val totalCount: Long = try {
-            if (filter.isEmpty()) {
-                coll.estimatedDocumentCount()
-            } else {
-                coll.countDocuments(filter, CountOptions().maxTime(2, TimeUnit.SECONDS))
-            }
-        } catch (_: Throwable) {
-            isApprox = true
-            -1L
+        val isUnfilteredPreview = filter.isEmpty() && sort.isEmpty()
+        val warmEstCount = if (filter.isEmpty()) {
+            getCachedEstimatedCountIfWarm(profile.id, database, collection)
+        } else {
+            null
         }
-
-        val explainOutcome = explainFindSafe(
-            db = db,
-            collection = collection,
-            filter = filter,
-            projection = projection,
-            sort = sort,
-            skip = safeSkip,
-            limit = safeLimit,
-            findIterable = iterable
-        )
-        val detailedIndexes = listCollectionIndexInfos(profile, database, collection)
-        val collectionIndexes = detailedIndexes.map { it.summaryLine() }
-
-        val (sampledFields, sampledFieldTypes) = extractFieldSchema(docs.take(30))
+        val (sampledFields, sampledFieldTypes) = extractFieldSchema(docs.take(20))
 
         return QueryExecutionResult(
             documents = docs,
+            totalCount = warmEstCount ?: -1L,
+            isApproximateCount = warmEstCount == null,
+            elapsedMs = elapsedMs,
+            scanType = if (isUnfilteredPreview) IndexScanType.NO_FILTER_PREVIEW else IndexScanType.UNKNOWN,
+            indexName = null,
+            sampledFields = sampledFields,
+            sampledFieldTypes = sampledFieldTypes
+        )
+    }
+
+    /**
+     * Phase 2 (Trailing Async Metadata) for Find:
+     * - Runs asynchronously AFTER primary documents are already rendered.
+     * - Empty Filter: uses O(1) `estimatedDocumentCount()` with 60s TTL cache (NEVER `countDocuments({})`).
+     * - Non-empty Filter: uses `countDocuments(filter)` capped at 1,500ms `maxTimeMS`.
+     * - Empty Filter + Empty Sort: NEVER calls `explain()` or `listIndexes()` -> returns `NO_FILTER_PREVIEW`.
+     * - Non-empty Filter or Sort: runs `QUERY_PLANNER` explain (1,500ms `maxTimeMS`, ZERO `EXECUTION_STATS`) + cached `listIndexes()`.
+     * - Every metadata call is isolated in `runCatching` so View / restricted-permission collections never fail.
+     */
+    fun fetchFindTrailingMetadata(
+        profile: MongoConnectionProfile,
+        database: String,
+        collection: String,
+        filterRaw: String?,
+        projectionRaw: String?,
+        sortRaw: String?,
+        skip: Int,
+        limit: Int,
+        forceRefresh: Boolean = false
+    ): TrailingQueryMetadata {
+        val filter = runCatching {
+            MongoShellNormalizer.parseBsonDocument(filterRaw?.trim().orEmpty().ifEmpty { "{}" })
+        }.getOrDefault(BsonDocument())
+        val projection = runCatching {
+            MongoShellNormalizer.parseBsonDocument(projectionRaw?.trim().orEmpty().ifEmpty { "{}" })
+        }.getOrDefault(BsonDocument())
+        val sort = runCatching {
+            MongoShellNormalizer.parseBsonDocument(sortRaw?.trim().orEmpty().ifEmpty { "{}" })
+        }.getOrDefault(BsonDocument())
+
+        if (forceRefresh) {
+            invalidateCollectionMetaCache(profile.id, database, collection)
+        }
+
+        // 1. Safe count (O(1) cached estimatedDocumentCount for empty filter; 1500ms-bounded countDocuments for filtered)
+        var isApprox = false
+        val totalCount: Long = if (filter.isEmpty()) {
+            getEstimatedCountSafe(profile, database, collection, forceRefresh) ?: run {
+                isApprox = true
+                -1L
+            }
+        } else {
+            runCatching {
+                val client = getOrCreateClient(profile)
+                val coll = client.getDatabase(database).getCollection(collection, BsonDocument::class.java)
+                coll.countDocuments(
+                    filter,
+                    CountOptions().maxTime(META_QUERY_MAX_TIME_MS, TimeUnit.MILLISECONDS)
+                )
+            }.getOrElse {
+                isApprox = true
+                -1L
+            }
+        }
+
+        // 2. Zero-overhead initial open: when Filter and Sort are both empty, skip explain() & listIndexes() completely!
+        if (filter.isEmpty() && sort.isEmpty()) {
+            return TrailingQueryMetadata(
+                totalCount = totalCount,
+                isApproximateCount = isApprox,
+                scanType = IndexScanType.NO_FILTER_PREVIEW,
+                indexName = null,
+                explainError = null,
+                detailedIndexes = null
+            )
+        }
+
+        // 3. Conditional QUERY_PLANNER explain (1,500ms maxTimeMS, zero EXECUTION_STATS) + cached index metadata
+        val safeSkip = skip.coerceAtLeast(0)
+        val safeLimit = limit.coerceIn(1, 5000)
+        val explainOutcome = runCatching {
+            val client = getOrCreateClient(profile)
+            val db = client.getDatabase(database)
+            val coll = db.getCollection(collection, BsonDocument::class.java)
+            val explainIterable = coll.find(filter)
+                .skip(safeSkip)
+                .limit(safeLimit)
+                .batchSize(safeLimit)
+                .maxTime(META_QUERY_MAX_TIME_MS, TimeUnit.MILLISECONDS)
+            if (!projection.isEmpty()) explainIterable.projection(projection)
+            if (!sort.isEmpty()) explainIterable.sort(sort)
+
+            explainFindSafe(
+                db = db,
+                collection = collection,
+                filter = filter,
+                projection = projection,
+                sort = sort,
+                skip = safeSkip,
+                limit = safeLimit,
+                findIterable = explainIterable
+            )
+        }.getOrElse { t ->
+            ExplainOutcome(IndexScanType.UNKNOWN, null, summarizeExplainError(t))
+        }
+
+        val detailedIndexes = listCollectionIndexInfos(
+            profile = profile,
+            database = database,
+            collection = collection,
+            forceRefresh = forceRefresh
+        )
+
+        return TrailingQueryMetadata(
             totalCount = totalCount,
             isApproximateCount = isApprox,
-            elapsedMs = elapsedMs,
             scanType = explainOutcome.scanType,
             indexName = explainOutcome.indexName,
-            sampledFields = sampledFields,
-            sampledFieldTypes = sampledFieldTypes,
-            collectionIndexes = collectionIndexes,
-            detailedIndexes = detailedIndexes,
-            explainError = explainOutcome.errorMessage
+            explainError = explainOutcome.errorMessage,
+            detailedIndexes = detailedIndexes
+        )
+    }
+
+    fun executeFind(
+        profile: MongoConnectionProfile,
+        database: String,
+        collection: String,
+        filterRaw: String?,
+        projectionRaw: String?,
+        sortRaw: String?,
+        skip: Int,
+        limit: Int
+    ): QueryExecutionResult {
+        val primary = executeFindPrimary(profile, database, collection, filterRaw, projectionRaw, sortRaw, skip, limit)
+        val trailing = fetchFindTrailingMetadata(profile, database, collection, filterRaw, projectionRaw, sortRaw, skip, limit)
+        val indexes = trailing.detailedIndexes ?: emptyList()
+        return primary.copy(
+            totalCount = trailing.totalCount ?: primary.totalCount,
+            isApproximateCount = trailing.isApproximateCount,
+            scanType = trailing.scanType ?: primary.scanType,
+            indexName = trailing.indexName,
+            explainError = trailing.explainError,
+            detailedIndexes = indexes,
+            collectionIndexes = indexes.map { it.summaryLine() }
         )
     }
 
@@ -504,16 +766,18 @@ class MongoConnectionManager(project: Project) : Disposable {
         val docs = iterable.into(mutableListOf())
         val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs)
 
-        val explainOutcome = explainAggregateSafe(
-            db = db,
-            collection = collection,
-            pipeline = pipeline,
-            aggIterable = iterable
-        )
+        val explainOutcome = runCatching {
+            val explainIterable = coll.aggregate(pipeline)
+                .allowDiskUse(true)
+                .maxTime(META_QUERY_MAX_TIME_MS, TimeUnit.MILLISECONDS)
+            explainAggregateSafe(db, collection, pipeline, explainIterable)
+        }.getOrElse { t ->
+            ExplainOutcome(IndexScanType.UNKNOWN, null, summarizeExplainError(t))
+        }
         val detailedIndexes = listCollectionIndexInfos(profile, database, collection)
         val collectionIndexes = detailedIndexes.map { it.summaryLine() }
 
-        val (sampledFields, sampledFieldTypes) = extractFieldSchema(docs.take(30))
+        val (sampledFields, sampledFieldTypes) = extractFieldSchema(docs.take(20))
 
         return QueryExecutionResult(
             documents = docs,
@@ -534,6 +798,7 @@ class MongoConnectionManager(project: Project) : Disposable {
      * Unified read-only index metadata loader with 60-second per-collection cache.
      * Shared by both the COLLSCAN/IXSCAN badge tooltip AND the Read-Only Index Inspector dialog
      * so `listIndexes()` is never duplicated redundantly.
+     * Isolated with `runCatching` so View or restricted collections never propagate errors.
      */
     fun listCollectionIndexInfos(
         profile: MongoConnectionProfile,
@@ -544,28 +809,26 @@ class MongoConnectionManager(project: Project) : Disposable {
         val cacheKey = "${profile.id}:$database:$collection"
         val now = System.currentTimeMillis()
         val cached = indexCache[cacheKey]
-        if (!forceRefresh && cached != null && now - cached.fetchedAtMs < 60_000L) {
+        if (!forceRefresh && cached != null && now - cached.fetchedAtMs < META_CACHE_TTL_MS) {
             return cached.indexes
         }
-        return try {
+        return runCatching {
             val client = getOrCreateClient(profile)
             val db = client.getDatabase(database)
             val coll = db.getCollection(collection, BsonDocument::class.java)
             val rawIndexes = coll.listIndexes(BsonDocument::class.java)
-                .maxTime(3, TimeUnit.SECONDS)
+                .maxTime(META_QUERY_MAX_TIME_MS, TimeUnit.MILLISECONDS)
                 .into(mutableListOf())
 
-            // Best-effort read-only collStats for per-index size bytes (ignored gracefully if restricted)
-            val sizeByName: Map<String, Long> = try {
-                val stats = db.runCommand(Document("collStats", collection))
+            // Best-effort read-only collStats for per-index size bytes (ignored gracefully if restricted/View)
+            val sizeByName: Map<String, Long> = runCatching {
+                val stats = db.runCommand(Document("collStats", collection).append("maxTimeMS", META_QUERY_MAX_TIME_MS.toInt()))
                 val sizesDoc = stats["indexSizes"] as? Document
                 sizesDoc?.entries?.mapNotNull { (k, v) ->
                     val bytes = (v as? Number)?.toLong() ?: return@mapNotNull null
                     k to bytes
                 }?.toMap().orEmpty()
-            } catch (_: Throwable) {
-                emptyMap()
-            }
+            }.getOrDefault(emptyMap())
 
             val parsed = rawIndexes.mapNotNull { idxDoc ->
                 val name = idxDoc.getString("name")?.value ?: return@mapNotNull null
@@ -611,7 +874,7 @@ class MongoConnectionManager(project: Project) : Disposable {
             }
             indexCache[cacheKey] = CachedIndexEntry(now, parsed)
             parsed
-        } catch (_: Throwable) {
+        }.getOrElse {
             cached?.indexes ?: emptyList()
         }
     }
@@ -622,6 +885,10 @@ class MongoConnectionManager(project: Project) : Disposable {
         collection: String
     ): List<String> = listCollectionIndexInfos(profile, database, collection).map { it.summaryLine() }
 
+    /**
+     * Lightweight QUERY_PLANNER-only explain (ZERO EXECUTION_STATS!) bounded by 1,500ms `maxTimeMS`.
+     * Never executes a full collection scan just to inspect the query plan.
+     */
     private fun explainFindSafe(
         db: com.mongodb.client.MongoDatabase,
         collection: String,
@@ -634,52 +901,45 @@ class MongoConnectionManager(project: Project) : Disposable {
     ): ExplainOutcome {
         var lastError: String? = null
 
-        // 1. Standard driver explain(QUERY_PLANNER)
-        try {
-            val res = parseExplainPlan(findIterable.explain(ExplainVerbosity.QUERY_PLANNER))
+        // 1. Driver explain(QUERY_PLANNER) with 1,500ms maxTime on iterable
+        runCatching {
+            parseExplainPlan(findIterable.explain(ExplainVerbosity.QUERY_PLANNER))
+        }.onSuccess { res ->
             if (res.first != IndexScanType.UNKNOWN) return ExplainOutcome(res.first, res.second, null)
-        } catch (t: Throwable) {
+        }.onFailure { t ->
             lastError = summarizeExplainError(t)
         }
 
-        // 2. Driver explain(EXECUTION_STATS) (AWS DocumentDB often populates richer plan info here)
-        try {
-            val res = parseExplainPlan(findIterable.explain(ExplainVerbosity.EXECUTION_STATS))
-            if (res.first != IndexScanType.UNKNOWN) return ExplainOutcome(res.first, res.second, null)
-        } catch (t: Throwable) {
-            lastError = summarizeExplainError(t)
-        }
-
-        // 3. Explicit db.runCommand({ explain: { find: ... }, verbosity: "executionStats" }) fallback
         val findCmd = Document("find", collection).append("filter", filter)
         if (!projection.isEmpty()) findCmd.append("projection", projection)
         if (!sort.isEmpty()) findCmd.append("sort", sort)
         if (skip > 0) findCmd.append("skip", skip)
         if (limit > 0) findCmd.append("limit", limit)
 
-        try {
-            val explainDoc = db.runCommand(Document("explain", findCmd).append("verbosity", "executionStats"))
-            val res = parseExplainPlan(explainDoc)
+        // 2. Explicit db.runCommand({ explain: { find: ... }, verbosity: "queryPlanner", maxTimeMS: 1500 })
+        runCatching {
+            val explainDoc = db.runCommand(
+                Document("explain", findCmd)
+                    .append("verbosity", "queryPlanner")
+                    .append("maxTimeMS", META_QUERY_MAX_TIME_MS.toInt())
+            )
+            parseExplainPlan(explainDoc)
+        }.onSuccess { res ->
             if (res.first != IndexScanType.UNKNOWN) return ExplainOutcome(res.first, res.second, null)
-        } catch (t: Throwable) {
+        }.onFailure { t ->
             lastError = summarizeExplainError(t)
         }
 
-        // 4. Explicit db.runCommand({ explain: { find: ... }, verbosity: "queryPlanner" }) fallback
-        try {
-            val explainDoc = db.runCommand(Document("explain", findCmd).append("verbosity", "queryPlanner"))
-            val res = parseExplainPlan(explainDoc)
+        // 3. DocumentDB 3.6/4.0 fallback without verbosity field (bounded by maxTimeMS: 1500)
+        runCatching {
+            val explainDoc = db.runCommand(
+                Document("explain", findCmd)
+                    .append("maxTimeMS", META_QUERY_MAX_TIME_MS.toInt())
+            )
+            parseExplainPlan(explainDoc)
+        }.onSuccess { res ->
             if (res.first != IndexScanType.UNKNOWN) return ExplainOutcome(res.first, res.second, null)
-        } catch (t: Throwable) {
-            lastError = summarizeExplainError(t)
-        }
-
-        // 5. DocumentDB 3.6/4.0 fallback without explicit verbosity field
-        try {
-            val explainDoc = db.runCommand(Document("explain", findCmd))
-            val res = parseExplainPlan(explainDoc)
-            if (res.first != IndexScanType.UNKNOWN) return ExplainOutcome(res.first, res.second, null)
-        } catch (t: Throwable) {
+        }.onFailure { t ->
             lastError = summarizeExplainError(t)
         }
 
@@ -690,6 +950,9 @@ class MongoConnectionManager(project: Project) : Disposable {
         )
     }
 
+    /**
+     * Lightweight QUERY_PLANNER-only aggregate explain (ZERO EXECUTION_STATS!) bounded by 1,500ms `maxTimeMS`.
+     */
     private fun explainAggregateSafe(
         db: com.mongodb.client.MongoDatabase,
         collection: String,
@@ -699,18 +962,11 @@ class MongoConnectionManager(project: Project) : Disposable {
         var lastError: String? = null
 
         // 1. Driver explain(QUERY_PLANNER)
-        try {
-            val res = parseExplainPlan(aggIterable.explain(ExplainVerbosity.QUERY_PLANNER))
+        runCatching {
+            parseExplainPlan(aggIterable.explain(ExplainVerbosity.QUERY_PLANNER))
+        }.onSuccess { res ->
             if (res.first != IndexScanType.UNKNOWN) return ExplainOutcome(res.first, res.second, null)
-        } catch (t: Throwable) {
-            lastError = summarizeExplainError(t)
-        }
-
-        // 2. Driver explain(EXECUTION_STATS)
-        try {
-            val res = parseExplainPlan(aggIterable.explain(ExplainVerbosity.EXECUTION_STATS))
-            if (res.first != IndexScanType.UNKNOWN) return ExplainOutcome(res.first, res.second, null)
-        } catch (t: Throwable) {
+        }.onFailure { t ->
             lastError = summarizeExplainError(t)
         }
 
@@ -718,34 +974,45 @@ class MongoConnectionManager(project: Project) : Disposable {
             .append("pipeline", pipeline)
             .append("cursor", Document())
 
-        // 3. runCommand({ explain: { aggregate: ... }, verbosity: "executionStats" })
-        try {
-            val explainDoc = db.runCommand(Document("explain", aggCmd).append("verbosity", "executionStats"))
-            val res = parseExplainPlan(explainDoc)
+        // 2. runCommand({ explain: { aggregate: ... }, verbosity: "queryPlanner", maxTimeMS: 1500 })
+        runCatching {
+            val explainDoc = db.runCommand(
+                Document("explain", aggCmd)
+                    .append("verbosity", "queryPlanner")
+                    .append("maxTimeMS", META_QUERY_MAX_TIME_MS.toInt())
+            )
+            parseExplainPlan(explainDoc)
+        }.onSuccess { res ->
             if (res.first != IndexScanType.UNKNOWN) return ExplainOutcome(res.first, res.second, null)
-        } catch (t: Throwable) {
+        }.onFailure { t ->
             lastError = summarizeExplainError(t)
         }
 
-        // 4. runCommand({ explain: { aggregate: ... } })
-        try {
-            val explainDoc = db.runCommand(Document("explain", aggCmd))
-            val res = parseExplainPlan(explainDoc)
+        // 3. runCommand({ explain: { aggregate: ... }, maxTimeMS: 1500 })
+        runCatching {
+            val explainDoc = db.runCommand(
+                Document("explain", aggCmd)
+                    .append("maxTimeMS", META_QUERY_MAX_TIME_MS.toInt())
+            )
+            parseExplainPlan(explainDoc)
+        }.onSuccess { res ->
             if (res.first != IndexScanType.UNKNOWN) return ExplainOutcome(res.first, res.second, null)
-        } catch (t: Throwable) {
+        }.onFailure { t ->
             lastError = summarizeExplainError(t)
         }
 
-        // 5. Legacy MongoDB & AWS DocumentDB direct { aggregate: ..., pipeline: [...], explain: true }
-        try {
+        // 4. Legacy MongoDB & AWS DocumentDB direct { aggregate: ..., pipeline: [...], explain: true, maxTimeMS: 1500 }
+        runCatching {
             val explainDoc = db.runCommand(
                 Document("aggregate", collection)
                     .append("pipeline", pipeline)
                     .append("explain", true)
+                    .append("maxTimeMS", META_QUERY_MAX_TIME_MS.toInt())
             )
-            val res = parseExplainPlan(explainDoc)
+            parseExplainPlan(explainDoc)
+        }.onSuccess { res ->
             if (res.first != IndexScanType.UNKNOWN) return ExplainOutcome(res.first, res.second, null)
-        } catch (t: Throwable) {
+        }.onFailure { t ->
             lastError = summarizeExplainError(t)
         }
 
@@ -772,6 +1039,7 @@ class MongoConnectionManager(project: Project) : Disposable {
         val client = getOrCreateClient(profile)
         val coll = client.getDatabase(database).getCollection(collection, BsonDocument::class.java)
         coll.replaceOne(Filters.eq("_id", originalId), replacement)
+        invalidateCollectionMetaCache(profile.id, database, collection)
     }
 
     fun cloneDocument(
@@ -787,6 +1055,7 @@ class MongoConnectionManager(project: Project) : Disposable {
         val newId = BsonObjectId(ObjectId())
         clone["_id"] = newId
         coll.insertOne(clone)
+        invalidateCollectionMetaCache(profile.id, database, collection)
         return newId
     }
 
@@ -800,6 +1069,7 @@ class MongoConnectionManager(project: Project) : Disposable {
         val client = getOrCreateClient(profile)
         val coll = client.getDatabase(database).getCollection(collection, BsonDocument::class.java)
         coll.deleteOne(Filters.eq("_id", id))
+        invalidateCollectionMetaCache(profile.id, database, collection)
     }
 
     private fun buildClientSettings(uri: String): MongoClientSettings {
@@ -959,6 +1229,7 @@ class MongoConnectionManager(project: Project) : Disposable {
         clientUris.clear()
         unlockedReadOnlyProfiles.clear()
         indexCache.clear()
+        estimatedCountCache.clear()
         snapshot.forEach { safeClose(it) }
     }
 }

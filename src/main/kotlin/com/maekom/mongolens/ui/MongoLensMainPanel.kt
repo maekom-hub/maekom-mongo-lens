@@ -191,7 +191,7 @@ class MongoLensMainPanel(
 
     /**
      * Simplified native ToolWindow title bar actions: ONLY 2 items:
-     * 1. Version & Connection Status ("v0.2.3 · 연결됨 (126ms)")
+     * 1. Version & Connection Status ("v0.2.4 · 연결됨 (126ms)")
      * 2. [⚙ 설정 / Settings] popup group (Decrypt Config, Check/Install Update, Language Switch)
      */
     fun createTitleActions(): List<AnAction> {

@@ -2,14 +2,17 @@ package com.maekom.mongolens.ui
 
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.progress.ProgressIndicator
-import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.util.Disposer
 import com.intellij.ui.components.JBLabel
+import com.intellij.util.concurrency.AppExecutorUtil
 import com.intellij.util.ui.JBUI
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import com.maekom.mongolens.config.MongoConnectionProfile
 import com.maekom.mongolens.config.SavedQuery
 import com.maekom.mongolens.config.SavedQueryStore
@@ -75,6 +78,13 @@ class FindQueryPanel(
 
     private var joinCurrentPage: Int = 0
     private var suppressLimitComboEvents = false
+
+    // Single-Flight request control: monotonically increasing generation + cancellable Futures + disposed guard
+    private val requestGeneration = AtomicLong(0L)
+    private val activePrimaryFuture = AtomicReference<Future<*>?>(null)
+    private val activeMetaFuture = AtomicReference<Future<*>?>(null)
+    private val isDisposedFlag = AtomicBoolean(false)
+    private val hasCompletedInitialLoad = AtomicBoolean(false)
 
     private val limitChoices: Array<LimitChoice> = if (initialJoinSpec != null) {
         JoinSpec.JOIN_LIMIT_OPTIONS.map { LimitChoice(it) }.toTypedArray()
@@ -213,7 +223,7 @@ class FindQueryPanel(
         profile = profile,
         database = database,
         collection = initialJoinSpec?.compactTabKeySegment() ?: collection,
-        onRequestRefresh = { executeFind(resetJoinPage = false) },
+        onRequestRefresh = { executeFind(resetJoinPage = false, forceMetaRefresh = true) },
         onPrevPage = {
             if (isJoinTab) {
                 if (currentJoinPageSize() != null && joinCurrentPage > 0) {
@@ -461,7 +471,7 @@ class FindQueryPanel(
             }
         }
 
-        runBtn.addActionListener { executeFind(resetJoinPage = true) }
+        runBtn.addActionListener { executeFind(resetJoinPage = true, forceMetaRefresh = true) }
 
         resetBtn.addActionListener {
             resultViewer.resetTableBatchDecryption()
@@ -478,7 +488,7 @@ class FindQueryPanel(
             projectEditor.text = ""
             sortEditor.text = ""
             skipSpinner.value = 0
-            executeFind(resetJoinPage = true)
+            executeFind(resetJoinPage = true, forceMetaRefresh = true)
         }
 
         smartInBtn.addActionListener {
@@ -767,7 +777,22 @@ class FindQueryPanel(
 
     private fun currentSkip(): Int = (skipSpinner.value as? Int) ?: 0
 
-    fun executeFind(resetJoinPage: Boolean = true) {
+    fun ensureLoadedIfNeeded() {
+        if (isDisposedFlag.get() || project.isDisposed) return
+        val inFlight = activePrimaryFuture.get()?.let { !it.isDone && !it.isCancelled } ?: false
+        if (!hasCompletedInitialLoad.get() && !inFlight) {
+            executeFind(resetJoinPage = false, forceMetaRefresh = false)
+        }
+    }
+
+    fun executeFind(resetJoinPage: Boolean = true, forceMetaRefresh: Boolean = false) {
+        if (isDisposedFlag.get() || project.isDisposed) return
+
+        // Single-Flight: advance generation & cancel any in-flight primary + trailing metadata tasks
+        val gen = requestGeneration.incrementAndGet()
+        activePrimaryFuture.getAndSet(null)?.cancel(true)
+        activeMetaFuture.getAndSet(null)?.cancel(true)
+
         resultViewer.resetTableBatchDecryption()
         filterEditor.dismissPopup()
         sortEditor.dismissPopup()
@@ -787,41 +812,41 @@ class FindQueryPanel(
         val skip = currentSkip()
 
         runBtn.isEnabled = false
+        resultViewer.setLoading(true)
         onStatusUpdate(I18n.t("header.status.querying"), false)
 
-        val taskTitle = if (joinSpecSnapshot != null) {
-            "Joining ${joinSpecSnapshot.displayTitle()}..."
-        } else {
-            "Finding documents in $database.$collection..."
-        }
+        val executor = AppExecutorUtil.getAppExecutorService()
+        val primaryFuture = executor.submit {
+            if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@submit
+            try {
+                // Phase 1: Zero-Overhead Primary Fetch (single find/join roundtrip; NO count/explain/listIndexes blocking UI)
+                val result = if (joinSpecSnapshot != null) {
+                    connectionManager.executeJoinPrimary(
+                        profile = profile,
+                        database = database,
+                        joinSpec = joinSpecSnapshot,
+                        filterRaw = filterRaw,
+                        sortRaw = sortRaw,
+                        pageIndex = joinPageSnapshot,
+                        pageSize = joinPageSizeSnapshot
+                    )
+                } else {
+                    connectionManager.executeFindPrimary(
+                        profile = profile,
+                        database = database,
+                        collection = collection,
+                        filterRaw = filterRaw,
+                        projectionRaw = projRaw,
+                        sortRaw = sortRaw,
+                        skip = skip,
+                        limit = limit
+                    )
+                }
 
-        object : Task.Backgroundable(project, taskTitle, true) {
-            override fun run(indicator: ProgressIndicator) {
-                try {
-                    val result = if (joinSpecSnapshot != null) {
-                        connectionManager.executeJoin(
-                            profile = profile,
-                            database = database,
-                            joinSpec = joinSpecSnapshot,
-                            filterRaw = filterRaw,
-                            sortRaw = sortRaw,
-                            pageIndex = joinPageSnapshot,
-                            pageSize = joinPageSizeSnapshot
-                        )
-                    } else {
-                        connectionManager.executeFind(
-                            profile = profile,
-                            database = database,
-                            collection = collection,
-                            filterRaw = filterRaw,
-                            projectionRaw = projRaw,
-                            sortRaw = sortRaw,
-                            skip = skip,
-                            limit = limit
-                        )
-                    }
+                if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@submit
 
-                    if (joinSpecSnapshot == null) {
+                if (joinSpecSnapshot == null) {
+                    runCatching {
                         savedQueryStore.recordHistory(
                             SavedQuery(
                                 id = UUID.randomUUID().toString(),
@@ -839,57 +864,106 @@ class FindQueryPanel(
                             )
                         )
                     }
+                }
 
-                    ApplicationManager.getApplication().invokeLater {
-                        runBtn.isEnabled = true
-                        if (result.sampledFields.isNotEmpty()) {
-                            onFieldsDiscovered(result.sampledFields, result.sampledFieldTypes)
-                        }
-                        val displaySkip = if (joinSpecSnapshot != null) {
-                            if (joinPageSizeSnapshot != null) joinPageSnapshot * joinPageSizeSnapshot else 0
-                        } else {
-                            skip
-                        }
-                        val displayLimit = if (joinSpecSnapshot != null) {
-                            joinPageSizeSnapshot ?: JoinSpec.MAX_UNLIMITED_DOCS
-                        } else {
-                            limit
-                        }
-                        val capBanner = if (result.unlimitedCapHit) {
-                            I18n.t("join.unlimitedCapBanner", JoinSpec.MAX_UNLIMITED_DOCS)
-                        } else {
-                            null
-                        }
-                        resultViewer.updateResults(
-                            result = result,
-                            skip = displaySkip,
-                            limit = displayLimit,
-                            previewBanner = capBanner
+                val displaySkip = if (joinSpecSnapshot != null) {
+                    if (joinPageSizeSnapshot != null) joinPageSnapshot * joinPageSizeSnapshot else 0
+                } else {
+                    skip
+                }
+                val displayLimit = if (joinSpecSnapshot != null) {
+                    joinPageSizeSnapshot ?: JoinSpec.MAX_UNLIMITED_DOCS
+                } else {
+                    limit
+                }
+                val capBanner = if (result.unlimitedCapHit) {
+                    I18n.t("join.unlimitedCapBanner", JoinSpec.MAX_UNLIMITED_DOCS)
+                } else {
+                    null
+                }
+
+                ApplicationManager.getApplication().invokeLater {
+                    if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@invokeLater
+                    hasCompletedInitialLoad.set(true)
+                    runBtn.isEnabled = true
+                    resultViewer.setLoading(false)
+                    if (result.sampledFields.isNotEmpty()) {
+                        onFieldsDiscovered(result.sampledFields, result.sampledFieldTypes)
+                    }
+                    resultViewer.updateResults(
+                        result = result,
+                        skip = displaySkip,
+                        limit = displayLimit,
+                        previewBanner = capBanner
+                    )
+                    if (result.unlimitedCapHit) {
+                        UiHelpers.notify(
+                            project,
+                            I18n.t("join.unlimitedCapToast", JoinSpec.MAX_UNLIMITED_DOCS),
+                            NotificationType.WARNING
                         )
-                        if (result.unlimitedCapHit) {
-                            UiHelpers.notify(
-                                project,
-                                I18n.t("join.unlimitedCapToast", JoinSpec.MAX_UNLIMITED_DOCS),
-                                NotificationType.WARNING
+                    }
+                    val statusMsg = if (connectionManager.isEffectivelyReadOnly(profile)) {
+                        "${I18n.t("header.status.connected", result.elapsedMs)} · ${I18n.t("header.status.readOnly")}"
+                    } else {
+                        I18n.t("header.status.connected", result.elapsedMs)
+                    }
+                    onStatusUpdate(statusMsg, false)
+                }
+
+                // Phase 2: Trailing Async Metadata (count + conditional QUERY_PLANNER explain when Filter/Sort is non-empty)
+                val metaFuture = executor.submit {
+                    if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@submit
+                    val meta = runCatching {
+                        if (joinSpecSnapshot != null) {
+                            connectionManager.fetchJoinTrailingMetadata(
+                                profile = profile,
+                                database = database,
+                                joinSpec = joinSpecSnapshot,
+                                filterRaw = filterRaw,
+                                sortRaw = sortRaw,
+                                pageIndex = joinPageSnapshot,
+                                pageSize = joinPageSizeSnapshot,
+                                forceRefresh = forceMetaRefresh
+                            )
+                        } else {
+                            connectionManager.fetchFindTrailingMetadata(
+                                profile = profile,
+                                database = database,
+                                collection = collection,
+                                filterRaw = filterRaw,
+                                projectionRaw = projRaw,
+                                sortRaw = sortRaw,
+                                skip = skip,
+                                limit = limit,
+                                forceRefresh = forceMetaRefresh
                             )
                         }
-                        val statusMsg = if (connectionManager.isEffectivelyReadOnly(profile)) {
-                            "${I18n.t("header.status.connected", result.elapsedMs)} · ${I18n.t("header.status.readOnly")}"
-                        } else {
-                            I18n.t("header.status.connected", result.elapsedMs)
-                        }
-                        onStatusUpdate(statusMsg, false)
-                    }
-                } catch (t: Throwable) {
-                    val msg = t.message ?: t.javaClass.simpleName
+                    }.getOrNull() ?: return@submit
+
+                    if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@submit
+
                     ApplicationManager.getApplication().invokeLater {
-                        runBtn.isEnabled = true
-                        onStatusUpdate(I18n.t("header.status.error", msg.take(80)), true)
-                        Messages.showErrorDialog(project, msg, I18n.t("find.run"))
+                        if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@invokeLater
+                        resultViewer.updateTrailingMetadata(meta)
                     }
                 }
+                activeMetaFuture.set(metaFuture)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } catch (t: Throwable) {
+                if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@submit
+                val msg = t.message ?: t.javaClass.simpleName
+                ApplicationManager.getApplication().invokeLater {
+                    if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@invokeLater
+                    runBtn.isEnabled = true
+                    resultViewer.setLoading(false)
+                    onStatusUpdate(I18n.t("header.status.error", msg.take(80)), true)
+                    Messages.showErrorDialog(project, msg, I18n.t("find.run"))
+                }
             }
-        }.queue()
+        }
+        activePrimaryFuture.set(primaryFuture)
     }
 
     private fun showSavedQueriesPopup() {
@@ -972,6 +1046,10 @@ class FindQueryPanel(
     }
 
     override fun dispose() {
+        isDisposedFlag.set(true)
+        requestGeneration.incrementAndGet()
+        activePrimaryFuture.getAndSet(null)?.cancel(true)
+        activeMetaFuture.getAndSet(null)?.cancel(true)
         filterEditor.dismissPopup()
         sortEditor.dismissPopup()
         projectEditor.dismissPopup()

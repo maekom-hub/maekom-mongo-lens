@@ -76,6 +76,7 @@ class WorkspaceTabManager(
         val existing = entriesByKey[tabKey]?.firstOrNull()
         if (existing != null) {
             tabs.select(existing.tabInfo, true)
+            existing.workspaceTab.ensureLoadedIfNeeded()
             return existing
         }
         return createTab(profile, database, collection, CollectionWorkspaceTab.WorkspaceMode.FIND)

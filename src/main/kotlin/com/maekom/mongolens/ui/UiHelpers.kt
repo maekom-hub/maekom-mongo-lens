@@ -227,6 +227,69 @@ object UiHelpers {
         }
     }
 
+    const val MAX_DISPLAY_STRING_CHARS = 400
+    const val MAX_JSON_PREVIEW_STRING_CHARS = 2_000
+    const val MAX_PREVIEW_ARRAY_ELEMENTS = 100
+    const val MAX_JSON_PREVIEW_TOTAL_CHARS = 400_000
+
+    fun truncateForDisplay(text: String, maxChars: Int = MAX_DISPLAY_STRING_CHARS): String {
+        if (text.length <= maxChars) return text
+        val hidden = text.length - maxChars
+        return "${text.substring(0, maxChars)}... (truncated +$hidden chars)"
+    }
+
+    /**
+     * Produces a display-safe truncated copy of a BsonDocument for Raw JSON preview rendering,
+     * capping huge strings, giant arrays, and Binary blobs without EVER mutating the original BsonDocument.
+     */
+    fun buildDisplaySafePreviewDocument(doc: BsonDocument, depth: Int = 0): BsonDocument {
+        val out = BsonDocument()
+        for ((k, v) in doc) {
+            out[k] = buildDisplaySafePreviewValue(v, depth)
+        }
+        return out
+    }
+
+    private fun buildDisplaySafePreviewValue(value: BsonValue, depth: Int): BsonValue = when (value) {
+        is BsonString -> {
+            if (value.value.length > MAX_JSON_PREVIEW_STRING_CHARS) {
+                BsonString(truncateForDisplay(value.value, MAX_JSON_PREVIEW_STRING_CHARS))
+            } else {
+                value
+            }
+        }
+        is BsonBinary -> {
+            if (value.data.size > 128) {
+                BsonString("Binary(${value.data.size} bytes, truncated)")
+            } else {
+                value
+            }
+        }
+        is BsonDocument -> {
+            if (depth >= 8) {
+                BsonString("{ ${value.size} fields ... (truncated) }")
+            } else {
+                buildDisplaySafePreviewDocument(value, depth + 1)
+            }
+        }
+        is BsonArray -> {
+            if (depth >= 8) {
+                BsonString("[ ${value.size} items ... (truncated) ]")
+            } else {
+                val arr = BsonArray()
+                val limit = value.size.coerceAtMost(MAX_PREVIEW_ARRAY_ELEMENTS)
+                for (i in 0 until limit) {
+                    arr.add(buildDisplaySafePreviewValue(value[i], depth + 1))
+                }
+                if (value.size > limit) {
+                    arr.add(BsonString("... (+${value.size - limit} more items, truncated)"))
+                }
+                arr
+            }
+        }
+        else -> value
+    }
+
     fun bsonDisplayValue(value: BsonValue): String {
         return when (value) {
             is BsonObjectId -> "ObjectId(\"${value.value.toHexString()}\")"
@@ -236,18 +299,18 @@ object UiHelpers {
             is BsonDecimal128 -> value.value.toString()
             is BsonDouble -> value.value.toString()
             is BsonBoolean -> value.value.toString()
-            is BsonString -> "\"${value.value}\""
+            is BsonString -> "\"${truncateForDisplay(value.value)}\""
             is BsonNull -> "null"
             is BsonBinary -> "Binary(${value.data.size} bytes)"
-            is BsonRegularExpression -> "/${value.pattern}/${value.options}"
+            is BsonRegularExpression -> "/${truncateForDisplay(value.pattern, 200)}/${value.options}"
             is BsonTimestamp -> "Timestamp(${value.time}, ${value.inc})"
             is BsonArray -> "[ ${value.size} items ]"
             is BsonDocument -> "{ ${value.size} fields }"
-            else -> value.toString()
+            else -> truncateForDisplay(value.toString())
         }
     }
 
-    /** Pure text without outer quotes — used for Tree double-click copy & Table cell copy */
+    /** Pure text without outer quotes — used for Tree double-click copy & Table cell copy (ALWAYS full original data!) */
     fun bsonPureTextValue(value: BsonValue): String {
         return when (value) {
             is BsonString -> value.value
@@ -271,10 +334,10 @@ object UiHelpers {
         }
     }
 
-    /** Clean quote-free display for Table View cells */
+    /** Clean quote-free display for Table View cells (safely truncated for huge strings; copy still uses full original!) */
     fun bsonTableDisplayValue(value: BsonValue): String {
         return when (value) {
-            is BsonString -> value.value
+            is BsonString -> truncateForDisplay(value.value)
             is BsonObjectId -> value.value.toHexString()
             is BsonDateTime -> formatIsoUtc(value.value)
             is BsonInt32 -> value.value.toString()
@@ -284,11 +347,11 @@ object UiHelpers {
             is BsonBoolean -> value.value.toString()
             is BsonNull -> "null"
             is BsonBinary -> "Binary(${value.data.size}B)"
-            is BsonRegularExpression -> "/${value.pattern}/${value.options}"
+            is BsonRegularExpression -> "/${truncateForDisplay(value.pattern, 200)}/${value.options}"
             is BsonTimestamp -> "${value.time}:${value.inc}"
             is BsonDocument -> "{...}"
             is BsonArray -> "[${value.size} items]"
-            else -> value.toString()
+            else -> truncateForDisplay(value.toString())
         }
     }
 

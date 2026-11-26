@@ -2,9 +2,14 @@ package com.maekom.mongolens.ui
 
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.ActionUpdateThread
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.Task
+import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.Messages
@@ -27,10 +32,9 @@ import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.BorderFactory
 import javax.swing.DefaultComboBoxModel
+import javax.swing.Icon
 import javax.swing.JButton
-import javax.swing.JMenuItem
 import javax.swing.JPanel
-import javax.swing.JPopupMenu
 import javax.swing.JTree
 import javax.swing.SwingUtilities
 import javax.swing.event.TreeExpansionEvent
@@ -214,30 +218,47 @@ class ConnectionsTreePanel(
         })
 
         tree.addMouseListener(object : MouseAdapter() {
-            override fun mousePressed(e: MouseEvent) = maybeShowContextMenu(e)
-            override fun mouseReleased(e: MouseEvent) = maybeShowContextMenu(e)
-
-            override fun mouseClicked(e: MouseEvent) {
+            override fun mousePressed(e: MouseEvent) {
+                if (e.isPopupTrigger) {
+                    showContextMenuAt(e)
+                    return
+                }
                 if (!SwingUtilities.isLeftMouseButton(e)) return
-                val path = tree.getPathForLocation(e.x, e.y) ?: return
+                val path = resolveTreePathAtPoint(e.x, e.y) ?: return
                 val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return
                 when (val data = node.userObject) {
                     is TreeNodeData.CollectionNode -> {
-                        onOpenFindTab(data.profile, data.database, data.collection, false)
+                        // Open/focus immediately on first left press so slight mouse movement never drops clicks
+                        if (e.clickCount == 1) {
+                            tree.selectionPath = path
+                            onOpenFindTab(data.profile, data.database, data.collection, false)
+                        }
                     }
-                    is TreeNodeData.ProfileNode -> {
-                        if (e.clickCount == 2) tree.expandPath(path)
-                    }
-                    is TreeNodeData.DatabaseNode -> {
-                        if (e.clickCount == 2) tree.expandPath(path)
+                    is TreeNodeData.ProfileNode, is TreeNodeData.DatabaseNode -> {
+                        if (e.clickCount == 2) {
+                            if (tree.isExpanded(path)) tree.collapsePath(path) else tree.expandPath(path)
+                        }
                     }
                     else -> Unit
                 }
             }
 
-            private fun maybeShowContextMenu(e: MouseEvent) {
-                if (!e.isPopupTrigger) return
-                val path = tree.getPathForLocation(e.x, e.y) ?: return
+            override fun mouseReleased(e: MouseEvent) {
+                if (e.isPopupTrigger) {
+                    showContextMenuAt(e)
+                }
+            }
+
+            private fun resolveTreePathAtPoint(x: Int, y: Int): TreePath? {
+                val exact = tree.getPathForLocation(x, y)
+                if (exact != null) return exact
+                val closest = tree.getClosestPathForLocation(x, y) ?: return null
+                val bounds = tree.getPathBounds(closest) ?: return null
+                return if (y in bounds.y..(bounds.y + bounds.height)) closest else null
+            }
+
+            private fun showContextMenuAt(e: MouseEvent) {
+                val path = resolveTreePathAtPoint(e.x, e.y) ?: return
                 tree.selectionPath = path
                 val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return
                 showContextMenu(node, e.x, e.y)
@@ -440,7 +461,12 @@ class ConnectionsTreePanel(
         object : Task.Backgroundable(project, "Counting ${data.collection}...", true) {
             override fun run(indicator: ProgressIndicator) {
                 try {
-                    val count = connectionManager.getEstimatedCount(data.profile, data.database, data.collection)
+                    val count = connectionManager.getEstimatedCount(
+                        data.profile,
+                        data.database,
+                        data.collection,
+                        forceRefresh = true
+                    )
                     ApplicationManager.getApplication().invokeLater {
                         data.estimatedCount = count
                         treeModel.nodeChanged(node)
@@ -454,109 +480,109 @@ class ConnectionsTreePanel(
         }.queue()
     }
 
+    private fun popupAction(
+        text: String,
+        icon: Icon,
+        onPerform: () -> Unit
+    ): DumbAwareAction = object : DumbAwareAction(text, null, icon) {
+        override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+        override fun actionPerformed(e: AnActionEvent) = onPerform()
+    }
+
     private fun showContextMenu(node: DefaultMutableTreeNode, x: Int, y: Int) {
-        val menu = JPopupMenu()
+        val group = DefaultActionGroup()
         when (val data = node.userObject) {
             is TreeNodeData.CollectionNode -> {
-                menu.add(JMenuItem(I18n.t("tree.ctx.openFind")).apply {
-                    addActionListener { onOpenFindTab(data.profile, data.database, data.collection, true) }
+                group.add(popupAction(I18n.t("tree.ctx.openFind"), AllIcons.Actions.Find) {
+                    onOpenFindTab(data.profile, data.database, data.collection, true)
                 })
-                menu.add(JMenuItem(I18n.t("tree.ctx.openAgg")).apply {
-                    addActionListener { onOpenAggTab(data.profile, data.database, data.collection) }
+                group.add(popupAction(I18n.t("tree.ctx.openAgg"), AllIcons.Actions.ListFiles) {
+                    onOpenAggTab(data.profile, data.database, data.collection)
                 })
-                menu.add(JMenuItem(I18n.t("tree.ctx.openShell")).apply {
-                    addActionListener { onOpenShellTab(data.profile, data.database, data.collection) }
+                group.add(popupAction(I18n.t("tree.ctx.openShell"), AllIcons.Nodes.Console) {
+                    onOpenShellTab(data.profile, data.database, data.collection)
                 })
-                menu.addSeparator()
-                menu.add(JMenuItem(I18n.t("tree.ctx.inspectIndexes")).apply {
-                    addActionListener { onInspectIndexes(data.profile, data.database, data.collection) }
+                group.addSeparator()
+                group.add(popupAction(I18n.t("tree.ctx.inspectIndexes"), AllIcons.Actions.Preview) {
+                    onInspectIndexes(data.profile, data.database, data.collection)
                 })
-                menu.addSeparator()
-                menu.add(JMenuItem(I18n.t("tree.ctx.copyName")).apply {
-                    addActionListener {
-                        UiHelpers.copyToClipboard(data.collection)
-                        UiHelpers.notify(project, I18n.t("result.copied"))
-                    }
+                group.addSeparator()
+                group.add(popupAction(I18n.t("tree.ctx.copyName"), AllIcons.Actions.Copy) {
+                    UiHelpers.copyToClipboard(data.collection)
+                    UiHelpers.notify(project, I18n.t("result.copied"))
                 })
-                menu.add(JMenuItem(I18n.t("tree.ctx.refreshCount")).apply {
-                    addActionListener { refreshEstimatedCount(node, data) }
+                group.add(popupAction(I18n.t("tree.ctx.refreshCount"), AllIcons.Actions.Refresh) {
+                    refreshEstimatedCount(node, data)
                 })
             }
             is TreeNodeData.ProfileNode -> {
                 val profile = data.profile
-                menu.add(JMenuItem(I18n.t("tree.ctx.reconnect")).apply {
-                    addActionListener {
-                        data.loaded = false
-                        node.removeAllChildren()
-                        node.add(DefaultMutableTreeNode(TreeNodeData.PlaceholderNode(I18n.t("tree.loading"))))
-                        treeModel.nodeStructureChanged(node)
-                        loadDatabasesForProfile(node, data)
-                        tree.expandPath(TreePath(node.path))
-                    }
+                group.add(popupAction(I18n.t("tree.ctx.reconnect"), AllIcons.Actions.Refresh) {
+                    data.loaded = false
+                    node.removeAllChildren()
+                    node.add(DefaultMutableTreeNode(TreeNodeData.PlaceholderNode(I18n.t("tree.loading"))))
+                    treeModel.nodeStructureChanged(node)
+                    loadDatabasesForProfile(node, data)
+                    tree.expandPath(TreePath(node.path))
                 })
                 if (profile.readOnly) {
-                    menu.addSeparator()
+                    group.addSeparator()
                     if (connectionManager.isEffectivelyReadOnly(profile)) {
-                        menu.add(JMenuItem(I18n.t("tree.ctx.unlockSession")).apply {
-                            addActionListener {
-                                val confirm = Messages.showYesNoDialog(
-                                    project,
-                                    I18n.t("readonly.unlock.msg", profile.displayName),
-                                    I18n.t("readonly.unlock.title"),
-                                    I18n.t("readonly.unlock.action"),
-                                    Messages.getCancelButton(),
-                                    Messages.getWarningIcon()
-                                )
-                                if (confirm == Messages.YES) {
-                                    connectionManager.unlockForSession(profile.id)
-                                    tree.repaint()
-                                }
+                        group.add(popupAction(I18n.t("tree.ctx.unlockSession"), AllIcons.Nodes.Padlock) {
+                            val confirm = Messages.showYesNoDialog(
+                                project,
+                                I18n.t("readonly.unlock.msg", profile.displayName),
+                                I18n.t("readonly.unlock.title"),
+                                I18n.t("readonly.unlock.action"),
+                                Messages.getCancelButton(),
+                                Messages.getWarningIcon()
+                            )
+                            if (confirm == Messages.YES) {
+                                connectionManager.unlockForSession(profile.id)
+                                tree.repaint()
                             }
                         })
                     } else {
-                        menu.add(JMenuItem(I18n.t("tree.ctx.relockSession")).apply {
-                            addActionListener {
-                                connectionManager.relockForSession(profile.id)
-                                tree.repaint()
-                            }
+                        group.add(popupAction(I18n.t("tree.ctx.relockSession"), AllIcons.Nodes.Padlock) {
+                            connectionManager.relockForSession(profile.id)
+                            tree.repaint()
                         })
                     }
                 }
                 if (profile.source == ProfileSource.CUSTOM) {
-                    menu.addSeparator()
-                    menu.add(JMenuItem(I18n.t("tree.ctx.editCustom")).apply {
-                        addActionListener { onEditCustomProfile(profile) }
+                    group.addSeparator()
+                    group.add(popupAction(I18n.t("tree.ctx.editCustom"), AllIcons.Actions.Edit) {
+                        onEditCustomProfile(profile)
                     })
-                    menu.add(JMenuItem(I18n.t("tree.ctx.deleteCustom")).apply {
-                        addActionListener {
-                            val confirm = Messages.showYesNoDialog(
-                                project,
-                                I18n.t("tree.deleteCustom.confirm", profile.displayName),
-                                I18n.t("tree.ctx.deleteCustom"),
-                                Messages.getWarningIcon()
-                            )
-                            if (confirm == Messages.YES) {
-                                onDeleteCustomProfile(profile)
-                            }
+                    group.add(popupAction(I18n.t("tree.ctx.deleteCustom"), AllIcons.General.Remove) {
+                        val confirm = Messages.showYesNoDialog(
+                            project,
+                            I18n.t("tree.deleteCustom.confirm", profile.displayName),
+                            I18n.t("tree.ctx.deleteCustom"),
+                            Messages.getWarningIcon()
+                        )
+                        if (confirm == Messages.YES) {
+                            onDeleteCustomProfile(profile)
                         }
                     })
                 }
             }
             is TreeNodeData.DatabaseNode -> {
-                menu.add(JMenuItem(I18n.t("tree.ctx.reconnect")).apply {
-                    addActionListener {
-                        data.loaded = false
-                        node.removeAllChildren()
-                        node.add(DefaultMutableTreeNode(TreeNodeData.PlaceholderNode(I18n.t("tree.loading"))))
-                        treeModel.nodeStructureChanged(node)
-                        loadCollectionsForDatabase(node, data)
-                        tree.expandPath(TreePath(node.path))
-                    }
+                group.add(popupAction(I18n.t("tree.ctx.reconnect"), AllIcons.Actions.Refresh) {
+                    data.loaded = false
+                    node.removeAllChildren()
+                    node.add(DefaultMutableTreeNode(TreeNodeData.PlaceholderNode(I18n.t("tree.loading"))))
+                    treeModel.nodeStructureChanged(node)
+                    loadCollectionsForDatabase(node, data)
+                    tree.expandPath(TreePath(node.path))
                 })
             }
             else -> return
         }
-        menu.show(tree, x, y)
+
+        val popupMenu = ActionManager.getInstance().createActionPopupMenu("MaekomMongoLensPopup", group)
+        popupMenu.setTargetComponent(tree)
+        popupMenu.component.show(tree, x, y)
     }
 
     private fun refreshTexts() {

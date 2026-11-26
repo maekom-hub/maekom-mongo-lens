@@ -3,13 +3,19 @@ package com.maekom.mongolens.ui
 import com.intellij.icons.AllIcons
 import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.ActionUpdateThread
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.editor.EditorFactory
 import com.intellij.openapi.editor.ex.EditorEx
+import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.popup.JBPopup
 import com.intellij.openapi.ui.popup.JBPopupFactory
+import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.util.text.StringUtil
 import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.SimpleTextAttributes
@@ -18,6 +24,8 @@ import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.table.JBTable
 import com.intellij.ui.treeStructure.Tree
+import com.intellij.util.concurrency.AppExecutorUtil
+import com.intellij.util.ui.AsyncProcessIcon
 import com.intellij.util.ui.JBUI
 import com.maekom.mongolens.config.MongoConnectionProfile
 import com.maekom.mongolens.crypto.CryptoConfigStore
@@ -30,12 +38,18 @@ import com.maekom.mongolens.mongo.MongoShellNormalizer
 import com.maekom.mongolens.mongo.QueryExecutionResult
 import com.maekom.mongolens.mongo.QuickFilterHelper
 import com.maekom.mongolens.mongo.ReferenceJumpHelper
+import com.maekom.mongolens.mongo.TrailingQueryMetadata
 import com.intellij.ui.JBColor
 import java.awt.Color
 import java.awt.Graphics
 import java.awt.Graphics2D
+import java.awt.GridBagLayout
 import java.awt.GridLayout
 import java.awt.RenderingHints
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import javax.swing.Icon
 import org.bson.BsonArray
 import org.bson.BsonDateTime
@@ -124,7 +138,7 @@ class ResultViewerPanel(
     class DocTreeNode(
         var displayLabel: String,
         var bsonDocument: BsonDocument,
-        var rawDocument: Document,
+        var rawDocument: Document? = null,
         var docIndex: Int
     ) : DefaultMutableTreeNode(displayLabel)
 
@@ -160,6 +174,28 @@ class ResultViewerPanel(
     private var activeCopyOverlayPopup: JBPopup? = null
     private var isTreeFullyExpanded: Boolean = false
     private var joinColumnOrigins: Map<String, JoinColumnOrigin> = initialJoinColumnOrigins
+
+    // Lazy view build & Single-Flight rendering state
+    private val isDisposedFlag = AtomicBoolean(false)
+    private val dataGeneration = AtomicLong(0L)
+    private val activeViewBuildFuture = AtomicReference<Future<*>?>(null)
+    private var treeBuiltGen: Long = -1L
+    private var tableBuiltGen: Long = -1L
+    private var jsonBuiltGen: Long = -1L
+    private var isLoading: Boolean = false
+
+    private val loadingSpinner = AsyncProcessIcon("MaekomMongoLensLoading")
+    private val loadingStatusLabel = JBLabel(I18n.t("result.loading")).apply {
+        foreground = JBUI.CurrentTheme.ContextHelp.FOREGROUND
+    }
+    private val loadingOverlayPanel = JPanel(GridBagLayout()).apply {
+        val inner = JPanel(FlowLayout(FlowLayout.CENTER, 8, 4)).apply {
+            isOpaque = false
+            add(loadingSpinner)
+            add(loadingStatusLabel)
+        }
+        add(inner)
+    }
 
     private val headerLeftBar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
     private val summaryLabel = JBLabel(" ")
@@ -294,7 +330,7 @@ class ResultViewerPanel(
     private val cardsPanel = JPanel(cardLayout)
 
     // 1. Tree View
-    private val treeRoot = DefaultMutableTreeNode("Results")
+    private var treeRoot = DefaultMutableTreeNode("Results")
     private val treeModel = DefaultTreeModel(treeRoot)
     private val resultTree = object : Tree(treeModel) {
         override fun getToolTipText(event: MouseEvent?): String? {
@@ -361,7 +397,7 @@ class ResultViewerPanel(
             return when (bsonVal) {
                 is BsonObjectId -> UiHelpers.formatObjectIdTooltip(bsonVal.value)
                 is BsonDateTime -> UiHelpers.formatDateDualTooltip(bsonVal.value)
-                else -> "${UiHelpers.bsonTypeTag(bsonVal)}: ${UiHelpers.bsonPureTextValue(bsonVal)}"
+                else -> "${UiHelpers.bsonTypeTag(bsonVal)}: ${UiHelpers.truncateForDisplay(UiHelpers.bsonPureTextValue(bsonVal), 300)}"
             }
         }
     }
@@ -377,6 +413,8 @@ class ResultViewerPanel(
         cardsPanel.add(treeScrollPane, "TREE")
         cardsPanel.add(rawJsonEditor.component, "JSON")
         cardsPanel.add(tableScrollPane, "TABLE")
+        cardsPanel.add(loadingOverlayPanel, "LOADING")
+        Disposer.register(this, loadingSpinner)
 
         add(cardsPanel, BorderLayout.CENTER)
         if (initialView != "TREE") {
@@ -699,7 +737,6 @@ class ResultViewerPanel(
                     docIndex = targetDocNode.docIndex,
                     selectedDocIndices = selectedTreeDocIndices(),
                     targetBsonDoc = targetDocNode.bsonDocument,
-                    targetRawDoc = targetDocNode.rawDocument,
                     focusFieldPath = focusFieldPath,
                     clickedBsonValue = clickedBsonVal,
                     selectedFieldItems = selectedFieldItems,
@@ -969,7 +1006,6 @@ class ResultViewerPanel(
                     "\"${MongoShellNormalizer.escapeJsonString(colName)}\": null"
                 }
                 val bsonDoc = currentDocs.getOrNull(modelRow) ?: return
-                val rawDoc = toRawDocument(bsonDoc)
                 val selectedDocIndices = resultTable.selectedRows
                     .map { resultTable.convertRowIndexToModel(it) }
                     .filter { it in currentDocs.indices }
@@ -997,7 +1033,6 @@ class ResultViewerPanel(
                     docIndex = modelRow,
                     selectedDocIndices = selectedDocIndices,
                     targetBsonDoc = bsonDoc,
-                    targetRawDoc = rawDoc,
                     focusFieldPath = colName,
                     clickedBsonValue = clickedBsonVal,
                     selectedFieldItems = selectedFieldItems,
@@ -1008,28 +1043,52 @@ class ResultViewerPanel(
         })
     }
 
+    private fun popupAction(
+        text: String,
+        icon: Icon,
+        enabled: Boolean = true,
+        description: String? = null,
+        onPerform: () -> Unit
+    ): DumbAwareAction = object : DumbAwareAction(text, description, icon) {
+        override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = enabled
+            if (description != null) e.presentation.description = description
+        }
+        override fun actionPerformed(e: AnActionEvent) {
+            if (enabled) onPerform()
+        }
+    }
+
+    private fun popupSubmenu(text: String, icon: Icon): DefaultActionGroup =
+        DefaultActionGroup(text, true).apply {
+            templatePresentation.icon = icon
+        }
+
     private fun showTableHeaderContextMenu(x: Int, y: Int, clickedColName: String) {
         val visibleCols = tableModel.getColumnNames()
-        val menu = JPopupMenu()
+        val group = DefaultActionGroup()
 
         if (onApplyColumnSelection != null) {
             val canHide = visibleCols.size >= 2
-            menu.add(JMenuItem(I18n.t("result.table.hideColumn", clickedColName)).apply {
-                isEnabled = canHide
-                if (!canHide) {
-                    toolTipText = I18n.t("result.table.hideColumnDisabledTooltip")
-                }
-                addActionListener {
+            group.add(
+                popupAction(
+                    text = I18n.t("result.table.hideColumn", clickedColName),
+                    icon = AllIcons.Actions.ToggleVisibility,
+                    enabled = canHide,
+                    description = if (!canHide) I18n.t("result.table.hideColumnDisabledTooltip") else null
+                ) {
                     val remaining = visibleCols.filter { it != clickedColName }
                     if (remaining.isNotEmpty()) {
                         onApplyColumnSelection.invoke(remaining, false)
                     }
                 }
-            })
-
-            menu.add(JMenuItem(I18n.t("result.table.selectColumns")).apply {
-                font = font.deriveFont(Font.BOLD)
-                addActionListener {
+            )
+            group.add(
+                popupAction(
+                    text = I18n.t("result.table.selectColumns"),
+                    icon = AllIcons.Nodes.DataTables
+                ) {
                     val schemaCols = availableColumnsSupplier?.invoke().orEmpty()
                     val allCols = buildList {
                         addAll(visibleCols)
@@ -1040,22 +1099,27 @@ class ResultViewerPanel(
                         onApplyColumnSelection.invoke(dlg.getSelectedColumns(), dlg.isAllColumnsSelected())
                     }
                 }
-            })
-            menu.addSeparator()
+            )
+            group.addSeparator()
         }
 
-        menu.add(JMenuItem(I18n.t("result.table.copyColumn")).apply {
-            addActionListener {
+        group.add(
+            popupAction(
+                text = I18n.t("result.table.copyColumn"),
+                icon = AllIcons.Actions.Copy
+            ) {
                 UiHelpers.copyToClipboard(clickedColName)
                 UiHelpers.notify(project, I18n.t("result.copied"))
             }
-        })
+        )
 
-        menu.show(resultTable.tableHeader, x, y)
+        val popupMenu = ActionManager.getInstance().createActionPopupMenu("MaekomMongoLensPopup", group)
+        popupMenu.setTargetComponent(resultTable.tableHeader)
+        popupMenu.component.show(resultTable.tableHeader, x, y)
     }
 
     /**
-     * Reorganized 5-group context menu for both Tree and Table views:
+     * IntelliJ New UI native 5-group context menu (`ActionPopupMenu` + `AllIcons`) for both Tree and Table views:
      *   Group 1: Dynamic Quick Filter (Cases A-E) & Sort (disabled/hidden in Join View)
      *   Group 2: Edit (`데이터 수정` / Edit Data)
      *   Group 3: Copy submenu (Value only / Key:Value JSON / Field Path)
@@ -1063,20 +1127,19 @@ class ResultViewerPanel(
      *   Group 5: Document Diff (2 Selected Docs + Pinned Baseline)
      */
     private fun showUnifiedContextMenu(
-        invoker: Component,
+        invoker: JComponent,
         x: Int,
         y: Int,
         docIndex: Int,
         selectedDocIndices: List<Int>,
         targetBsonDoc: BsonDocument,
-        targetRawDoc: Document,
         focusFieldPath: String?,
         clickedBsonValue: BsonValue?,
         selectedFieldItems: List<QuickFilterHelper.SelectedFieldItem>,
         copyValueOnlyText: String,
         copyKeyValueJsonText: String
     ) {
-        val menu = JPopupMenu()
+        val group = DefaultActionGroup()
         val normalizedFocusPath = focusFieldPath?.let { QuickFilterHelper.normalizeFilterFieldPath(it) }?.takeIf { it.isNotEmpty() }
 
         // ============================================================
@@ -1088,96 +1151,76 @@ class ResultViewerPanel(
             when (selectionKind) {
                 is QuickFilterHelper.SmartSelectionKind.SingleScalar -> {
                     addedGroup1 = true
-                    menu.add(JMenuItem(I18n.t("result.qf.equals")).apply {
-                        addActionListener {
-                            onMergeQuickFilter.invoke(
-                                QuickFilterHelper.buildEqualsClause(selectionKind.fieldPath, selectionKind.value)
-                            )
-                        }
+                    group.add(popupAction(I18n.t("result.qf.equals"), AllIcons.General.Filter) {
+                        onMergeQuickFilter.invoke(
+                            QuickFilterHelper.buildEqualsClause(selectionKind.fieldPath, selectionKind.value)
+                        )
                     })
-                    menu.add(JMenuItem(I18n.t("result.qf.notEquals")).apply {
-                        addActionListener {
-                            onMergeQuickFilter.invoke(
-                                QuickFilterHelper.buildNotEqualsClause(selectionKind.fieldPath, selectionKind.value)
-                            )
-                        }
+                    group.add(popupAction(I18n.t("result.qf.notEquals"), AllIcons.General.Remove) {
+                        onMergeQuickFilter.invoke(
+                            QuickFilterHelper.buildNotEqualsClause(selectionKind.fieldPath, selectionKind.value)
+                        )
                     })
                 }
                 is QuickFilterHelper.SmartSelectionKind.SameFieldMultiValues -> {
                     addedGroup1 = true
                     val n = selectionKind.values.size
-                    menu.add(JMenuItem(I18n.t("result.qf.inList", n)).apply {
-                        addActionListener {
-                            onMergeQuickFilter.invoke(
-                                QuickFilterHelper.buildInClause(selectionKind.fieldPath, selectionKind.values)
-                            )
-                        }
+                    group.add(popupAction(I18n.t("result.qf.inList", n), AllIcons.General.Filter) {
+                        onMergeQuickFilter.invoke(
+                            QuickFilterHelper.buildInClause(selectionKind.fieldPath, selectionKind.values)
+                        )
                     })
-                    menu.add(JMenuItem(I18n.t("result.qf.ninList", n)).apply {
-                        addActionListener {
-                            onMergeQuickFilter.invoke(
-                                QuickFilterHelper.buildNinClause(selectionKind.fieldPath, selectionKind.values)
-                            )
-                        }
+                    group.add(popupAction(I18n.t("result.qf.ninList", n), AllIcons.General.Remove) {
+                        onMergeQuickFilter.invoke(
+                            QuickFilterHelper.buildNinClause(selectionKind.fieldPath, selectionKind.values)
+                        )
                     })
                 }
                 is QuickFilterHelper.SmartSelectionKind.SameFieldDatePair -> {
                     addedGroup1 = true
-                    menu.add(JMenuItem(I18n.t("result.qf.dateRange")).apply {
-                        addActionListener {
-                            onMergeQuickFilter.invoke(
-                                QuickFilterHelper.buildDateRangeClause(
-                                    selectionKind.fieldPath,
-                                    selectionKind.minValue,
-                                    selectionKind.maxValue
-                                )
+                    group.add(popupAction(I18n.t("result.qf.dateRange"), AllIcons.General.History) {
+                        onMergeQuickFilter.invoke(
+                            QuickFilterHelper.buildDateRangeClause(
+                                selectionKind.fieldPath,
+                                selectionKind.minValue,
+                                selectionKind.maxValue
                             )
-                        }
+                        )
                     })
-                    menu.add(JMenuItem(I18n.t("result.qf.dateInTwo")).apply {
-                        addActionListener {
-                            onMergeQuickFilter.invoke(
-                                QuickFilterHelper.buildInClause(
-                                    selectionKind.fieldPath,
-                                    listOf(selectionKind.minValue, selectionKind.maxValue)
-                                )
+                    group.add(popupAction(I18n.t("result.qf.dateInTwo"), AllIcons.General.Filter) {
+                        onMergeQuickFilter.invoke(
+                            QuickFilterHelper.buildInClause(
+                                selectionKind.fieldPath,
+                                listOf(selectionKind.minValue, selectionKind.maxValue)
                             )
-                        }
+                        )
                     })
                 }
                 is QuickFilterHelper.SmartSelectionKind.MultiFieldConditions -> {
                     addedGroup1 = true
                     val n = selectionKind.items.size
-                    menu.add(JMenuItem(I18n.t("result.qf.multiAnd", n)).apply {
-                        addActionListener {
-                            onMergeQuickFilter.invoke(
-                                QuickFilterHelper.buildMultiFieldAndClause(selectionKind.items)
-                            )
-                        }
+                    group.add(popupAction(I18n.t("result.qf.multiAnd", n), AllIcons.General.Filter) {
+                        onMergeQuickFilter.invoke(
+                            QuickFilterHelper.buildMultiFieldAndClause(selectionKind.items)
+                        )
                     })
-                    menu.add(JMenuItem(I18n.t("result.qf.multiOr", n)).apply {
-                        addActionListener {
-                            onMergeQuickFilter.invoke(
-                                QuickFilterHelper.buildMultiFieldOrClause(selectionKind.items)
-                            )
-                        }
+                    group.add(popupAction(I18n.t("result.qf.multiOr", n), AllIcons.General.Remove) {
+                        onMergeQuickFilter.invoke(
+                            QuickFilterHelper.buildMultiFieldOrClause(selectionKind.items)
+                        )
                     })
                 }
                 is QuickFilterHelper.SmartSelectionKind.SingleStruct -> {
                     addedGroup1 = true
-                    menu.add(JMenuItem(I18n.t("result.qf.existsTrue")).apply {
-                        addActionListener {
-                            onMergeQuickFilter.invoke(
-                                QuickFilterHelper.buildExistsTrueClause(selectionKind.fieldPath)
-                            )
-                        }
+                    group.add(popupAction(I18n.t("result.qf.existsTrue"), AllIcons.General.Filter) {
+                        onMergeQuickFilter.invoke(
+                            QuickFilterHelper.buildExistsTrueClause(selectionKind.fieldPath)
+                        )
                     })
-                    menu.add(JMenuItem(I18n.t("result.qf.emptyOrMissing")).apply {
-                        addActionListener {
-                            onMergeQuickFilter.invoke(
-                                QuickFilterHelper.buildEmptyOrMissingClause(selectionKind.fieldPath)
-                            )
-                        }
+                    group.add(popupAction(I18n.t("result.qf.emptyOrMissing"), AllIcons.General.Remove) {
+                        onMergeQuickFilter.invoke(
+                            QuickFilterHelper.buildEmptyOrMissingClause(selectionKind.fieldPath)
+                        )
                     })
                 }
                 null -> Unit
@@ -1190,43 +1233,35 @@ class ResultViewerPanel(
                 when (clickedBsonValue) {
                     is BsonObjectId -> {
                         addedGroup1 = true
-                        val oidMenu = JMenu(I18n.t("result.timeFilter.menu")).apply {
-                            add(JMenuItem(I18n.t("result.timeFilter.gte")).apply {
-                                addActionListener {
-                                    onApplyQuickFilter.invoke(
-                                        UiHelpers.buildObjectIdTimeRangeFilter(normalizedFocusPath, clickedBsonValue.value, isGte = true)
-                                    )
-                                }
+                        val oidSub = popupSubmenu(I18n.t("result.timeFilter.menu"), AllIcons.General.History).apply {
+                            add(popupAction(I18n.t("result.timeFilter.gte"), AllIcons.General.History) {
+                                onApplyQuickFilter.invoke(
+                                    UiHelpers.buildObjectIdTimeRangeFilter(normalizedFocusPath, clickedBsonValue.value, isGte = true)
+                                )
                             })
-                            add(JMenuItem(I18n.t("result.timeFilter.lte")).apply {
-                                addActionListener {
-                                    onApplyQuickFilter.invoke(
-                                        UiHelpers.buildObjectIdTimeRangeFilter(normalizedFocusPath, clickedBsonValue.value, isGte = false)
-                                    )
-                                }
+                            add(popupAction(I18n.t("result.timeFilter.lte"), AllIcons.General.History) {
+                                onApplyQuickFilter.invoke(
+                                    UiHelpers.buildObjectIdTimeRangeFilter(normalizedFocusPath, clickedBsonValue.value, isGte = false)
+                                )
                             })
                         }
-                        menu.add(oidMenu)
+                        group.add(oidSub)
                     }
                     is BsonDateTime -> {
                         addedGroup1 = true
-                        val dateMenu = JMenu(I18n.t("result.dateFilter.menu")).apply {
-                            add(JMenuItem(I18n.t("result.dateFilter.gte")).apply {
-                                addActionListener {
-                                    onApplyQuickFilter.invoke(
-                                        UiHelpers.buildDateTimeRangeFilter(normalizedFocusPath, clickedBsonValue.value, isGte = true)
-                                    )
-                                }
+                        val dateSub = popupSubmenu(I18n.t("result.dateFilter.menu"), AllIcons.General.History).apply {
+                            add(popupAction(I18n.t("result.dateFilter.gte"), AllIcons.General.History) {
+                                onApplyQuickFilter.invoke(
+                                    UiHelpers.buildDateTimeRangeFilter(normalizedFocusPath, clickedBsonValue.value, isGte = true)
+                                )
                             })
-                            add(JMenuItem(I18n.t("result.dateFilter.lte")).apply {
-                                addActionListener {
-                                    onApplyQuickFilter.invoke(
-                                        UiHelpers.buildDateTimeRangeFilter(normalizedFocusPath, clickedBsonValue.value, isGte = false)
-                                    )
-                                }
+                            add(popupAction(I18n.t("result.dateFilter.lte"), AllIcons.General.History) {
+                                onApplyQuickFilter.invoke(
+                                    UiHelpers.buildDateTimeRangeFilter(normalizedFocusPath, clickedBsonValue.value, isGte = false)
+                                )
                             })
                         }
-                        menu.add(dateMenu)
+                        group.add(dateSub)
                     }
                     else -> Unit
                 }
@@ -1241,19 +1276,15 @@ class ResultViewerPanel(
             }
             if (onApplyQuickSort != null && singleSortField != null) {
                 addedGroup1 = true
-                val sortMenu = JMenu(I18n.t("result.qs.menu")).apply {
-                    add(JMenuItem(I18n.t("result.qs.asc")).apply {
-                        addActionListener {
-                            onApplyQuickSort.invoke(QuickFilterHelper.buildSortJson(singleSortField, ascending = true))
-                        }
+                val sortSub = popupSubmenu(I18n.t("result.qs.menu"), AllIcons.ObjectBrowser.Sorted).apply {
+                    add(popupAction(I18n.t("result.qs.asc"), AllIcons.Actions.MoveUp) {
+                        onApplyQuickSort.invoke(QuickFilterHelper.buildSortJson(singleSortField, ascending = true))
                     })
-                    add(JMenuItem(I18n.t("result.qs.desc")).apply {
-                        addActionListener {
-                            onApplyQuickSort.invoke(QuickFilterHelper.buildSortJson(singleSortField, ascending = false))
-                        }
+                    add(popupAction(I18n.t("result.qs.desc"), AllIcons.Actions.MoveDown) {
+                        onApplyQuickSort.invoke(QuickFilterHelper.buildSortJson(singleSortField, ascending = false))
                     })
                 }
-                menu.add(sortMenu)
+                group.add(sortSub)
             }
         }
 
@@ -1261,51 +1292,43 @@ class ResultViewerPanel(
         // Group 2: Edit (`데이터 수정`)
         // ============================================================
         if (addedGroup1) {
-            menu.addSeparator()
+            group.addSeparator()
         }
-        menu.add(JMenuItem(I18n.t("result.doc.editData")).apply {
-            font = font.deriveFont(Font.BOLD)
-            isEnabled = !isJoinView
-            if (isJoinView) {
-                toolTipText = I18n.t("join.editDisabledTooltip")
-            }
-            addActionListener {
-                if (isJoinView) return@addActionListener
+        group.add(
+            popupAction(
+                text = I18n.t("result.doc.editData"),
+                icon = AllIcons.Actions.Edit,
+                enabled = !isJoinView,
+                description = if (isJoinView) I18n.t("join.editDisabledTooltip") else null
+            ) {
                 ApplicationManager.getApplication().invokeLater {
-                    openDocumentEditDialog(docIndex, targetBsonDoc, targetRawDoc, focusFieldPath)
+                    openDocumentEditDialog(docIndex, targetBsonDoc, toRawDocument(targetBsonDoc), focusFieldPath)
                 }
             }
-        })
+        )
 
         // ============================================================
         // Group 3: Copy Submenu (Value / Key:Value JSON / Field Path)
         // ============================================================
-        menu.addSeparator()
-        val copySubmenu = JMenu(I18n.t("result.copy.menu")).apply {
-            add(JMenuItem(I18n.t("result.copy.valueOnly")).apply {
-                addActionListener {
-                    UiHelpers.copyToClipboard(copyValueOnlyText)
-                    UiHelpers.notify(project, I18n.t("result.copied"))
-                }
+        group.addSeparator()
+        val pathToCopy = normalizedFocusPath ?: focusFieldPath
+        val copySub = popupSubmenu(I18n.t("result.copy.menu"), AllIcons.Actions.Copy).apply {
+            add(popupAction(I18n.t("result.copy.valueOnly"), AllIcons.Actions.Copy) {
+                UiHelpers.copyToClipboard(copyValueOnlyText)
+                UiHelpers.notify(project, I18n.t("result.copied"))
             })
-            add(JMenuItem(I18n.t("result.copy.keyValueJson")).apply {
-                addActionListener {
-                    UiHelpers.copyToClipboard(copyKeyValueJsonText)
-                    UiHelpers.notify(project, I18n.t("result.copied"))
-                }
+            add(popupAction(I18n.t("result.copy.keyValueJson"), AllIcons.FileTypes.Json) {
+                UiHelpers.copyToClipboard(copyKeyValueJsonText)
+                UiHelpers.notify(project, I18n.t("result.copied"))
             })
-            add(JMenuItem(I18n.t("result.copy.fieldPath")).apply {
-                val pathToCopy = normalizedFocusPath ?: focusFieldPath
-                isEnabled = !pathToCopy.isNullOrBlank()
-                addActionListener {
-                    if (!pathToCopy.isNullOrBlank()) {
-                        UiHelpers.copyToClipboard(pathToCopy)
-                        UiHelpers.notify(project, I18n.t("result.copied"))
-                    }
+            add(popupAction(I18n.t("result.copy.fieldPath"), AllIcons.Actions.ShowAsTree, enabled = !pathToCopy.isNullOrBlank()) {
+                if (!pathToCopy.isNullOrBlank()) {
+                    UiHelpers.copyToClipboard(pathToCopy)
+                    UiHelpers.notify(project, I18n.t("result.copied"))
                 }
             })
         }
-        menu.add(copySubmenu)
+        group.add(copySub)
 
         // ============================================================
         // Group 4: Reference Jump & Collection Join View
@@ -1315,19 +1338,15 @@ class ResultViewerPanel(
             clickedBsonValue != null &&
             ReferenceJumpHelper.isReferenceCandidate(focusFieldPath, clickedBsonValue)
         if (canRefJump || onRequestOpenJoinDialog != null) {
-            menu.addSeparator()
+            group.addSeparator()
             if (canRefJump) {
-                menu.add(JMenuItem(I18n.t("result.ref.jumpToCollection")).apply {
-                    addActionListener {
-                        showReferenceCollectionPopup(invoker, Point(x, y), focusFieldPath!!, clickedBsonValue!!)
-                    }
+                group.add(popupAction(I18n.t("result.ref.jumpToCollection"), AllIcons.Actions.Search) {
+                    showReferenceCollectionPopup(invoker, Point(x, y), focusFieldPath!!, clickedBsonValue!!)
                 })
             }
             if (onRequestOpenJoinDialog != null) {
-                menu.add(JMenuItem(I18n.t("result.join.openDialog")).apply {
-                    addActionListener {
-                        onRequestOpenJoinDialog.invoke(normalizedFocusPath ?: focusFieldPath)
-                    }
+                group.add(popupAction(I18n.t("result.join.openDialog"), AllIcons.Vcs.Merge) {
+                    onRequestOpenJoinDialog.invoke(normalizedFocusPath ?: focusFieldPath)
                 })
             }
         }
@@ -1336,19 +1355,20 @@ class ResultViewerPanel(
         // Group 5: Document Diff (2 Selected Docs + Pinned Baseline)
         // ============================================================
         if (diffBaselineState != null) {
-            menu.addSeparator()
+            group.addSeparator()
             val canCompareTwo = selectedDocIndices.size == 2
-            menu.add(JMenuItem(I18n.t("diff.menu.compareTwo")).apply {
-                isEnabled = canCompareTwo
-                if (!canCompareTwo) {
-                    toolTipText = I18n.t("diff.menu.compareTwoHint")
-                }
-                addActionListener {
-                    if (selectedDocIndices.size != 2) return@addActionListener
+            group.add(
+                popupAction(
+                    text = I18n.t("diff.menu.compareTwo"),
+                    icon = AllIcons.Actions.Diff,
+                    enabled = canCompareTwo,
+                    description = if (!canCompareTwo) I18n.t("diff.menu.compareTwoHint") else null
+                ) {
+                    if (selectedDocIndices.size != 2) return@popupAction
                     val leftIdx = selectedDocIndices[0]
                     val rightIdx = selectedDocIndices[1]
-                    val leftDoc = resolveDocSnapshotForDiff(leftIdx) ?: return@addActionListener
-                    val rightDoc = resolveDocSnapshotForDiff(rightIdx) ?: return@addActionListener
+                    val leftDoc = resolveDocSnapshotForDiff(leftIdx) ?: return@popupAction
+                    val rightDoc = resolveDocSnapshotForDiff(rightIdx) ?: return@popupAction
                     DocumentDiffHelper.showDiff(
                         project = project,
                         contextTitle = "$database.$collection",
@@ -1358,38 +1378,35 @@ class ResultViewerPanel(
                         rightDoc = rightDoc
                     )
                 }
-            })
+            )
 
-            menu.add(JMenuItem(I18n.t("diff.menu.pinBaseline")).apply {
-                addActionListener {
-                    val snapDoc = resolveDocSnapshotForDiff(docIndex) ?: return@addActionListener
-                    val shortId = shortDocId(snapDoc, docIndex)
-                    val fullLabel = "${profile.displayName}/$database.$collection [$shortId]"
-                    diffBaselineState.pin(fullLabel, shortId, snapDoc)
-                    UiHelpers.notify(project, I18n.t("diff.pinnedToast", shortId))
-                }
+            group.add(popupAction(I18n.t("diff.menu.pinBaseline"), AllIcons.Actions.PinTab) {
+                val snapDoc = resolveDocSnapshotForDiff(docIndex) ?: return@popupAction
+                val shortId = shortDocId(snapDoc, docIndex)
+                val fullLabel = "${profile.displayName}/$database.$collection [$shortId]"
+                diffBaselineState.pin(fullLabel, shortId, snapDoc)
+                UiHelpers.notify(project, I18n.t("diff.pinnedToast", shortId))
             })
 
             val pinned = diffBaselineState.current
             if (pinned != null) {
-                menu.add(JMenuItem(I18n.t("diff.menu.compareWithBaseline", pinned.shortId)).apply {
-                    font = font.deriveFont(Font.BOLD)
-                    addActionListener {
-                        val currentSnap = resolveDocSnapshotForDiff(docIndex) ?: return@addActionListener
-                        DocumentDiffHelper.showDiff(
-                            project = project,
-                            contextTitle = "${pinned.shortId} ↔ ${shortDocId(currentSnap, docIndex)}",
-                            leftTitle = I18n.t("diff.baselineLabel", pinned.fullLabel),
-                            leftDoc = pinned.canonicalDoc,
-                            rightTitle = "${profile.displayName}/$database.$collection ${buildDocDiffTitle(docIndex, currentSnap)}",
-                            rightDoc = currentSnap
-                        )
-                    }
+                group.add(popupAction(I18n.t("diff.menu.compareWithBaseline", pinned.shortId), AllIcons.Actions.Diff) {
+                    val currentSnap = resolveDocSnapshotForDiff(docIndex) ?: return@popupAction
+                    DocumentDiffHelper.showDiff(
+                        project = project,
+                        contextTitle = "${pinned.shortId} ↔ ${shortDocId(currentSnap, docIndex)}",
+                        leftTitle = I18n.t("diff.baselineLabel", pinned.fullLabel),
+                        leftDoc = pinned.canonicalDoc,
+                        rightTitle = "${profile.displayName}/$database.$collection ${buildDocDiffTitle(docIndex, currentSnap)}",
+                        rightDoc = currentSnap
+                    )
                 })
             }
         }
 
-        menu.show(invoker, x, y)
+        val popupMenu = ActionManager.getInstance().createActionPopupMenu("MaekomMongoLensPopup", group)
+        popupMenu.setTargetComponent(invoker)
+        popupMenu.component.show(invoker, x, y)
     }
 
     private fun showReferenceCollectionPopup(
@@ -1496,9 +1513,12 @@ class ResultViewerPanel(
 
     private fun showExportMenu() {
         if (currentDocs.isEmpty()) return
-        val menu = JPopupMenu()
-        menu.add(JMenuItem(I18n.t("result.export.csv")).apply {
-            addActionListener {
+        val group = DefaultActionGroup().apply {
+            add(popupAction(I18n.t("result.export.csv"), AllIcons.Nodes.DataTables) {
+                if (tableBuiltGen != dataGeneration.get()) {
+                    tableModel.setDocuments(currentDocs)
+                    tableBuiltGen = dataGeneration.get()
+                }
                 val cols = tableModel.getColumnNames()
                 ResultExportHelper.exportCsv(
                     project = project,
@@ -1507,19 +1527,19 @@ class ResultViewerPanel(
                     rowCount = tableModel.rowCount,
                     cellTextProvider = { r, c -> tableModel.getPureCopyValueAt(r, c) }
                 )
-            }
-        })
-        menu.add(JMenuItem(I18n.t("result.export.json")).apply {
-            addActionListener {
+            })
+            add(popupAction(I18n.t("result.export.json"), AllIcons.FileTypes.Json) {
                 val docsToExport = currentDocs.indices.mapNotNull { resolveDocSnapshotForDiff(it) }
                 ResultExportHelper.exportJson(
                     project = project,
                     suggestedBaseName = collection,
                     documents = docsToExport
                 )
-            }
-        })
-        menu.show(exportBtn, 0, exportBtn.height)
+            })
+        }
+        val popupMenu = ActionManager.getInstance().createActionPopupMenu("MaekomMongoLensPopup", group)
+        popupMenu.setTargetComponent(exportBtn)
+        popupMenu.component.show(exportBtn, 0, exportBtn.height)
     }
 
     private fun resolveTreePathAtPoint(x: Int, y: Int): TreePath? {
@@ -1818,25 +1838,33 @@ class ResultViewerPanel(
         currentDocs[docIndex] = updatedDoc
         currentResult = currentResult?.copy(documents = currentDocs.toList())
 
-        if (docIndex < treeRoot.childCount) {
+        if (treeBuiltGen == dataGeneration.get() && docIndex < treeRoot.childCount) {
             val docNode = treeRoot.getChildAt(docIndex) as? DocTreeNode
             if (docNode != null) {
                 val idPreview = updatedDoc["_id"]?.let { UiHelpers.bsonIdRawText(it) } ?: "doc"
                 docNode.displayLabel = "[${currentSkip + docIndex + 1}] $idPreview"
                 docNode.userObject = docNode.displayLabel
                 docNode.bsonDocument = updatedDoc
-                docNode.rawDocument = toRawDocument(updatedDoc)
+                docNode.rawDocument = null
                 docNode.removeAllChildren()
                 addDocumentChildren(docNode, docNode, updatedDoc, "")
                 treeModel.nodeStructureChanged(docNode)
-                // Keep 1st-level expanded and nested Object/Array collapsed
                 resultTree.expandPath(TreePath(docNode.path))
             }
+        } else {
+            treeBuiltGen = -1L
         }
 
-        populateRawJson(currentDocs)
+        if (jsonBuiltGen == dataGeneration.get()) {
+            jsonBuiltGen = -1L
+            if (activeView == "JSON") buildActiveViewAsync(dataGeneration.get())
+        }
         clearTableBatchDecryption(repaintTable = false)
-        tableModel.updateDocumentInPlace(docIndex, updatedDoc)
+        if (tableBuiltGen == dataGeneration.get()) {
+            tableModel.updateDocumentInPlace(docIndex, updatedDoc)
+        } else {
+            tableBuiltGen = -1L
+        }
         updateBatchDecryptControls()
 
         SwingUtilities.invokeLater {
@@ -1858,7 +1886,7 @@ class ResultViewerPanel(
             currentResult = prev.copy(documents = currentDocs.toList(), totalCount = newTotal)
         }
 
-        if (docIndex < treeRoot.childCount) {
+        if (treeBuiltGen == dataGeneration.get() && docIndex < treeRoot.childCount) {
             val nodeToRemove = treeRoot.getChildAt(docIndex) as? DefaultMutableTreeNode
             if (nodeToRemove != null) {
                 treeModel.removeNodeFromParent(nodeToRemove)
@@ -1875,16 +1903,37 @@ class ResultViewerPanel(
                 treeRoot.add(DefaultMutableTreeNode(I18n.t("result.empty")))
                 treeModel.reload()
             }
+        } else {
+            treeBuiltGen = -1L
         }
 
         updateSummaryAndBadges()
-        populateRawJson(currentDocs)
-        populateTable(currentDocs)
+        if (jsonBuiltGen == dataGeneration.get()) {
+            jsonBuiltGen = -1L
+            if (activeView == "JSON") buildActiveViewAsync(dataGeneration.get())
+        }
+        if (tableBuiltGen == dataGeneration.get()) {
+            populateTable(currentDocs)
+        } else {
+            tableBuiltGen = -1L
+        }
         updateBatchDecryptControls()
 
         SwingUtilities.invokeLater {
             treeScrollPane.viewport.viewPosition = savedTreePos
             tableScrollPane.viewport.viewPosition = savedTablePos
+        }
+    }
+
+    fun setLoading(loading: Boolean) {
+        this.isLoading = loading
+        if (loading) {
+            loadingSpinner.resume()
+            loadingStatusLabel.text = I18n.t("result.loading")
+            cardLayout.show(cardsPanel, "LOADING")
+        } else {
+            loadingSpinner.suspend()
+            cardLayout.show(cardsPanel, activeView)
         }
     }
 
@@ -1898,8 +1947,21 @@ class ResultViewerPanel(
         tableViewBtn.isSelected = viewName == "TABLE"
         val isTree = viewName == "TREE"
         expandCollapseToggleBtn.isVisible = isTree
-        cardLayout.show(cardsPanel, viewName)
+        if (!isLoading) {
+            cardLayout.show(cardsPanel, viewName)
+            val gen = dataGeneration.get()
+            if (currentResult != null && !isViewBuiltForGen(viewName, gen)) {
+                buildActiveViewAsync(gen)
+            }
+        }
         updateBatchDecryptControls()
+    }
+
+    private fun isViewBuiltForGen(viewName: String, gen: Long): Boolean = when (viewName) {
+        "TREE" -> treeBuiltGen == gen
+        "TABLE" -> tableBuiltGen == gen
+        "JSON" -> jsonBuiltGen == gen
+        else -> true
     }
 
     fun updateResults(
@@ -1909,17 +1971,107 @@ class ResultViewerPanel(
         previewBanner: String? = null
     ) {
         clearAllDecryptedPlaintext(repaintTable = false)
+        val gen = dataGeneration.incrementAndGet()
+        activeViewBuildFuture.getAndSet(null)?.cancel(true)
+
         this.currentDocs = result.documents.toMutableList()
         this.currentResult = result
         this.currentSkip = skip
         this.currentLimit = limit
         this.previewBannerText = previewBanner
+        this.treeBuiltGen = -1L
+        this.tableBuiltGen = -1L
+        this.jsonBuiltGen = -1L
 
         updateSummaryAndBadges()
-        populateTree(currentDocs)
-        populateRawJson(currentDocs)
-        populateTable(currentDocs)
         updateBatchDecryptControls()
+        buildActiveViewAsync(gen)
+    }
+
+    /**
+     * Applies trailing async metadata (O(1) cached count, conditional QUERY_PLANNER explain, and cached indexes)
+     * after primary documents are already rendered on screen — zero view rebuilds.
+     */
+    fun updateTrailingMetadata(meta: TrailingQueryMetadata) {
+        if (isDisposedFlag.get() || project.isDisposed) return
+        val existing = currentResult ?: return
+        val updatedIndexes = meta.detailedIndexes ?: existing.detailedIndexes
+        val updatedSummaries = if (meta.detailedIndexes != null) {
+            meta.detailedIndexes.map { it.summaryLine() }
+        } else {
+            existing.collectionIndexes
+        }
+        currentResult = existing.copy(
+            totalCount = meta.totalCount ?: existing.totalCount,
+            isApproximateCount = if (meta.totalCount != null) meta.isApproximateCount else existing.isApproximateCount,
+            scanType = meta.scanType ?: existing.scanType,
+            indexName = if (meta.scanType != null) meta.indexName else existing.indexName,
+            explainError = if (meta.scanType != null) meta.explainError else existing.explainError,
+            detailedIndexes = updatedIndexes,
+            collectionIndexes = updatedSummaries
+        )
+        updateSummaryAndBadges()
+    }
+
+    /**
+     * Lazy View Rendering: builds ONLY the currently active view (`TREE` / `TABLE` / `JSON`) off the EDT
+     * using `AppExecutorUtil.getAppExecutorService()`, leaving the other 2 views unbuilt until switched to.
+     */
+    private fun buildActiveViewAsync(gen: Long) {
+        if (isDisposedFlag.get() || project.isDisposed) return
+        val targetView = activeView
+        val docsSnapshot = currentDocs.toList()
+        val skipSnapshot = currentSkip
+
+        activeViewBuildFuture.getAndSet(null)?.cancel(true)
+        val future = AppExecutorUtil.getAppExecutorService().submit {
+            if (isDisposedFlag.get() || project.isDisposed || gen != dataGeneration.get()) return@submit
+            when (targetView) {
+                "TREE" -> {
+                    val builtRoot = buildTreeRootOffEdt(docsSnapshot, skipSnapshot)
+                    if (isDisposedFlag.get() || project.isDisposed || gen != dataGeneration.get()) return@submit
+                    ApplicationManager.getApplication().invokeLater {
+                        if (isDisposedFlag.get() || project.isDisposed || gen != dataGeneration.get()) return@invokeLater
+                        treeRoot = builtRoot
+                        treeModel.setRoot(builtRoot)
+                        treeBuiltGen = gen
+                        if (docsSnapshot.isNotEmpty()) {
+                            expandDocumentRootsOnly()
+                        }
+                        if (!isLoading) cardLayout.show(cardsPanel, activeView)
+                    }
+                }
+                "TABLE" -> {
+                    val cols = computeTableColumnsOffEdt(docsSnapshot)
+                    if (isDisposedFlag.get() || project.isDisposed || gen != dataGeneration.get()) return@submit
+                    ApplicationManager.getApplication().invokeLater {
+                        if (isDisposedFlag.get() || project.isDisposed || gen != dataGeneration.get()) return@invokeLater
+                        tableModel.setDocumentsPrecomputed(docsSnapshot, cols)
+                        applyTableHeaderDisplayLabelsAndWidths()
+                        tableBuiltGen = gen
+                        updateBatchDecryptControls()
+                        if (!isLoading) cardLayout.show(cardsPanel, activeView)
+                    }
+                }
+                "JSON" -> {
+                    val previewText = buildTruncatedRawJsonOffEdt(docsSnapshot)
+                    if (isDisposedFlag.get() || project.isDisposed || gen != dataGeneration.get()) return@submit
+                    ApplicationManager.getApplication().invokeLater {
+                        if (isDisposedFlag.get() || project.isDisposed || gen != dataGeneration.get() || rawJsonEditor.isDisposed) {
+                            return@invokeLater
+                        }
+                        ApplicationManager.getApplication().runWriteAction {
+                            if (!rawJsonEditor.isDisposed) {
+                                rawJsonDocument.setText(previewText)
+                            }
+                        }
+                        jsonBuiltGen = gen
+                        if (!isLoading) cardLayout.show(cardsPanel, activeView)
+                    }
+                }
+            }
+        }
+        activeViewBuildFuture.set(future)
     }
 
     private fun updateSummaryAndBadges() {
@@ -1952,6 +2104,15 @@ class ResultViewerPanel(
                 indexBadge.background = UiHelpers.COLOR_ORANGE_BG
                 indexBadge.foreground = UiHelpers.COLOR_ORANGE_FG
                 indexBadge.toolTipText = buildCollscanIndexHintTooltip(result.collectionIndexes)
+                indexBadge.isVisible = true
+            }
+            IndexScanType.NO_FILTER_PREVIEW -> {
+                indexBadge.text = I18n.t("result.badge.noFilterPreview")
+                indexBadge.background = UiHelpers.COLOR_BLUE_BG
+                indexBadge.foreground = UiHelpers.COLOR_BLUE_FG
+                val tip = StringUtil.escapeXmlEntities(I18n.t("result.badge.noFilterPreviewTooltip"))
+                val clickHint = StringUtil.escapeXmlEntities(I18n.t("result.badge.clickInspectHint"))
+                indexBadge.toolTipText = "<html><b>$tip</b><br/><i>$clickHint</i></html>"
                 indexBadge.isVisible = true
             }
             IndexScanType.UNKNOWN -> {
@@ -1994,29 +2155,24 @@ class ResultViewerPanel(
         return "<html><b>$warn</b><br/><br/><b>$header</b><br/>$bullets<br/><br/><i>$clickHint</i></html>"
     }
 
-    private fun populateTree(docs: List<BsonDocument>) {
-        treeRoot.removeAllChildren()
+    private fun buildTreeRootOffEdt(docs: List<BsonDocument>, skipOffset: Int): DefaultMutableTreeNode {
+        val root = DefaultMutableTreeNode("Results")
         if (docs.isEmpty()) {
-            treeRoot.add(DefaultMutableTreeNode(I18n.t("result.empty")))
+            root.add(DefaultMutableTreeNode(I18n.t("result.empty")))
         } else {
             docs.forEachIndexed { idx, doc ->
                 val idPreview = doc["_id"]?.let { UiHelpers.bsonIdRawText(it) } ?: "doc"
                 val docNode = DocTreeNode(
-                    displayLabel = "[${currentSkip + idx + 1}] $idPreview",
+                    displayLabel = "[${skipOffset + idx + 1}] $idPreview",
                     bsonDocument = doc,
-                    rawDocument = toRawDocument(doc),
+                    rawDocument = null,
                     docIndex = idx
                 )
                 addDocumentChildren(docNode, docNode, doc, "")
-                treeRoot.add(docNode)
+                root.add(docNode)
             }
         }
-        treeModel.reload()
-
-        // Expand ONLY top-level document roots via TreePath (keeps nested Object/Array collapsed)
-        if (docs.isNotEmpty()) {
-            expandDocumentRootsOnly()
-        }
+        return root
     }
 
     /**
@@ -2075,14 +2231,19 @@ class ResultViewerPanel(
         rootDocNode: DocTreeNode,
         parent: DefaultMutableTreeNode,
         doc: BsonDocument,
-        prefixPath: String
+        prefixPath: String,
+        depth: Int = 0
     ) {
+        if (depth >= 8) {
+            parent.add(DefaultMutableTreeNode("... ({ ${doc.size} fields }, truncated)"))
+            return
+        }
         for ((k, v) in doc) {
             val fieldPath = if (prefixPath.isEmpty()) k else "$prefixPath.$k"
             val child = FieldTreeNode(rootDocNode, k, v, fieldPath)
             when (v) {
-                is BsonDocument -> addDocumentChildren(rootDocNode, child, v, fieldPath)
-                is BsonArray -> addArrayChildren(rootDocNode, child, v, fieldPath)
+                is BsonDocument -> addDocumentChildren(rootDocNode, child, v, fieldPath, depth + 1)
+                is BsonArray -> addArrayChildren(rootDocNode, child, v, fieldPath, depth + 1)
                 else -> Unit
             }
             parent.add(child)
@@ -2093,34 +2254,60 @@ class ResultViewerPanel(
         rootDocNode: DocTreeNode,
         parent: DefaultMutableTreeNode,
         arr: BsonArray,
-        prefixPath: String
+        prefixPath: String,
+        depth: Int = 0
     ) {
-        arr.forEachIndexed { i, elem ->
+        if (depth >= 8) {
+            parent.add(DefaultMutableTreeNode("... ([ ${arr.size} items ], truncated)"))
+            return
+        }
+        val previewLimit = arr.size.coerceAtMost(UiHelpers.MAX_PREVIEW_ARRAY_ELEMENTS)
+        for (i in 0 until previewLimit) {
+            val elem = arr[i]
             val key = "[$i]"
             val fieldPath = if (prefixPath.isEmpty()) key else "$prefixPath.$key"
             val child = FieldTreeNode(rootDocNode, key, elem, fieldPath)
             when (elem) {
-                is BsonDocument -> addDocumentChildren(rootDocNode, child, elem, fieldPath)
-                is BsonArray -> addArrayChildren(rootDocNode, child, elem, fieldPath)
+                is BsonDocument -> addDocumentChildren(rootDocNode, child, elem, fieldPath, depth + 1)
+                is BsonArray -> addArrayChildren(rootDocNode, child, elem, fieldPath, depth + 1)
                 else -> Unit
             }
             parent.add(child)
         }
+        if (arr.size > previewLimit) {
+            parent.add(DefaultMutableTreeNode("... (+${arr.size - previewLimit} more items, truncated)"))
+        }
     }
 
-    private fun populateRawJson(docs: List<BsonDocument>) {
-        val text = if (docs.isEmpty()) {
-            "[]"
-        } else {
-            docs.joinToString(separator = ",\n", prefix = "[\n", postfix = "\n]") { doc ->
-                StringUtil.convertLineSeparators(MongoShellNormalizer.formatPrettyExtended(doc))
-                    .lines()
-                    .joinToString("\n") { "  $it" }
+    private fun buildTruncatedRawJsonOffEdt(docs: List<BsonDocument>): String {
+        if (docs.isEmpty()) return "[]"
+        val sb = StringBuilder("[\n")
+        for ((idx, doc) in docs.withIndex()) {
+            if (sb.length >= UiHelpers.MAX_JSON_PREVIEW_TOTAL_CHARS) {
+                val remaining = docs.size - idx
+                sb.append("  \"... (+$remaining more documents truncated for display preview; Export JSON contains full data)\"\n")
+                break
             }
+            val safeDoc = UiHelpers.buildDisplaySafePreviewDocument(doc)
+            val pretty = StringUtil.convertLineSeparators(MongoShellNormalizer.formatPrettyExtended(safeDoc))
+                .lines()
+                .joinToString("\n") { "  $it" }
+            sb.append(pretty)
+            if (idx < docs.lastIndex) sb.append(",\n") else sb.append("\n")
         }
-        ApplicationManager.getApplication().runWriteAction {
-            rawJsonDocument.setText(text)
+        sb.append("]")
+        return sb.toString()
+    }
+
+    private fun computeTableColumnsOffEdt(docs: List<BsonDocument>): List<String> {
+        val keys = linkedSetOf<String>()
+        if (docs.any { it.containsKey("_id") }) {
+            keys.add("_id")
         }
+        for (d in docs) {
+            keys.addAll(d.keys)
+        }
+        return keys.toList()
     }
 
     fun setJoinColumnOrigins(origins: Map<String, JoinColumnOrigin>) {
@@ -2169,6 +2356,7 @@ class ResultViewerPanel(
             tableViewBtn.text = I18n.t("result.view.table")
             prevBtn.text = I18n.t("result.prev")
             nextBtn.text = I18n.t("result.next")
+            loadingStatusLabel.text = I18n.t("result.loading")
             updateExpandCollapseToggleButton()
             updateSummaryAndBadges()
             updateBatchDecryptControls()
@@ -2180,6 +2368,9 @@ class ResultViewerPanel(
     }
 
     override fun dispose() {
+        isDisposedFlag.set(true)
+        dataGeneration.incrementAndGet()
+        activeViewBuildFuture.getAndSet(null)?.cancel(true)
         clearAllDecryptedPlaintext(repaintTable = false)
         activeCopyOverlayPopup?.let { if (!it.isDisposed) it.cancel() }
         if (!rawJsonEditor.isDisposed) {
@@ -2202,6 +2393,13 @@ class ResultViewerPanel(
             decryptedCells.clear()
             this.docs = documents.toMutableList()
             recomputeColumns()
+            fireTableStructureChanged()
+        }
+
+        fun setDocumentsPrecomputed(documents: List<BsonDocument>, precomputedColumns: List<String>) {
+            decryptedCells.clear()
+            this.docs = documents.toMutableList()
+            this.columns = precomputedColumns
             fireTableStructureChanged()
         }
 
