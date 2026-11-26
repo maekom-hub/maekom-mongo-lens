@@ -45,9 +45,11 @@ object PluginUpdateChecker {
 
     const val PLUGIN_ID = "com.maekom.mongolens"
     const val RELEASES_API_URL = "https://api.github.com/repos/maekom-hub/maekom-mongo-lens/releases/latest"
-    private const val FALLBACK_VERSION = "0.1.9"
+    private const val FALLBACK_VERSION = "0.2.0"
     private const val USER_AGENT = "maekom-mongo-lens"
-    private const val TEMP_DIR_PREFIX = "maekom-mongo-lens-update-"
+    private const val STAGING_DIR_NAME = "maekom-mongo-lens-staging"
+    private const val LEGACY_TEMP_DIR_NAME = "maekom-mongo-lens-updates"
+    private const val LEGACY_TMP_PREFIX = "maekom-mongo-lens-update-"
     private const val ASSET_PREFIX = "maekom-mongo-lens-"
     private const val MIN_PLUGIN_ZIP_BYTES = 10_240L
 
@@ -202,13 +204,14 @@ object PluginUpdateChecker {
                     indicator.fraction = 0.05
                     indicator.text = I18n.t("update.dialog.downloading", assetName)
 
-                    // 1. Clean up stale update temp dirs from previous runs (never use deleteOnExit)
+                    // 1. Clean up stale legacy tmp/staging folders ONLY right before starting a new download (never deleteOnExit)
                     cleanupPreviousUpdateTempDirs()
 
-                    // 2. Preserve original release asset filename inside a fresh temp directory
-                    val tempDir = Files.createTempDirectory(TEMP_DIR_PREFIX)
+                    // 2. Store ZIP outside IntelliJ's volatile `system/tmp` so IDE restart cleanup never deletes it before install
+                    val stagingDir = Paths.get(PathManager.getSystemPath(), STAGING_DIR_NAME)
+                    Files.createDirectories(stagingDir)
                     val safeFileName = Paths.get(assetName).fileName.toString()
-                    val targetZip = tempDir.resolve(safeFileName)
+                    val targetZip = stagingDir.resolve(safeFileName)
 
                     // 3. Download completely and ensure OutputStream is flushed & closed before verifying/installing
                     downloadFileWithProgress(validatedUri, targetZip, release.assetSize, indicator)
@@ -282,12 +285,27 @@ object PluginUpdateChecker {
     }
 
     private fun cleanupPreviousUpdateTempDirs() {
+        // Clean legacy v0.1.8 `PathManager.getTempPath()/maekom-mongo-lens-updates`
+        runCatching {
+            val legacyIdeTmp = Paths.get(PathManager.getTempPath(), LEGACY_TEMP_DIR_NAME)
+            if (Files.exists(legacyIdeTmp)) {
+                deleteDirectoryRecursivelyQuietly(legacyIdeTmp)
+            }
+        }
+        // Clean previous staging folder files inside `PathManager.getSystemPath()/maekom-mongo-lens-staging`
+        runCatching {
+            val stagingDir = Paths.get(PathManager.getSystemPath(), STAGING_DIR_NAME)
+            if (Files.isDirectory(stagingDir)) {
+                deleteDirectoryRecursivelyQuietly(stagingDir)
+            }
+        }
+        // Clean legacy v0.1.9 OS temp `maekom-mongo-lens-update-*` directories
         val tmpRoot = runCatching { Paths.get(System.getProperty("java.io.tmpdir")) }.getOrNull() ?: return
         if (!Files.isDirectory(tmpRoot)) return
         runCatching {
             Files.list(tmpRoot).use { stream ->
                 stream.filter { path ->
-                    Files.isDirectory(path) && path.fileName?.toString()?.startsWith(TEMP_DIR_PREFIX) == true
+                    Files.isDirectory(path) && path.fileName?.toString()?.startsWith(LEGACY_TMP_PREFIX) == true
                 }.forEach { staleDir ->
                     deleteDirectoryRecursivelyQuietly(staleDir)
                 }
