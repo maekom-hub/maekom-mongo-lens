@@ -89,6 +89,65 @@ spring:
 
 ---
 
+## 실무 핵심 기능 가이드 (v0.1.8+) / Key Feature Guides (v0.1.8+)
+
+### 1. 빠른 컬럼 선택 및 숨기기 (`Quick Column Chooser` / `SELECT` Mode)
+- **KO**: 복잡한 `$project` JSON을 직접 타이핑하지 않고 마우스 클릭만으로 원하는 컬럼만 골라 조회합니다.
+  1. `Table` 뷰에서 컬럼 헤더를 우클릭합니다.
+  2. **`[이 컬럼 숨기기]`** 또는 **`[표시할 컬럼 선택 (Project)...]`** 을 클릭합니다.
+  3. 체크박스에서 필요한 컬럼만 선택 후 **`[적용 및 재조회]`** 를 누르면 `Project` 입력창이 자동으로 펼쳐지며 쿼리가 반영됩니다.
+- **EN**: Select or hide columns with clicks instead of typing `$project` JSON manually.
+  1. Right-click any column header in `Table` view.
+  2. Click **`Hide This Column`** or **`Select Visible Columns (Project)...`**.
+  3. Check the desired columns and click **`Apply & Run`** — the `Project` bar expands automatically with the generated projection.
+- **예제 / Example** (`userId`, `status`, `createdAt`만 선택 시 / Selecting only `userId`, `status`, `createdAt`):
+  ```json
+  { "_id": 0, "userId": 1, "status": 1, "createdAt": 1 }
+  ```
+
+### 2. 참조 컬렉션 1-클릭 점프 & RDB 스타일 조인 뷰 (`Reference Jump & Collection Join View`)
+- **KO**: 외래키/식별자 필드를 따라 연관 컬렉션 문서를 새 탭에서 즉시 열거나, 두 이력 컬렉션(`A ⋈ B`)의 원하는 컬럼만 골라 RDB `LEFT JOIN`처럼 한 테이블로 합쳐 조회합니다.
+  - **단순 점프**: `userId` 등 참조 필드 우클릭 → **`[참조 컬렉션에서 조회 (새 탭)...]`** → 대상 컬렉션 선택 시 새 탭에서 자동 필터 조회 (`ObjectId` ↔ 24자리 hex 문자열 자동 변환 지원).
+  - **조인 뷰 (`auth_hst ⋈ temp_hst`)**: 기준 필드 우클릭 → **`[다른 컬렉션과 조인해서 보기...]`** → 대상 컬렉션 및 매칭 필드 선택(예: `user_id` ↔ `userId` 자동 매칭) → 양쪽 컬렉션에서 표시할 컬럼 체크 → **`[조인 탭으로 실행 ▶]`**.
+- **EN**: Jump to a referenced document in a new tab or join two collections (`A ⋈ B`) in an RDB `LEFT JOIN` table view.
+  - **Reference Jump**: Right-click a reference field (`userId`, etc.) → **`Find in Referenced Collection (New Tab)...`** → pick target collection (auto-coerces `ObjectId` ↔ 24-char hex string).
+  - **Join View (`auth_hst ⋈ temp_hst`)**: Right-click a source field → **`Join with Another Collection...`** → pick target collection & matching field (auto-matches `user_id` ↔ `userId`) → check columns from both sides → **`Run in Join Tab ▶`**.
+- **예제 / Example (실무 안전 파이프라인 / Safe Pre-Filtered Pipeline)**:
+  대용량 DB 보호를 위해 기존 `Filter`와 `Limit`을 먼저 적용해 압축한 뒤 `$lookup`을 수행합니다:
+  ```javascript
+  // auth_hst ⋈ temp_hst (최신 1건 매칭 및 원하는 컬럼 평탄화 조회 / Match latest 1 & flatten columns)
+  [
+    { "$match": { "status": "FAIL" } },
+    { "$limit": 50 },
+    { "$lookup": { ... } },
+    { "$project": { "user_id": 1, "status": 1, "temp_hst_status": "$_joined.status", "item1": "$_joined.item1" } }
+  ]
+  ```
+
+### 3. `ObjectId` 및 `Date` 시각 표시(KST/UTC 병기) & UTC 기간 범위 필터 (`Time Display & Range Filter`)
+- **KO**: 원본 `ObjectId`와 `ISODate` 값은 그대로 보존하면서 사람이 읽기 쉬운 KST/UTC 시각을 함께 보여주고, 클릭 두 번으로 해당 시각 기준 기간 필터를 생성합니다.
+  - **시각 확인**: `Tree` 뷰에서는 `ObjectId("...")` 우측 회색 라벨로, `Table` 뷰에서는 셀 마우스 호버 툴팁으로 `2026-11-26 10:30:15 KST (UTC 01:30:15)` 확인.
+  - **범위 필터 생성**: `ObjectId` 셀 우클릭 → **`[생성 시각 기준 필터]`** → **`이 시각 이후 생성 문서만 조회 ($gte)`** 또는 **`이 시각 이전 생성 문서만 조회 ($lte)`** 선택.
+- **EN**: Display human-readable KST/UTC timestamps alongside raw `ObjectId` and `ISODate` values, and generate UTC-based range filters in two clicks.
+  - **View Time**: Inline gray label next to `ObjectId("...")` in `Tree` view, or cell hover tooltip (`2026-11-26 10:30:15 KST (UTC 01:30:15)`) in `Table` view.
+  - **Range Filter**: Right-click an `ObjectId` cell → **`Filter by Creation Time`** → **`Find docs created at/after this time ($gte)`** or **`Find docs created at/before this time ($lte)`**.
+- **예제 / Example** (시차 오차 없는 원본 Unix Epoch(UTC) 경계값 자동 생성 / Exact UTC epoch boundary):
+  ```json
+  { "_id": { "$gte": ObjectId("67452a1b0000000000000000") } }
+  ```
+
+### 4. 문서 간 Diff 비교 (`Document Diff` & Baseline 핀 고정)
+- **KO**: 같은 목록 내 두 문서나, API/배치 실행 전후·다른 환경(`dev` vs `prd`) 문서를 키 순서 차이 없이 깔끔하게 비교합니다.
+  - **2개 문서 즉시 비교**: `Table` 또는 `Tree`에서 `Ctrl`/`Shift` 클릭으로 2개 문서 선택 후 우클릭 → **`[선택한 2개 문서 Diff 비교]`**.
+  - **Baseline 고정 비교**: 기준 문서 우클릭 → **`[비교 기준(Baseline)으로 고정]`** (상단 바에 `[📌 기준: ... ✕]` 배지 표시) → 재조회 또는 다른 탭에서 대상 문서 우클릭 → **`[고정된 기준과 Diff 비교]`**.
+  - **특징**: 필드 키를 알파벳순으로 자동 정렬하여 실제 값이 바뀐 부분만 정확히 하이라이트하며, 화면에 복호화가 활성화된 경우 복호화된 평문 JSON 기준으로 비교합니다.
+- **EN**: Compare two documents in the same list or across environments (`dev` vs `prd`) using IntelliJ's built-in Diff viewer without field-order noise.
+  - **Compare 2 Selected Docs**: `Ctrl`/`Shift`-click 2 documents in `Table` or `Tree` → right-click → **`Compare 2 Selected Documents (Diff)`**.
+  - **Compare with Pinned Baseline**: Right-click a reference document → **`Pin as Diff Baseline`** (`[📌 Baseline: ... ✕]` badge appears) → right-click any target document (even after re-querying or in another tab) → **`Compare with Pinned Baseline`**.
+  - **Highlights**: Keys are canonically sorted alphabetically, and if decryption is active on screen, Diff compares the decrypted plaintext JSON.
+
+---
+
 ## 빌드 방법 / Build from Source
 
 ```bash
