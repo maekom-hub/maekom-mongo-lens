@@ -60,9 +60,14 @@ class JoinViewDialog(
     initialLocalField: String?,
     sourceTopFields: List<String>,
     private val sourceFieldCategories: Map<String, String>,
+    private val sourceJoinKeyCategories: Map<String, String> = sourceFieldCategories,
     allCollectionsInDb: List<String>,
     private val existingJoinSpec: JoinSpec? = null
 ) : DialogWrapper(project) {
+
+    private data class JoinLimitOption(val value: Int?) {
+        override fun toString(): String = value?.toString() ?: I18n.t("join.limit.unlimited")
+    }
 
     private data class SourceKeyOption(
         val sourceRef: JoinSourceRef,
@@ -86,6 +91,8 @@ class JoinViewDialog(
         var allColumns: MutableList<String> = mutableListOf(),
         var selectedColumns: LinkedHashSet<String> = linkedSetOf(),
         var fieldCategories: MutableMap<String, String> = linkedMapOf(),
+        var joinKeyFields: MutableList<String> = mutableListOf(),
+        var joinFieldCategories: MutableMap<String, String> = linkedMapOf(),
         var conditions: MutableList<JoinCondition> = mutableListOf(),
         var excludeUnmatched: Boolean = true,
         var schemaLoaded: Boolean = false,
@@ -101,6 +108,15 @@ class JoinViewDialog(
         existingJoinSpec?.let { spec ->
             addAll(spec.allLeftFields)
             addAll(spec.selectedLeftFields)
+        }
+    }.map { it.trim() }.filter { it.isNotEmpty() }.distinct().ifEmpty { listOf("_id") }
+
+    // Includes top-level fields PLUS nested Object & Array-of-Objects dot paths (e.g. `items.product_id`)
+    private val leftJoinKeyFields: List<String> = buildList {
+        addAll(sourceJoinKeyCategories.keys)
+        addAll(leftFields)
+        initialLocalField?.takeIf { it.isNotBlank() }?.let { add(it.trim()) }
+        existingJoinSpec?.let { spec ->
             spec.baseConditions.forEach { add(it.field) }
             spec.targets.filter { it.sourceRef is JoinSourceRef.Base }.forEach { add(it.localField) }
         }
@@ -167,6 +183,16 @@ class JoinViewDialog(
     private val latestOneRadio = JBRadioButton(I18n.t("join.dialog.strategyLatestOne"), true)
     private val unwindAllRadio = JBRadioButton(I18n.t("join.dialog.strategyUnwindAll"), false)
     private val excludeUnmatchedCheckBox = JBCheckBox(I18n.t("join.dialog.innerJoinCheck"), true)
+
+    private val joinLimitChoices: Array<JoinLimitOption> =
+        JoinSpec.JOIN_LIMIT_OPTIONS.map { JoinLimitOption(it) }.toTypedArray()
+    private val joinLimitCombo = ComboBox(joinLimitChoices).apply {
+        val initLimit = if (existingJoinSpec != null) existingJoinSpec.limitOption else 50
+        selectedItem = joinLimitChoices.firstOrNull { it.value == initLimit }
+            ?: joinLimitChoices.firstOrNull { it.value == 50 }
+            ?: joinLimitChoices.first()
+        preferredSize = Dimension(JBUI.scale(148), JBUI.scale(26))
+    }
 
     // WHERE AND conditions builder
     private val addConditionBtn = JButton(I18n.t("join.dialog.addCondition")).apply {
@@ -309,9 +335,11 @@ class JoinViewDialog(
 
         fun refreshFieldChoices(preserveCurrentText: Boolean, explicitText: String? = null) {
             val savedText = explicitText ?: if (preserveCurrentText) currentField() else null
-            val activeRightFields = activeDraft().allColumns
+            val activeRightFields = activeDraft().let { d ->
+                (d.joinKeyFields + d.allColumns).distinct()
+            }
             val choices = when (currentTarget()) {
-                JoinConditionTarget.LEFT -> leftFields
+                JoinConditionTarget.LEFT -> leftJoinKeyFields
                 JoinConditionTarget.RIGHT -> activeRightFields
             }
             val mergedChoices = buildList {
@@ -373,6 +401,8 @@ class JoinViewDialog(
                         matchStrategy = t.matchStrategy,
                         allColumns = mergedCols,
                         selectedColumns = LinkedHashSet(t.selectedColumns),
+                        joinKeyFields = (mergedCols + t.foreignField + t.conditions.map { it.field })
+                            .map { it.trim() }.filter { it.isNotEmpty() }.distinct().toMutableList(),
                         conditions = t.conditions.toMutableList(),
                         excludeUnmatched = t.excludeUnmatched,
                         schemaLoaded = false,
@@ -384,9 +414,10 @@ class JoinViewDialog(
             val defaultTarget = candidateCollections.firstOrNull { it != sourceCollection }
                 ?: candidateCollections.firstOrNull()
                 ?: sourceCollection
-            val defaultLocal = initialLocalField?.substringBefore('.')?.takeIf { it in leftFields }
-                ?: leftFields.firstOrNull { it != "_id" && (it.endsWith("Id") || it.endsWith("_id")) }
-                ?: leftFields.first()
+            val defaultLocal = initialLocalField?.trim()?.takeIf { it in leftJoinKeyFields }
+                ?: initialLocalField?.substringBefore('.')?.takeIf { it in leftJoinKeyFields }
+                ?: leftJoinKeyFields.firstOrNull { it != "_id" && (it.endsWith("Id") || it.endsWith("_id")) }
+                ?: leftJoinKeyFields.first()
             targetDrafts.add(
                 MutableTargetDraft(
                     targetCollection = defaultTarget,
@@ -638,7 +669,7 @@ class JoinViewDialog(
             rebuildSourceKeyCombo(activeTargetIdx, draft)
 
             foreignFieldModel.removeAllElements()
-            val foreignPool = (draft.allColumns + draft.foreignField).filter { it.isNotBlank() }.distinct()
+            val foreignPool = (draft.joinKeyFields + draft.allColumns + draft.foreignField).filter { it.isNotBlank() }.distinct()
             foreignPool.forEach { foreignFieldModel.addElement(it) }
             foreignFieldCombo.selectedItem = draft.foreignField
             foreignFieldCombo.editor?.item = draft.foreignField
@@ -668,13 +699,13 @@ class JoinViewDialog(
     private fun rebuildSourceKeyCombo(targetIdx: Int, draft: MutableTargetDraft) {
         sourceKeyModel.removeAllElements()
         val options = mutableListOf<SourceKeyOption>()
-        for (lf in leftFields) {
+        for (lf in leftJoinKeyFields) {
             options.add(SourceKeyOption(JoinSourceRef.Base, sourceCollection, lf))
         }
         // Chain Join support: allow linking from ANY previous join target (0 until targetIdx)
         for (prevIdx in 0 until targetIdx) {
             val prev = targetDrafts[prevIdx]
-            val prevFields = (prev.allColumns + prev.selectedColumns + prev.foreignField)
+            val prevFields = (prev.joinKeyFields + prev.allColumns + prev.selectedColumns + prev.foreignField)
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
                 .distinct()
@@ -804,14 +835,18 @@ class JoinViewDialog(
                 draft.allColumns.clear()
                 draft.selectedColumns.clear()
                 draft.fieldCategories.clear()
+                draft.joinKeyFields.clear()
+                draft.joinFieldCategories.clear()
             }
         } else if (schema.documentCount == 0 || schema.fieldTypes.isEmpty()) {
             draft.lastError = null
             draft.isEmptyCollection = true
             draft.fieldCategories.clear()
+            draft.joinFieldCategories.clear()
             if (!restoring) {
                 draft.allColumns.clear()
                 draft.selectedColumns.clear()
+                draft.joinKeyFields.clear()
                 draft.foreignField = draft.localField.ifBlank { "_id" }
             }
         } else {
@@ -819,15 +854,23 @@ class JoinViewDialog(
             draft.isEmptyCollection = false
             draft.fieldCategories.clear()
             draft.fieldCategories.putAll(schema.fieldTypes)
+            draft.joinFieldCategories.clear()
+            draft.joinFieldCategories.putAll(schema.joinFieldTypes)
 
             val sampledKeys = schema.fieldTypes.keys.toList()
+            val sampledJoinKeys = (schema.joinFieldTypes.keys + sampledKeys).distinct()
+            draft.joinKeyFields.clear()
+            draft.joinKeyFields.addAll(
+                (sampledJoinKeys + draft.foreignField + draft.conditions.map { it.field })
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .distinct()
+            )
             if (restoring) {
                 val merged = buildList {
                     addAll(sampledKeys)
                     addAll(draft.allColumns)
                     addAll(draft.selectedColumns)
-                    add(draft.foreignField)
-                    draft.conditions.forEach { add(it.field) }
                 }.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
                 draft.allColumns.clear()
                 draft.allColumns.addAll(merged)
@@ -844,7 +887,7 @@ class JoinViewDialog(
             suppressEditorEvents = true
             try {
                 foreignFieldModel.removeAllElements()
-                val pool = (draft.allColumns + draft.foreignField).filter { it.isNotBlank() }.distinct()
+                val pool = (draft.joinKeyFields + draft.allColumns + draft.foreignField).filter { it.isNotBlank() }.distinct()
                 pool.forEach { foreignFieldModel.addElement(it) }
                 foreignFieldCombo.selectedItem = draft.foreignField
                 foreignFieldCombo.editor?.item = draft.foreignField
@@ -869,17 +912,20 @@ class JoinViewDialog(
     }
 
     private fun autoMatchForeignField(draft: MutableTargetDraft) {
-        if (draft.allColumns.isEmpty()) return
-        val local = draft.localField.trim()
-        val snake = ReferenceJumpHelper.camelToSnake(local)
-        val camel = ReferenceJumpHelper.snakeToCamel(local)
+        val candidates = (draft.joinKeyFields + draft.allColumns).distinct()
+        if (candidates.isEmpty()) return
+        val localFull = draft.localField.trim()
+        val localLeaf = localFull.substringAfterLast('.')
+        val snake = ReferenceJumpHelper.camelToSnake(localLeaf)
+        val camel = ReferenceJumpHelper.snakeToCamel(localLeaf)
 
         val matched = when {
-            local.isNotEmpty() && local != "_id" && local in draft.allColumns -> local
-            snake.isNotEmpty() && snake != "_id" && snake in draft.allColumns -> snake
-            camel.isNotEmpty() && camel != "_id" && camel in draft.allColumns -> camel
-            "_id" in draft.allColumns -> "_id"
-            else -> draft.allColumns.first()
+            localFull.isNotEmpty() && localFull != "_id" && localFull in candidates -> localFull
+            localLeaf.isNotEmpty() && localLeaf != "_id" && localLeaf in candidates -> localLeaf
+            snake.isNotEmpty() && snake != "_id" && snake in candidates -> snake
+            camel.isNotEmpty() && camel != "_id" && camel in candidates -> camel
+            "_id" in candidates -> "_id"
+            else -> candidates.first()
         }
         draft.foreignField = matched
         if (draft === activeDraft()) {
@@ -905,14 +951,19 @@ class JoinViewDialog(
 
         val sourceOpt = sourceKeyCombo.selectedItem as? SourceKeyOption
         val localCat: String? = when (val ref = sourceOpt?.sourceRef) {
-            is JoinSourceRef.Base -> sourceFieldCategories[sourceOpt.fieldName]
+            is JoinSourceRef.Base -> sourceJoinKeyCategories[sourceOpt.fieldName]
+                ?: sourceFieldCategories[sourceOpt.fieldName]
                 ?: if (sourceOpt.fieldName == "_id") "ObjectId" else null
-            is JoinSourceRef.PreviousTarget -> targetDrafts.getOrNull(ref.targetIndex)?.fieldCategories?.get(sourceOpt.fieldName)
-                ?: if (sourceOpt.fieldName == "_id") "ObjectId" else null
+            is JoinSourceRef.PreviousTarget -> {
+                val prevDraft = targetDrafts.getOrNull(ref.targetIndex)
+                prevDraft?.joinFieldCategories?.get(sourceOpt.fieldName)
+                    ?: prevDraft?.fieldCategories?.get(sourceOpt.fieldName)
+                    ?: if (sourceOpt.fieldName == "_id") "ObjectId" else null
+            }
             null -> null
         }
         val foreign = currentForeignFieldText()
-        val foreignCat = draft.fieldCategories[foreign]
+        val foreignCat = draft.joinFieldCategories[foreign] ?: draft.fieldCategories[foreign]
 
         if (localCat != null && foreignCat != null && localCat != foreignCat) {
             statusOrMismatchLabel.text = "⚠ ${I18n.t("join.dialog.typeMismatchWarning", localCat, foreignCat)}"
@@ -1076,14 +1127,24 @@ class JoinViewDialog(
             .addComponent(statusOrMismatchLabel, 2)
             .panel
 
-        // 3. Match Strategy Radios
-        val strategyRow = JPanel(FlowLayout(FlowLayout.LEFT, 12, 0)).apply {
+        // 3. Match Strategy Radios + Result Limit selector
+        val strategyRow = JPanel(BorderLayout(8, 0)).apply {
             border = BorderFactory.createCompoundBorder(
                 BorderFactory.createTitledBorder(I18n.t("join.dialog.strategySection")),
                 JBUI.Borders.empty(2, 6)
             )
-            add(latestOneRadio)
-            add(unwindAllRadio)
+            val radios = JPanel(FlowLayout(FlowLayout.LEFT, 12, 0)).apply {
+                isOpaque = false
+                add(latestOneRadio)
+                add(unwindAllRadio)
+            }
+            val limitPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply {
+                isOpaque = false
+                add(JBLabel(I18n.t("join.dialog.limitLabel")))
+                add(joinLimitCombo)
+            }
+            add(radios, BorderLayout.CENTER)
+            add(limitPanel, BorderLayout.EAST)
         }
 
         // 4. WHERE AND Exclusion Conditions Builder
@@ -1206,12 +1267,15 @@ class JoinViewDialog(
             it.field.isNotBlank() && (!it.operator.requiresValue || it.rawValue.isNotBlank())
         }
 
+        val selectedLimitOption: Int? = (joinLimitCombo.selectedItem as? JoinLimitOption)?.value
+
         return JoinSpec(
             leftCollection = sourceCollection,
             allLeftFields = leftFields,
             selectedLeftFields = selectedLeft,
             baseConditions = cleanBaseConds,
-            targets = builtTargets
+            targets = builtTargets,
+            limitOption = selectedLimitOption
         )
     }
 }

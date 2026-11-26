@@ -85,7 +85,8 @@ data class JoinSpec(
     val allLeftFields: List<String>,
     val selectedLeftFields: List<String>,
     val baseConditions: List<JoinCondition> = emptyList(),
-    val targets: List<JoinTargetSpec>
+    val targets: List<JoinTargetSpec>,
+    val limitOption: Int? = 50 // null = Unlimited (safely capped at MAX_UNLIMITED_DOCS)
 ) {
     val primaryRightCollection: String
         get() = targets.firstOrNull()?.targetCollection.orEmpty()
@@ -248,37 +249,46 @@ data class JoinSpec(
 
     /**
      * Builds the AWS DocumentDB & MongoDB 100% compatible sequential Multi-Join Aggregation Pipeline:
-     * 1. Pre-filter base collection (top Filter + baseConditions) -> $sort -> $skip -> $limit
-     * 2. For each target[i] sequentially:
-     *    - Standard localField/foreignField $lookup -> as: "_joined_$i" (ZERO let/pipeline!)
-     *      (supports Star Join from BASE and Chain Join from "_joined_$k.<field>")
-     *    - LATEST_ONE: $addFields + $cond($isArray) + ($filter if conditions exist) + $arrayElemAt(-1)
-     *    - UNWIND_ALL: $unwind(preserveNullAndEmptyArrays: true) + $match (or $filter before $unwind for LEFT JOIN)
-     *    - If target.excludeUnmatched: $match { "_joined_$i": { "$ne": null } } immediately
-     * 3. Final flat 1D $project mapping every selected base & target column to its unique `resultFieldKey`
+     * 1. Base `$match` (top Filter + baseConditions)
+     * 2. Deterministic `$sort` (user sort + `_id: 1` tie-breaker, or default `{ _id: -1 }` so pages never drift/duplicate)
+     * 3. For each target[i] sequentially:
+     *    - Standard localField/foreignField `$lookup` -> as: `_joined_$i` (ZERO `let`/`pipeline`, natively handles array-of-objects paths!)
+     *    - `LATEST_ONE`: `$addFields` + `$cond($isArray)` + (`$filter` if conditions exist) + `$arrayElemAt(-1)`
+     *    - `UNWIND_ALL`: `$unwind(preserveNullAndEmptyArrays: true)` + `$match` (or `$filter` before `$unwind` for LEFT JOIN)
+     *    - If `target.excludeUnmatched`: `$match { "_joined_$i": { "$ne": null } }` immediately
+     * 4. Post-Join single `$skip(pageIndex * pageSize)` & `$limit(pageSize + 1)` (NO `$facet`!; Unlimited omits `$skip` and caps at 5,000)
+     * 5. Final flat 1D `$project` mapping every selected base & target column to its unique `resultFieldKey`
      */
     fun buildPipeline(
         filter: BsonDocument,
         sort: BsonDocument,
-        skip: Int,
-        limit: Int
+        pageIndex: Int = 0,
+        pageSize: Int? = limitOption,
+        probeForNextPage: Boolean = false
     ): List<BsonDocument> {
         val stages = mutableListOf<BsonDocument>()
 
-        // Stage 1: Base collection pre-filter, sort, skip, limit BEFORE any $lookup
+        // Stage 1: Base collection pre-filter
         val effectiveLeftFilter = buildEffectiveLeftFilter(filter)
         if (!effectiveLeftFilter.isEmpty()) {
             stages.add(BsonDocument("\$match", effectiveLeftFilter))
         }
-        if (!sort.isEmpty()) {
-            stages.add(BsonDocument("\$sort", sort))
-        }
-        if (skip > 0) {
-            stages.add(BsonDocument("\$skip", BsonInt32(skip)))
-        }
-        stages.add(BsonDocument("\$limit", BsonInt32(limit.coerceIn(1, 5000))))
 
-        // Stage 2: Sequential $lookup + per-target conditions + exclusion for each target[i]
+        // Stage 2: Deterministic $sort (always ensure _id tie-breaker so pagination is 100% stable)
+        val effectiveSort = BsonDocument()
+        if (sort.isEmpty()) {
+            effectiveSort["_id"] = BsonInt32(-1)
+        } else {
+            for ((k, v) in sort) {
+                effectiveSort[k] = v
+            }
+            if (!effectiveSort.containsKey("_id")) {
+                effectiveSort["_id"] = BsonInt32(1)
+            }
+        }
+        stages.add(BsonDocument("\$sort", effectiveSort))
+
+        // Stage 3: Sequential $lookup + per-target conditions + exclusion for each target[i]
         targets.forEachIndexed { idx, target ->
             val joinAlias = "_joined_$idx"
             val resolvedLocalField = when (val src = target.sourceRef) {
@@ -289,7 +299,7 @@ data class JoinSpec(
                 }
             }
 
-            // Standard localField / foreignField $lookup (100% AWS DocumentDB compatible)
+            // Standard localField / foreignField $lookup (100% AWS DocumentDB compatible; natively traverses array-of-objects dot paths)
             val lookupDoc = BsonDocument()
                 .append("from", BsonString(target.targetCollection))
                 .append("localField", BsonString(resolvedLocalField))
@@ -403,7 +413,22 @@ data class JoinSpec(
             }
         }
 
-        // Stage 3: Final flat 1D $project using authoritative ColumnOrigin keys
+        // Stage 4: Single Post-Join $skip & $limit (strictly AFTER $lookup & exclusion $match!)
+        if (pageSize != null) {
+            val safeSize = pageSize.coerceIn(1, MAX_UNLIMITED_DOCS)
+            val offset = pageIndex.coerceAtLeast(0) * safeSize
+            if (offset > 0) {
+                stages.add(BsonDocument("\$skip", BsonInt32(offset)))
+            }
+            val limitValue = if (probeForNextPage) safeSize + 1 else safeSize
+            stages.add(BsonDocument("\$limit", BsonInt32(limitValue)))
+        } else {
+            // Unlimited mode: omit $skip, enforce 5,000-doc safety cap
+            val capLimit = if (probeForNextPage) MAX_UNLIMITED_DOCS + 1 else MAX_UNLIMITED_DOCS
+            stages.add(BsonDocument("\$limit", BsonInt32(capLimit)))
+        }
+
+        // Stage 5: Final flat 1D $project using authoritative ColumnOrigin keys
         val origins = columnOriginsByResultKey()
         val proj = BsonDocument()
         if ("_id" !in origins || origins["_id"]?.isBase != true) {
@@ -427,8 +452,8 @@ data class JoinSpec(
     fun formatPipelineJsonArray(
         filterRaw: String?,
         sortRaw: String?,
-        skip: Int,
-        limit: Int
+        pageIndex: Int,
+        pageSize: Int?
     ): String {
         val filterDoc = try {
             MongoShellNormalizer.parseBsonDocument(filterRaw?.trim().orEmpty().ifEmpty { "{}" })
@@ -440,7 +465,7 @@ data class JoinSpec(
         } catch (_: Throwable) {
             BsonDocument()
         }
-        val stages = buildPipeline(filterDoc, sortDoc, skip, limit)
+        val stages = buildPipeline(filterDoc, sortDoc, pageIndex, pageSize, probeForNextPage = false)
         return stages.joinToString(separator = ",\n", prefix = "[\n", postfix = "\n]") { stage ->
             MongoShellNormalizer.formatPrettyExtended(stage)
                 .lines()
@@ -451,10 +476,10 @@ data class JoinSpec(
     fun toMongoshScript(
         filterRaw: String?,
         sortRaw: String?,
-        skip: Int,
-        limit: Int
+        pageIndex: Int,
+        pageSize: Int?
     ): String {
-        val prettyArray = formatPipelineJsonArray(filterRaw, sortRaw, skip, limit)
+        val prettyArray = formatPipelineJsonArray(filterRaw, sortRaw, pageIndex, pageSize)
         return MongoShellNormalizer.toMongoshAggregateCommand(leftCollection, prettyArray)
     }
 
@@ -493,9 +518,36 @@ data class JoinSpec(
         val field = cond.field.trim()
         val itemRef = BsonString("\$\$item.$field")
         val baseFieldName = field.substringAfterLast('.')
+        val mayBeArrayOfObjects = field.contains('.')
         return when (cond.operator) {
-            JoinConditionOperator.EQ -> BsonDocument("\$eq", BsonArray(listOf(itemRef, wrapExprLiteral(parseTypedValue(baseFieldName, cond.rawValue)))))
-            JoinConditionOperator.NE -> BsonDocument("\$ne", BsonArray(listOf(itemRef, wrapExprLiteral(parseTypedValue(baseFieldName, cond.rawValue)))))
+            JoinConditionOperator.EQ -> {
+                val lit = wrapExprLiteral(parseTypedValue(baseFieldName, cond.rawValue))
+                if (mayBeArrayOfObjects) {
+                    BsonDocument(
+                        "\$cond",
+                        BsonDocument()
+                            .append("if", BsonDocument("\$isArray", itemRef))
+                            .append("then", BsonDocument("\$in", BsonArray(listOf(lit, itemRef))))
+                            .append("else", BsonDocument("\$eq", BsonArray(listOf(itemRef, lit))))
+                    )
+                } else {
+                    BsonDocument("\$eq", BsonArray(listOf(itemRef, lit)))
+                }
+            }
+            JoinConditionOperator.NE -> {
+                val lit = wrapExprLiteral(parseTypedValue(baseFieldName, cond.rawValue))
+                if (mayBeArrayOfObjects) {
+                    BsonDocument(
+                        "\$cond",
+                        BsonDocument()
+                            .append("if", BsonDocument("\$isArray", itemRef))
+                            .append("then", BsonDocument("\$not", BsonArray(listOf(BsonDocument("\$in", BsonArray(listOf(lit, itemRef)))))))
+                            .append("else", BsonDocument("\$ne", BsonArray(listOf(itemRef, lit))))
+                    )
+                } else {
+                    BsonDocument("\$ne", BsonArray(listOf(itemRef, lit)))
+                }
+            }
             JoinConditionOperator.GT -> BsonDocument("\$gt", BsonArray(listOf(itemRef, wrapExprLiteral(parseTypedValue(baseFieldName, cond.rawValue)))))
             JoinConditionOperator.GTE -> BsonDocument("\$gte", BsonArray(listOf(itemRef, wrapExprLiteral(parseTypedValue(baseFieldName, cond.rawValue)))))
             JoinConditionOperator.LT -> BsonDocument("\$lt", BsonArray(listOf(itemRef, wrapExprLiteral(parseTypedValue(baseFieldName, cond.rawValue)))))
@@ -503,7 +555,28 @@ data class JoinSpec(
             JoinConditionOperator.IN -> {
                 val arr = parseInList(baseFieldName, cond.rawValue)
                 val safeArr = BsonArray(arr.map { wrapExprLiteral(it) })
-                BsonDocument("\$in", BsonArray(listOf(itemRef, safeArr)))
+                if (mayBeArrayOfObjects) {
+                    BsonDocument(
+                        "\$cond",
+                        BsonDocument()
+                            .append("if", BsonDocument("\$isArray", itemRef))
+                            .append(
+                                "then",
+                                BsonDocument(
+                                    "\$gt",
+                                    BsonArray(
+                                        listOf(
+                                            BsonDocument("\$size", BsonDocument("\$setIntersection", BsonArray(listOf(itemRef, safeArr)))),
+                                            BsonInt32(0)
+                                        )
+                                    )
+                                )
+                            )
+                            .append("else", BsonDocument("\$in", BsonArray(listOf(itemRef, safeArr))))
+                    )
+                } else {
+                    BsonDocument("\$in", BsonArray(listOf(itemRef, safeArr)))
+                }
             }
             JoinConditionOperator.IS_NOT_EMPTY -> {
                 // Normalize missing field -> null via $ifNull so missing fields are treated identically to null
@@ -513,7 +586,8 @@ data class JoinSpec(
                     BsonArray(
                         listOf(
                             BsonDocument("\$ne", BsonArray(listOf(normalized, BsonNull.VALUE))),
-                            BsonDocument("\$ne", BsonArray(listOf(normalized, BsonString(""))))
+                            BsonDocument("\$ne", BsonArray(listOf(normalized, BsonString("")))),
+                            BsonDocument("\$ne", BsonArray(listOf(normalized, BsonArray())))
                         )
                     )
                 )
@@ -525,7 +599,8 @@ data class JoinSpec(
                     BsonArray(
                         listOf(
                             BsonDocument("\$eq", BsonArray(listOf(normalized, BsonNull.VALUE))),
-                            BsonDocument("\$eq", BsonArray(listOf(normalized, BsonString(""))))
+                            BsonDocument("\$eq", BsonArray(listOf(normalized, BsonString("")))),
+                            BsonDocument("\$eq", BsonArray(listOf(normalized, BsonArray())))
                         )
                     )
                 )
@@ -542,6 +617,9 @@ data class JoinSpec(
     }
 
     companion object {
+        const val MAX_UNLIMITED_DOCS = 5000
+        val JOIN_LIMIT_OPTIONS: List<Int?> = listOf(20, 50, 100, 500, null)
+
         private val hex24Regex = Regex("^[0-9a-fA-F]{24}$")
         private val intRegex = Regex("^-?(?:0|[1-9]\\d*)$")
         private val decimalRegex = Regex("^-?(?:0|[1-9]\\d*)\\.\\d+$")

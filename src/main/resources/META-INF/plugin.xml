@@ -4,14 +4,26 @@
     <vendor url="https://github.com/maekom-hub/maekom-mongo-lens">maekom-hub</vendor>
 
     <description><![CDATA[
-        <b>Maekom Mongo Lens</b> provides a Zero-Config MongoDB Compass-style GUI directly inside IntelliJ IDEA Community &amp; Ultimate.<br/><br/>
+        <b>Maekom Mongo Lens</b> provides a Zero-Config MongoDB &amp; AWS DocumentDB Compass-style GUI directly inside IntelliJ IDEA Community &amp; Ultimate.<br/><br/>
         <ul>
             <li><b>Zero-Config Spring Boot YAML Discovery:</b> Automatically parses single &amp; multi-document <code>application*.yml</code> files, resolves <code>${VAR:default}</code> placeholders and <code>.env</code>, and protects PRD environments with Read-Only lock.</li>
-            <li><b>Compass-Style Query Workspace:</b> Multi-tab Find workspace with Filter/Project/Sort JSON editors, field auto-completion, instant Limit stepping, Smart <code>$in</code> builder, Mongo Shell normalizer, and Tree / Raw JSON / Table viewers with index scan badges.</li>
-            <li><b>Bidirectional Aggregation Pipeline Builder:</b> Switch seamlessly between visual stage cards (with per-stage ON/OFF toggles &amp; 5-doc stage preview) and raw JSON script.</li>
-            <li><b>In-App GitHub Releases Updater &amp; Real-time KO/EN UI:</b> Check and install updates from GitHub Releases and toggle Korean/English without restarting the IDE.</li>
+            <li><b>Compass-Style Query Workspace &amp; Smart Quick Filters:</b> Multi-tab Find workspace with Filter/Project/Sort JSON editors, 5-group context menu with multi-selection Smart Quick Filter (<code>=</code>, <code>!=</code>, <code>$in</code>, <code>$nin</code>, Date <code>$gte~$lte</code>, <code>AND</code>/<code>$or</code>, <code>$exists</code>) &amp; Sort, Smart <code>$in</code> builder, and Document Diff.</li>
+            <li><b>Read-Only Index Inspector &amp; ESR Query Guide:</b> Accurate MongoDB &amp; AWS DocumentDB <code>IXSCAN</code>/<code>COLLSCAN</code>/<code>UNKNOWN</code> detection, unified cached index viewer, one-click Filter templates, and copy-only ESR <code>createIndex</code> recommendations.</li>
+            <li><b>AWS DocumentDB-Compatible Multi-Join View &amp; Bidirectional Aggregation Builder:</b> Star &amp; Chain joins (<code>A ⋈ B ⋈ C</code>) with array-of-objects key paths, deterministic post-join paging, Unlimited mode (5,000-doc safety cap), and visual/raw Aggregation pipeline builder.</li>
+            <li><b>AES Field Decryption, In-App Updater &amp; Real-Time KO/EN UI:</b> Temporary plaintext decryption with auto-masking, GitHub Releases in-app updater, and instant Korean/English switching.</li>
         </ul>
     ]]></description>
+
+    <change-notes><![CDATA[
+        <h3>v0.2.3</h3>
+        <ul>
+            <li><b>Explain &amp; Unified Index Cache:</b> Hardened multi-tier MongoDB &amp; AWS DocumentDB <code>explain()</code> parsing, explicit <code>UNKNOWN</code> badge with failure tooltip when explain fails, and unified 60s cached index metadata (including index sizes).</li>
+            <li><b>Read-Only Index Inspector &amp; Query Filter Guide:</b> Click the <code>IXSCAN</code>/<code>COLLSCAN</code>/<code>UNKNOWN</code> badge or right-click any collection in Connections tree to inspect indexes, apply Filter templates, and copy ESR-ordered <code>createIndex</code> recommendations (strictly read-only).</li>
+            <li><b>5-Group Context Menu &amp; Multi-Selection Smart Quick Filter/Sort:</b> Reorganized Tree &amp; Table right-click menus with automatic single/multi-cell <code>=</code>, <code>!=</code>, <code>$in</code>, <code>$nin</code>, Date range <code>$gte~$lte</code>, multi-field <code>AND</code>/<code>$or</code> (safe <code>$and</code> wrapping), <code>$exists</code>, and quick Sort.</li>
+            <li><b>Join View Fixes &amp; Limit Modes:</b> Added array-of-objects dot-notation join keys (e.g. <code>items.product_id</code>), fixed post-join deterministic <code>$sort</code>/<code>$skip</code>/<code>$limit(N+1)</code> paging consistency, and added explicit <code>20 / 50 / 100 / 500 / Unlimited (5,000 cap)</code> modes.</li>
+            <li><b>Visual Hierarchy Upgrade:</b> Added active bottom-accent mode tabs (<code>Documents (Find)</code> / <code>Aggregations</code> / <code>Mongo Shell</code>) and an icon-backed segmented control for <code>Tree</code> / <code>Table</code> / <code>JSON</code>.</li>
+        </ul>
+    ]]></change-notes>
 
     <depends>com.intellij.modules.platform</depends>
 

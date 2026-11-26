@@ -50,6 +50,7 @@ class ConnectionsTreePanel(
     private val onOpenFindTab: (MongoConnectionProfile, String, String, Boolean) -> Unit,
     private val onOpenAggTab: (MongoConnectionProfile, String, String) -> Unit,
     private val onOpenShellTab: (MongoConnectionProfile, String, String) -> Unit,
+    private val onInspectIndexes: (MongoConnectionProfile, String, String) -> Unit,
     private val onEditCustomProfile: (MongoConnectionProfile) -> Unit,
     private val onDeleteCustomProfile: (MongoConnectionProfile) -> Unit
 ) : JPanel(BorderLayout()) {
@@ -465,6 +466,10 @@ class ConnectionsTreePanel(
                 })
                 menu.add(JMenuItem(I18n.t("tree.ctx.openShell")).apply {
                     addActionListener { onOpenShellTab(data.profile, data.database, data.collection) }
+                })
+                menu.addSeparator()
+                menu.add(JMenuItem(I18n.t("tree.ctx.inspectIndexes")).apply {
+                    addActionListener { onInspectIndexes(data.profile, data.database, data.collection) }
                 })
                 menu.addSeparator()
                 menu.add(JMenuItem(I18n.t("tree.ctx.copyName")).apply {

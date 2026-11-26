@@ -57,6 +57,8 @@ object UiHelpers {
     val COLOR_RED_FG = JBColor(Color(0xC62828), Color(0xFF7B86))
     val COLOR_BLUE_BG = JBColor(Color(0xE8F1FD), Color(0x1D334D))
     val COLOR_BLUE_FG = JBColor(Color(0x1565C0), Color(0x7AB8FF))
+    val COLOR_GRAY_BG = JBColor(Color(0xECEFF1), Color(0x32363A))
+    val COLOR_GRAY_FG = JBColor(Color(0x546E7A), Color(0xB0BEC5))
 
     // BSON Type Colors
     val BSON_OID_COLOR = JBColor(Color(0x8E44AD), Color(0xC39BD3))

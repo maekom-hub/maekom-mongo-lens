@@ -15,10 +15,13 @@ import com.maekom.mongolens.config.SavedQuery
 import com.maekom.mongolens.config.SavedQueryStore
 import com.maekom.mongolens.crypto.CryptoConfigStore
 import com.maekom.mongolens.i18n.I18n
+import com.intellij.notification.NotificationType
 import com.maekom.mongolens.mongo.JoinSpec
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import com.maekom.mongolens.mongo.MongoShellNormalizer
+import com.maekom.mongolens.mongo.QuickFilterHelper
 import com.maekom.mongolens.mongo.SmartInValueType
+import org.bson.BsonDocument
 import org.bson.BsonValue
 import java.awt.BorderLayout
 import java.awt.Dimension
@@ -60,13 +63,24 @@ class FindQueryPanel(
     private val onJoinSpecUpdated: ((updatedSpec: JoinSpec) -> Unit)? = null
 ) : JPanel(BorderLayout()), Disposable {
 
+    private data class LimitChoice(val value: Int?) {
+        override fun toString(): String = value?.toString() ?: I18n.t("join.limit.unlimited")
+    }
+
     private val initialJoinSpecRef: JoinSpec? = initialJoinSpec
 
     @Volatile
     private var activeJoinSpec: JoinSpec? = initialJoinSpec
     val isJoinTab: Boolean get() = activeJoinSpec != null
 
-    private val limitPresets = arrayOf(20, 50, 100, 500, 1000)
+    private var joinCurrentPage: Int = 0
+    private var suppressLimitComboEvents = false
+
+    private val limitChoices: Array<LimitChoice> = if (initialJoinSpec != null) {
+        JoinSpec.JOIN_LIMIT_OPTIONS.map { LimitChoice(it) }.toTypedArray()
+    } else {
+        arrayOf(20, 50, 100, 500, 1000).map { LimitChoice(it) }.toTypedArray()
+    }
     private val unifiedInputHeight = JBUI.scale(32)
     private val unifiedLabelSize = Dimension(JBUI.scale(48), unifiedInputHeight)
 
@@ -145,9 +159,10 @@ class FindQueryPanel(
         margin = JBUI.insets(1, 3)
         toolTipText = I18n.t("find.limitDecreaseTooltip")
     }
-    private val limitCombo = ComboBox(limitPresets).apply {
-        selectedItem = 50
-        preferredSize = Dimension(68, JBUI.scale(28))
+    private val limitCombo = ComboBox(limitChoices).apply {
+        val initVal: Int? = if (initialJoinSpec != null) initialJoinSpec.limitOption else 50
+        selectedItem = limitChoices.firstOrNull { it.value == initVal } ?: limitChoices.firstOrNull { it.value == 50 } ?: limitChoices.first()
+        preferredSize = Dimension(if (initialJoinSpec != null) JBUI.scale(132) else JBUI.scale(68), JBUI.scale(28))
     }
     private val limitIncreaseBtn = JButton("+").apply {
         preferredSize = Dimension(26, JBUI.scale(28))
@@ -198,17 +213,31 @@ class FindQueryPanel(
         profile = profile,
         database = database,
         collection = initialJoinSpec?.compactTabKeySegment() ?: collection,
-        onRequestRefresh = { executeFind() },
+        onRequestRefresh = { executeFind(resetJoinPage = false) },
         onPrevPage = {
-            val lim = currentLimit()
-            val prevSkip = (currentSkip() - lim).coerceAtLeast(0)
-            skipSpinner.value = prevSkip
-            executeFind()
+            if (isJoinTab) {
+                if (currentJoinPageSize() != null && joinCurrentPage > 0) {
+                    joinCurrentPage = (joinCurrentPage - 1).coerceAtLeast(0)
+                    executeFind(resetJoinPage = false)
+                }
+            } else {
+                val lim = currentLimit()
+                val prevSkip = (currentSkip() - lim).coerceAtLeast(0)
+                skipSpinner.value = prevSkip
+                executeFind()
+            }
         },
         onNextPage = {
-            val lim = currentLimit()
-            skipSpinner.value = currentSkip() + lim
-            executeFind()
+            if (isJoinTab) {
+                if (currentJoinPageSize() != null) {
+                    joinCurrentPage += 1
+                    executeFind(resetJoinPage = false)
+                }
+            } else {
+                val lim = currentLimit()
+                skipSpinner.value = currentSkip() + lim
+                executeFind()
+            }
         },
         onReadOnlyChanged = onReadOnlyChanged,
         diffBaselineState = diffBaselineState,
@@ -222,6 +251,16 @@ class FindQueryPanel(
         onApplyQuickFilter = { filterJson ->
             applyQuickFilterAndRun(filterJson)
         },
+        onMergeQuickFilter = { patchClause ->
+            mergeQuickFilterAndRun(patchClause)
+        },
+        onApplyQuickSort = { sortJson ->
+            applyQuickSortAndRun(sortJson)
+        },
+        onOpenIndexInspector = { execResult ->
+            openIndexInspectorDialog(execResult)
+        },
+        indexCollectionName = initialJoinSpec?.leftCollection ?: collection,
         collectionsSupplier = collectionsSupplier,
         onJumpToReferenceCollection = onOpenReferenceJumpTab,
         onRequestOpenJoinDialog = if (onOpenJoinTab != null) { initialField ->
@@ -263,8 +302,10 @@ class FindQueryPanel(
             add(limitDecreaseBtn)
             add(limitCombo)
             add(limitIncreaseBtn)
-            add(skipLabel)
-            add(skipSpinner)
+            if (!isJoinTab) {
+                add(skipLabel)
+                add(skipSpinner)
+            }
             add(smartInBtn)
             add(toShellBtn)
             add(savedQueriesBtn)
@@ -371,7 +412,13 @@ class FindQueryPanel(
         }
 
         limitCombo.addActionListener {
+            if (suppressLimitComboEvents) return@addActionListener
             resultViewer.resetTableBatchDecryption()
+            if (isJoinTab) {
+                joinCurrentPage = 0
+                activeJoinSpec = activeJoinSpec?.copy(limitOption = currentJoinPageSize())
+                executeFind(resetJoinPage = true)
+            }
         }
 
         skipSpinner.addChangeListener {
@@ -382,35 +429,56 @@ class FindQueryPanel(
             val idx = limitCombo.selectedIndex
             if (idx > 0) {
                 resultViewer.resetTableBatchDecryption()
-                limitCombo.selectedIndex = idx - 1
-                executeFind()
+                suppressLimitComboEvents = true
+                try {
+                    limitCombo.selectedIndex = idx - 1
+                } finally {
+                    suppressLimitComboEvents = false
+                }
+                if (isJoinTab) {
+                    joinCurrentPage = 0
+                    activeJoinSpec = activeJoinSpec?.copy(limitOption = currentJoinPageSize())
+                }
+                executeFind(resetJoinPage = true)
             }
         }
 
         limitIncreaseBtn.addActionListener {
             val idx = limitCombo.selectedIndex
-            if (idx in 0 until limitPresets.lastIndex) {
+            if (idx in 0 until limitChoices.lastIndex) {
                 resultViewer.resetTableBatchDecryption()
-                limitCombo.selectedIndex = idx + 1
-                executeFind()
+                suppressLimitComboEvents = true
+                try {
+                    limitCombo.selectedIndex = idx + 1
+                } finally {
+                    suppressLimitComboEvents = false
+                }
+                if (isJoinTab) {
+                    joinCurrentPage = 0
+                    activeJoinSpec = activeJoinSpec?.copy(limitOption = currentJoinPageSize())
+                }
+                executeFind(resetJoinPage = true)
             }
         }
 
-        runBtn.addActionListener { executeFind() }
+        runBtn.addActionListener { executeFind(resetJoinPage = true) }
 
         resetBtn.addActionListener {
             resultViewer.resetTableBatchDecryption()
+            joinCurrentPage = 0
             if (initialJoinSpecRef != null) {
                 activeJoinSpec = initialJoinSpecRef
                 resultViewer.setJoinColumnOrigins(initialJoinSpecRef.columnOriginsByResultKey())
                 onJoinSpecUpdated?.invoke(initialJoinSpecRef)
+                selectLimitChoice(initialJoinSpecRef.limitOption)
+            } else {
+                selectLimitChoice(50)
             }
             filterEditor.text = ""
             projectEditor.text = ""
             sortEditor.text = ""
-            limitCombo.selectedItem = 50
             skipSpinner.value = 0
-            executeFind()
+            executeFind(resetJoinPage = true)
         }
 
         smartInBtn.addActionListener {
@@ -443,8 +511,8 @@ class FindQueryPanel(
             return joinSpec.toMongoshScript(
                 filterRaw = filterEditor.safeText(),
                 sortRaw = sortEditor.safeText(),
-                skip = currentSkip(),
-                limit = currentLimit()
+                pageIndex = joinCurrentPage,
+                pageSize = currentJoinPageSize()
             )
         }
 
@@ -523,8 +591,57 @@ class FindQueryPanel(
         filterEditor.text = filterJson.trim()
         filterEditor.refreshAutoHeightNow()
         skipSpinner.value = 0
+        joinCurrentPage = 0
         revalidateHierarchy()
-        executeFind()
+        executeFind(resetJoinPage = true)
+    }
+
+    fun applyFilterTemplateOnly(filterTemplateJson: String) {
+        filterEditor.text = filterTemplateJson.trim()
+        filterEditor.refreshAutoHeightNow()
+        revalidateHierarchy()
+        ApplicationManager.getApplication().invokeLater {
+            filterEditor.requestFocusInWindow()
+        }
+    }
+
+    private fun mergeQuickFilterAndRun(patchClause: BsonDocument) {
+        val mergedJson = QuickFilterHelper.mergeIntoExistingFilter(filterEditor.safeText(), patchClause)
+        filterEditor.text = mergedJson
+        filterEditor.refreshAutoHeightNow()
+        skipSpinner.value = 0
+        joinCurrentPage = 0
+        revalidateHierarchy()
+        executeFind(resetJoinPage = true)
+    }
+
+    private fun applyQuickSortAndRun(sortJson: String) {
+        sortEditor.text = sortJson.trim()
+        sortEditor.refreshAutoHeightNow()
+        skipSpinner.value = 0
+        joinCurrentPage = 0
+        revalidateHierarchy()
+        executeFind(resetJoinPage = true)
+    }
+
+    private fun openIndexInspectorDialog(execResult: com.maekom.mongolens.mongo.QueryExecutionResult?) {
+        val targetColl = activeJoinSpec?.leftCollection ?: collection
+        IndexInspectorDialog(
+            project = project,
+            connectionManager = connectionManager,
+            profile = profile,
+            database = database,
+            collection = targetColl,
+            initialIndexes = execResult?.detailedIndexes?.takeIf { it.isNotEmpty() },
+            currentFilterRaw = filterEditor.safeText(),
+            currentSortRaw = sortEditor.safeText(),
+            currentScanType = execResult?.scanType,
+            currentIndexName = execResult?.indexName,
+            explainError = execResult?.explainError,
+            onApplyFilterTemplate = { templateJson ->
+                applyFilterTemplateOnly(templateJson)
+            }
+        ).show()
     }
 
     private fun openJoinConfigurationDialog(initialLocalField: String?) {
@@ -536,11 +653,13 @@ class FindQueryPanel(
             } catch (_: Throwable) {
                 collectionsSupplier()
             }
-            val sourceCategories: Map<String, String> = try {
-                connectionManager.sampleCollectionTopLevelTypes(profile, database, collection, 20)
+            val sampledSchema = try {
+                connectionManager.sampleCollectionTopLevelSchema(profile, database, collection, 20)
             } catch (_: Throwable) {
-                emptyMap()
+                MongoConnectionManager.SampledTopLevelSchema(0, linkedMapOf(), linkedMapOf())
             }
+            val sourceCategories = sampledSchema.fieldTypes
+            val sourceJoinKeyCategories = sampledSchema.joinFieldTypes
             val topFields = buildList {
                 addAll(sourceCategories.keys)
                 fieldSuggestionsSupplier().forEach { add(it.substringBefore('.')) }
@@ -557,6 +676,7 @@ class FindQueryPanel(
                     initialLocalField = initialLocalField,
                     sourceTopFields = topFields,
                     sourceFieldCategories = sourceCategories,
+                    sourceJoinKeyCategories = sourceJoinKeyCategories,
                     allCollectionsInDb = allCollections
                 )
                 if (dlg.showAndGet()) {
@@ -571,15 +691,15 @@ class FindQueryPanel(
         val jsonArray = spec.formatPipelineJsonArray(
             filterRaw = filterEditor.safeText(),
             sortRaw = sortEditor.safeText(),
-            skip = currentSkip(),
-            limit = currentLimit()
+            pageIndex = joinCurrentPage,
+            pageSize = currentJoinPageSize()
         )
         UiHelpers.copyToClipboard(jsonArray)
         UiHelpers.notify(project, I18n.t("join.tab.pipelineCopied"))
     }
 
     private fun openEditCurrentJoinDialog() {
-        val currentSpec = activeJoinSpec ?: return
+        val currentSpec = activeJoinSpec?.copy(limitOption = currentJoinPageSize()) ?: return
         ApplicationManager.getApplication().executeOnPooledThread {
             val allCollections = try {
                 val cached = collectionsSupplier()
@@ -587,11 +707,13 @@ class FindQueryPanel(
             } catch (_: Throwable) {
                 collectionsSupplier()
             }
-            val sourceCategories: Map<String, String> = try {
-                connectionManager.sampleCollectionTopLevelTypes(profile, database, currentSpec.leftCollection, 10)
+            val sampledSchema = try {
+                connectionManager.sampleCollectionTopLevelSchema(profile, database, currentSpec.leftCollection, 15)
             } catch (_: Throwable) {
-                emptyMap()
+                MongoConnectionManager.SampledTopLevelSchema(0, linkedMapOf(), linkedMapOf())
             }
+            val sourceCategories = sampledSchema.fieldTypes
+            val sourceJoinKeyCategories = sampledSchema.joinFieldTypes
             val topFields = buildList {
                 addAll(sourceCategories.keys)
                 addAll(currentSpec.allLeftFields)
@@ -609,26 +731,43 @@ class FindQueryPanel(
                     initialLocalField = currentSpec.targets.firstOrNull()?.localField,
                     sourceTopFields = topFields,
                     sourceFieldCategories = sourceCategories,
+                    sourceJoinKeyCategories = sourceJoinKeyCategories,
                     allCollectionsInDb = allCollections,
                     existingJoinSpec = currentSpec
                 )
                 if (dlg.showAndGet()) {
                     val updatedSpec = dlg.buildJoinSpec()
                     activeJoinSpec = updatedSpec
+                    selectLimitChoice(updatedSpec.limitOption)
                     resultViewer.setJoinColumnOrigins(updatedSpec.columnOriginsByResultKey())
                     onJoinSpecUpdated?.invoke(updatedSpec)
+                    joinCurrentPage = 0
                     skipSpinner.value = 0
-                    executeFind()
+                    executeFind(resetJoinPage = true)
                 }
             }
         }
     }
 
-    private fun currentLimit(): Int = (limitCombo.selectedItem as? Int) ?: 50
+    private fun selectLimitChoice(targetValue: Int?) {
+        suppressLimitComboEvents = true
+        try {
+            val match = limitChoices.firstOrNull { it.value == targetValue }
+                ?: limitChoices.firstOrNull { it.value == 50 }
+                ?: limitChoices.first()
+            limitCombo.selectedItem = match
+        } finally {
+            suppressLimitComboEvents = false
+        }
+    }
+
+    private fun currentJoinPageSize(): Int? = (limitCombo.selectedItem as? LimitChoice)?.value
+
+    private fun currentLimit(): Int = (limitCombo.selectedItem as? LimitChoice)?.value ?: JoinSpec.MAX_UNLIMITED_DOCS
 
     private fun currentSkip(): Int = (skipSpinner.value as? Int) ?: 0
 
-    fun executeFind() {
+    fun executeFind(resetJoinPage: Boolean = true) {
         resultViewer.resetTableBatchDecryption()
         filterEditor.dismissPopup()
         sortEditor.dismissPopup()
@@ -638,9 +777,14 @@ class FindQueryPanel(
         val filterRaw = filterEditor.safeText().ifEmpty { "{}" }
         val projRaw = projectEditor.safeText().ifEmpty { "{}" }
         val sortRaw = sortEditor.safeText().ifEmpty { "{}" }
+        val joinSpecSnapshot = activeJoinSpec
+        if (joinSpecSnapshot != null && resetJoinPage) {
+            joinCurrentPage = 0
+        }
+        val joinPageSnapshot = joinCurrentPage
+        val joinPageSizeSnapshot = if (joinSpecSnapshot != null) currentJoinPageSize() else null
         val limit = currentLimit()
         val skip = currentSkip()
-        val joinSpecSnapshot = activeJoinSpec
 
         runBtn.isEnabled = false
         onStatusUpdate(I18n.t("header.status.querying"), false)
@@ -661,8 +805,8 @@ class FindQueryPanel(
                             joinSpec = joinSpecSnapshot,
                             filterRaw = filterRaw,
                             sortRaw = sortRaw,
-                            skip = skip,
-                            limit = limit
+                            pageIndex = joinPageSnapshot,
+                            pageSize = joinPageSizeSnapshot
                         )
                     } else {
                         connectionManager.executeFind(
@@ -701,7 +845,34 @@ class FindQueryPanel(
                         if (result.sampledFields.isNotEmpty()) {
                             onFieldsDiscovered(result.sampledFields, result.sampledFieldTypes)
                         }
-                        resultViewer.updateResults(result, skip = skip, limit = limit)
+                        val displaySkip = if (joinSpecSnapshot != null) {
+                            if (joinPageSizeSnapshot != null) joinPageSnapshot * joinPageSizeSnapshot else 0
+                        } else {
+                            skip
+                        }
+                        val displayLimit = if (joinSpecSnapshot != null) {
+                            joinPageSizeSnapshot ?: JoinSpec.MAX_UNLIMITED_DOCS
+                        } else {
+                            limit
+                        }
+                        val capBanner = if (result.unlimitedCapHit) {
+                            I18n.t("join.unlimitedCapBanner", JoinSpec.MAX_UNLIMITED_DOCS)
+                        } else {
+                            null
+                        }
+                        resultViewer.updateResults(
+                            result = result,
+                            skip = displaySkip,
+                            limit = displayLimit,
+                            previewBanner = capBanner
+                        )
+                        if (result.unlimitedCapHit) {
+                            UiHelpers.notify(
+                                project,
+                                I18n.t("join.unlimitedCapToast", JoinSpec.MAX_UNLIMITED_DOCS),
+                                NotificationType.WARNING
+                            )
+                        }
                         val statusMsg = if (connectionManager.isEffectivelyReadOnly(profile)) {
                             "${I18n.t("header.status.connected", result.elapsedMs)} · ${I18n.t("header.status.readOnly")}"
                         } else {
@@ -766,12 +937,12 @@ class FindQueryPanel(
         filterEditor.text = if (f == "{}") "" else f
         projectEditor.text = if (p == "{}") "" else p
         sortEditor.text = if (s == "{}") "" else s
-        limitCombo.selectedItem = if (q.limit in limitPresets) q.limit else 50
+        selectLimitChoice(q.limit)
         skipSpinner.value = q.skip.coerceAtLeast(0)
         if (p.isNotEmpty() && p != "{}") {
             setProjectRowVisible(true)
         }
-        executeFind()
+        executeFind(resetJoinPage = true)
     }
 
     private fun updateProjectToggleText() {
@@ -785,6 +956,7 @@ class FindQueryPanel(
             sortLabel.text = I18n.t("find.sort")
             limitLabel.text = I18n.t("find.limit")
             skipLabel.text = I18n.t("find.skip")
+            limitCombo.repaint()
             updateProjectToggleText()
             runBtn.text = I18n.t("find.run")
             runBtn.toolTipText = I18n.t("find.runTooltip")

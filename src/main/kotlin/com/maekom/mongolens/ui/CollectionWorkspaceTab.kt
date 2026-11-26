@@ -6,8 +6,13 @@ import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
+import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.util.ui.JBUI
+import java.awt.Color
+import java.awt.Graphics
+import java.awt.Graphics2D
+import java.awt.RenderingHints
 import com.maekom.mongolens.config.MongoConnectionProfile
 import com.maekom.mongolens.config.SavedQueryStore
 import com.maekom.mongolens.config.VariableStore
@@ -64,15 +69,68 @@ class CollectionWorkspaceTab(
     private val sampledFieldTypes = ConcurrentHashMap<String, SmartInValueType>()
     private val cachedCollections = CopyOnWriteArrayList<String>(listOf(collection))
 
-    private val findModeBtn = JToggleButton(I18n.t("workspace.mode.find"), initialMode == WorkspaceMode.FIND).apply {
-        margin = JBUI.insets(2, 8)
+    private class ModeTabButton(text: String, selected: Boolean) : JToggleButton(text, selected) {
+        private var hovered = false
+
+        init {
+            isContentAreaFilled = false
+            isFocusPainted = false
+            isBorderPainted = false
+            isOpaque = false
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            margin = JBUI.insets(6, 12, 7, 12)
+            addMouseListener(object : MouseAdapter() {
+                override fun mouseEntered(e: MouseEvent?) {
+                    hovered = true
+                    repaint()
+                }
+                override fun mouseExited(e: MouseEvent?) {
+                    hovered = false
+                    repaint()
+                }
+            })
+            refreshStyle()
+        }
+
+        fun refreshStyle() {
+            font = font.deriveFont(if (isSelected) Font.BOLD else Font.PLAIN)
+            foreground = if (isSelected) {
+                JBUI.CurrentTheme.Label.foreground()
+            } else {
+                JBUI.CurrentTheme.ContextHelp.FOREGROUND
+            }
+            repaint()
+        }
+
+        override fun setSelected(b: Boolean) {
+            super.setSelected(b)
+            refreshStyle()
+        }
+
+        override fun paintComponent(g: Graphics) {
+            val g2 = g.create() as Graphics2D
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+                if (isSelected) {
+                    g2.color = JBColor(Color(0xE8F1FD), Color(0x2B3646))
+                    g2.fillRoundRect(0, JBUI.scale(1), width, height - JBUI.scale(2), JBUI.scale(6), JBUI.scale(6))
+                    val barH = JBUI.scale(3)
+                    g2.color = JBUI.CurrentTheme.TabbedPane.FOCUS_COLOR
+                    g2.fillRect(JBUI.scale(2), height - barH, width - JBUI.scale(4), barH)
+                } else if (hovered) {
+                    g2.color = JBUI.CurrentTheme.ActionButton.hoverBackground()
+                    g2.fillRoundRect(0, JBUI.scale(1), width, height - JBUI.scale(2), JBUI.scale(6), JBUI.scale(6))
+                }
+            } finally {
+                g2.dispose()
+            }
+            super.paintComponent(g)
+        }
     }
-    private val aggModeBtn = JToggleButton(I18n.t("workspace.mode.agg"), initialMode == WorkspaceMode.AGGREGATION).apply {
-        margin = JBUI.insets(2, 8)
-    }
-    private val shellModeBtn = JToggleButton(I18n.t("workspace.mode.shell"), initialMode == WorkspaceMode.SHELL).apply {
-        margin = JBUI.insets(2, 8)
-    }
+
+    private val findModeBtn = ModeTabButton(I18n.t("workspace.mode.find"), initialMode == WorkspaceMode.FIND)
+    private val aggModeBtn = ModeTabButton(I18n.t("workspace.mode.agg"), initialMode == WorkspaceMode.AGGREGATION)
+    private val shellModeBtn = ModeTabButton(I18n.t("workspace.mode.shell"), initialMode == WorkspaceMode.SHELL)
 
     private val breadcrumbLabel = JBLabel(
         if (initialJoinSpec != null) {
@@ -245,6 +303,11 @@ class CollectionWorkspaceTab(
     fun applyQuickFilterAndRun(filterJson: String) {
         switchMode(WorkspaceMode.FIND)
         findPanel.applyQuickFilterAndRun(filterJson)
+    }
+
+    fun applyFilterTemplateOnly(filterTemplateJson: String) {
+        switchMode(WorkspaceMode.FIND)
+        findPanel.applyFilterTemplateOnly(filterTemplateJson)
     }
 
     fun switchMode(mode: WorkspaceMode) {

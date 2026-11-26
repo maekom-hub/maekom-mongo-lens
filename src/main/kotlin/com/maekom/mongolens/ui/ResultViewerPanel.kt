@@ -28,7 +28,15 @@ import com.maekom.mongolens.mongo.JoinColumnOrigin
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import com.maekom.mongolens.mongo.MongoShellNormalizer
 import com.maekom.mongolens.mongo.QueryExecutionResult
+import com.maekom.mongolens.mongo.QuickFilterHelper
 import com.maekom.mongolens.mongo.ReferenceJumpHelper
+import com.intellij.ui.JBColor
+import java.awt.Color
+import java.awt.Graphics
+import java.awt.Graphics2D
+import java.awt.GridLayout
+import java.awt.RenderingHints
+import javax.swing.Icon
 import org.bson.BsonArray
 import org.bson.BsonDateTime
 import org.bson.BsonDocument
@@ -98,6 +106,10 @@ class ResultViewerPanel(
     private val availableColumnsSupplier: (() -> List<String>)? = null,
     private val onApplyColumnSelection: ((selectedColumns: List<String>, allSelected: Boolean) -> Unit)? = null,
     private val onApplyQuickFilter: ((filterJson: String) -> Unit)? = null,
+    private val onMergeQuickFilter: ((patchClause: BsonDocument) -> Unit)? = null,
+    private val onApplyQuickSort: ((sortJson: String) -> Unit)? = null,
+    private val onOpenIndexInspector: ((result: QueryExecutionResult?) -> Unit)? = null,
+    private val indexCollectionName: String = collection,
     private val collectionsSupplier: (() -> List<String>)? = null,
     private val onJumpToReferenceCollection: ((targetCollection: String, sourceFieldPath: String, sourceValue: BsonValue) -> Unit)? = null,
     private val onRequestOpenJoinDialog: ((initialLocalField: String?) -> Unit)? = null,
@@ -153,6 +165,7 @@ class ResultViewerPanel(
     private val summaryLabel = JBLabel(" ")
     private val indexBadge = UiHelpers.createBadgeLabel("", UiHelpers.COLOR_GREEN_BG, UiHelpers.COLOR_GREEN_FG).apply {
         isVisible = false
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
     }
     private val batchDecryptBtn = JButton(I18n.t("crypto.table.decryptPage"), AllIcons.Nodes.Padlock).apply {
         margin = JBUI.insets(1, 6)
@@ -194,9 +207,85 @@ class ResultViewerPanel(
         isEnabled = false
     }
 
-    private val treeViewBtn = JToggleButton(I18n.t("result.view.tree"), true).apply { margin = JBUI.insets(1, 6) }
-    private val jsonViewBtn = JToggleButton(I18n.t("result.view.json"), false).apply { margin = JBUI.insets(1, 6) }
-    private val tableViewBtn = JToggleButton(I18n.t("result.view.table"), false).apply { margin = JBUI.insets(1, 6) }
+    private class ViewSegmentButton(
+        text: String,
+        icon: Icon,
+        selected: Boolean,
+        private val drawRightDivider: Boolean
+    ) : JToggleButton(text, icon, selected) {
+        private var hovered = false
+
+        init {
+            isContentAreaFilled = false
+            isFocusPainted = false
+            isBorderPainted = false
+            isOpaque = false
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            margin = JBUI.insets(3, 9)
+            iconTextGap = JBUI.scale(5)
+            addMouseListener(object : MouseAdapter() {
+                override fun mouseEntered(e: MouseEvent?) {
+                    hovered = true
+                    repaint()
+                }
+                override fun mouseExited(e: MouseEvent?) {
+                    hovered = false
+                    repaint()
+                }
+            })
+            refreshStyle()
+        }
+
+        fun refreshStyle() {
+            font = font.deriveFont(if (isSelected) Font.BOLD else Font.PLAIN)
+            foreground = if (isSelected) {
+                JBUI.CurrentTheme.Label.foreground()
+            } else {
+                JBUI.CurrentTheme.ContextHelp.FOREGROUND
+            }
+            repaint()
+        }
+
+        override fun setSelected(b: Boolean) {
+            super.setSelected(b)
+            refreshStyle()
+        }
+
+        override fun paintComponent(g: Graphics) {
+            val g2 = g.create() as Graphics2D
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+                if (isSelected) {
+                    g2.color = JBColor(Color(0xD8E8FC), Color(0x2E436E))
+                    g2.fillRect(0, 0, width, height)
+                    g2.color = JBUI.CurrentTheme.Focus.focusColor()
+                    g2.fillRect(0, height - JBUI.scale(2), width, JBUI.scale(2))
+                } else if (hovered) {
+                    g2.color = JBUI.CurrentTheme.ActionButton.hoverBackground()
+                    g2.fillRect(0, 0, width, height)
+                }
+                if (drawRightDivider) {
+                    g2.color = JBColor.border()
+                    g2.drawLine(width - 1, JBUI.scale(2), width - 1, height - JBUI.scale(2))
+                }
+            } finally {
+                g2.dispose()
+            }
+            super.paintComponent(g)
+        }
+    }
+
+    private val treeViewBtn = ViewSegmentButton(I18n.t("result.view.tree"), AllIcons.Actions.ShowAsTree, true, drawRightDivider = true)
+    private val tableViewBtn = ViewSegmentButton(I18n.t("result.view.table"), AllIcons.Nodes.DataTables, false, drawRightDivider = true)
+    private val jsonViewBtn = ViewSegmentButton(I18n.t("result.view.json"), AllIcons.FileTypes.Json, false, drawRightDivider = false)
+
+    private val viewSegmentedControl = JPanel(GridLayout(1, 3, 0, 0)).apply {
+        isOpaque = false
+        border = BorderFactory.createLineBorder(JBColor.border(), 1, true)
+        add(treeViewBtn)
+        add(tableViewBtn)
+        add(jsonViewBtn)
+    }
 
     private val prevBtn = JButton(I18n.t("result.prev")).apply { margin = JBUI.insets(1, 6) }
     private val nextBtn = JButton(I18n.t("result.next")).apply { margin = JBUI.insets(1, 6) }
@@ -333,6 +422,27 @@ class ResultViewerPanel(
         batchDecryptBtn.addActionListener { handleTableBatchDecryptClick() }
         editJoinBtn.addActionListener { onRequestEditJoin?.invoke() }
         copyJoinPipelineBtn.addActionListener { onCopyJoinPipeline?.invoke() }
+        indexBadge.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                if (!SwingUtilities.isLeftMouseButton(e)) return
+                if (onOpenIndexInspector != null) {
+                    onOpenIndexInspector.invoke(currentResult)
+                } else {
+                    val res = currentResult
+                    IndexInspectorDialog(
+                        project = project,
+                        connectionManager = connectionManager,
+                        profile = profile,
+                        database = database,
+                        collection = indexCollectionName,
+                        initialIndexes = res?.detailedIndexes?.takeIf { it.isNotEmpty() },
+                        currentScanType = res?.scanType,
+                        currentIndexName = res?.indexName,
+                        explainError = res?.explainError
+                    ).show()
+                }
+            }
+        })
         baselineBadgeLabel.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
                 if (SwingUtilities.isLeftMouseButton(e)) {
@@ -370,11 +480,9 @@ class ResultViewerPanel(
             }
 
             treeViewBtn.addActionListener { switchView("TREE") }
-            jsonViewBtn.addActionListener { switchView("JSON") }
             tableViewBtn.addActionListener { switchView("TABLE") }
-            add(treeViewBtn)
-            add(jsonViewBtn)
-            add(tableViewBtn)
+            jsonViewBtn.addActionListener { switchView("JSON") }
+            add(viewSegmentedControl)
         }
 
         headerBar.add(headerLeftBar, BorderLayout.WEST)
@@ -551,25 +659,38 @@ class ResultViewerPanel(
                     resultTree.selectionPath = resolvedPath
                 }
 
-                val (targetDocNode, focusFieldPath, clickedBsonVal, copyText) = when (clickedNode) {
-                    is DocTreeNode -> Quadruple(
-                        clickedNode,
-                        "_id".takeIf { clickedNode.bsonDocument.containsKey("_id") },
-                        clickedNode.bsonDocument["_id"],
-                        MongoShellNormalizer.formatPrettyExtended(clickedNode.bsonDocument)
-                    )
+                val (targetDocNode, focusFieldPath, clickedBsonVal, valueOnlyText, keyValueJsonText) = when (clickedNode) {
+                    is DocTreeNode -> {
+                        val idVal = clickedNode.bsonDocument["_id"]
+                        val prettyJson = MongoShellNormalizer.formatPrettyExtended(clickedNode.bsonDocument)
+                        Quintuple(
+                            clickedNode,
+                            "_id".takeIf { idVal != null },
+                            idVal,
+                            idVal?.let { UiHelpers.bsonPureTextValue(it) } ?: prettyJson,
+                            prettyJson
+                        )
+                    }
                     is FieldTreeNode -> {
                         val plain = decryptedFields[decryptKeyFor(clickedNode)]?.plaintext
                         val valText = plain ?: UiHelpers.bsonPureTextValue(clickedNode.bsonValue)
-                        Quadruple(
+                        val kvJson = QuickFilterHelper.formatKeyValueJsonSnippet(
+                            clickedNode.keyLabel,
+                            clickedNode.bsonValue,
+                            decryptedPlaintext = plain
+                        )
+                        Quintuple(
                             clickedNode.rootDocNode,
                             clickedNode.fieldPath,
                             clickedNode.bsonValue,
-                            "${clickedNode.keyLabel}: $valText"
+                            valText,
+                            kvJson
                         )
                     }
                     else -> return
                 }
+
+                val selectedFieldItems = collectSelectedTreeFieldItems(clickedNode)
 
                 showUnifiedContextMenu(
                     invoker = resultTree,
@@ -581,13 +702,50 @@ class ResultViewerPanel(
                     targetRawDoc = targetDocNode.rawDocument,
                     focusFieldPath = focusFieldPath,
                     clickedBsonValue = clickedBsonVal,
-                    copyKeyValueText = copyText
+                    selectedFieldItems = selectedFieldItems,
+                    copyValueOnlyText = valueOnlyText,
+                    copyKeyValueJsonText = keyValueJsonText
                 )
             }
         })
     }
 
-    private data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
+    private data class Quintuple<A, B, C, D, E>(val first: A, val second: B, val third: C, val fourth: D, val fifth: E)
+
+    private fun collectSelectedTreeFieldItems(fallbackNode: Any): List<QuickFilterHelper.SelectedFieldItem> {
+        val items = mutableListOf<QuickFilterHelper.SelectedFieldItem>()
+        for (path in resultTree.selectionPaths.orEmpty()) {
+            when (val n = path.lastPathComponent) {
+                is FieldTreeNode -> {
+                    val normPath = QuickFilterHelper.normalizeFilterFieldPath(n.fieldPath)
+                    if (normPath.isNotEmpty()) {
+                        items.add(QuickFilterHelper.SelectedFieldItem(normPath, n.bsonValue))
+                    }
+                }
+                is DocTreeNode -> {
+                    n.bsonDocument["_id"]?.let { idVal ->
+                        items.add(QuickFilterHelper.SelectedFieldItem("_id", idVal))
+                    }
+                }
+            }
+        }
+        if (items.isEmpty()) {
+            when (fallbackNode) {
+                is FieldTreeNode -> {
+                    val normPath = QuickFilterHelper.normalizeFilterFieldPath(fallbackNode.fieldPath)
+                    if (normPath.isNotEmpty()) {
+                        items.add(QuickFilterHelper.SelectedFieldItem(normPath, fallbackNode.bsonValue))
+                    }
+                }
+                is DocTreeNode -> {
+                    fallbackNode.bsonDocument["_id"]?.let { idVal ->
+                        items.add(QuickFilterHelper.SelectedFieldItem("_id", idVal))
+                    }
+                }
+            }
+        }
+        return items
+    }
 
     private fun selectedTreeDocIndices(): List<Int> {
         return resultTree.selectionPaths.orEmpty().mapNotNull { path ->
@@ -791,8 +949,11 @@ class ResultViewerPanel(
                 val row = resultTable.rowAtPoint(e.point)
                 val col = resultTable.columnAtPoint(e.point)
                 if (row < 0 || col < 0) return
-                // Preserve existing multi-row selection if right-clicked row is already selected
-                if (row !in resultTable.selectedRows) {
+
+                // Preserve existing multi-cell / multi-row selection when clicking inside it
+                val alreadySelectedCell = resultTable.isCellSelected(row, col)
+                val existingRows = resultTable.selectedRows
+                if (!alreadySelectedCell && !(existingRows.size >= 2 && row in existingRows)) {
                     resultTable.changeSelection(row, col, false, false)
                 }
 
@@ -801,12 +962,33 @@ class ResultViewerPanel(
                 val colName = tableModel.getColumnName(modelCol)
                 val pureVal = tableModel.getPureCopyValueAt(modelRow, modelCol)
                 val clickedBsonVal = tableModel.getBsonValueAt(modelRow, modelCol)
+                val decryptedPlain = if (tableModel.isCellDecrypted(modelRow, modelCol)) pureVal else null
+                val kvJson = if (clickedBsonVal != null) {
+                    QuickFilterHelper.formatKeyValueJsonSnippet(colName, clickedBsonVal, decryptedPlaintext = decryptedPlain)
+                } else {
+                    "\"${MongoShellNormalizer.escapeJsonString(colName)}\": null"
+                }
                 val bsonDoc = currentDocs.getOrNull(modelRow) ?: return
                 val rawDoc = toRawDocument(bsonDoc)
                 val selectedDocIndices = resultTable.selectedRows
                     .map { resultTable.convertRowIndexToModel(it) }
                     .filter { it in currentDocs.indices }
                     .distinct()
+
+                val selectedFieldItems = mutableListOf<QuickFilterHelper.SelectedFieldItem>()
+                for (vRow in resultTable.selectedRows) {
+                    val mRow = resultTable.convertRowIndexToModel(vRow)
+                    for (vCol in resultTable.selectedColumns) {
+                        if (!resultTable.isCellSelected(vRow, vCol)) continue
+                        val mCol = resultTable.convertColumnIndexToModel(vCol)
+                        val cName = tableModel.getColumnName(mCol)
+                        val bVal = tableModel.getBsonValueAt(mRow, mCol) ?: continue
+                        selectedFieldItems.add(QuickFilterHelper.SelectedFieldItem(cName, bVal))
+                    }
+                }
+                if (selectedFieldItems.isEmpty() && clickedBsonVal != null) {
+                    selectedFieldItems.add(QuickFilterHelper.SelectedFieldItem(colName, clickedBsonVal))
+                }
 
                 showUnifiedContextMenu(
                     invoker = resultTable,
@@ -818,8 +1000,9 @@ class ResultViewerPanel(
                     targetRawDoc = rawDoc,
                     focusFieldPath = colName,
                     clickedBsonValue = clickedBsonVal,
-                    copyKeyValueText = pureVal,
-                    copyLabelKey = "result.table.copyCell"
+                    selectedFieldItems = selectedFieldItems,
+                    copyValueOnlyText = pureVal,
+                    copyKeyValueJsonText = kvJson
                 )
             }
         })
@@ -871,6 +1054,14 @@ class ResultViewerPanel(
         menu.show(resultTable.tableHeader, x, y)
     }
 
+    /**
+     * Reorganized 5-group context menu for both Tree and Table views:
+     *   Group 1: Dynamic Quick Filter (Cases A-E) & Sort (disabled/hidden in Join View)
+     *   Group 2: Edit (`데이터 수정` / Edit Data)
+     *   Group 3: Copy submenu (Value only / Key:Value JSON / Field Path)
+     *   Group 4: Reference Jump & Collection Join View
+     *   Group 5: Document Diff (2 Selected Docs + Pinned Baseline)
+     */
     private fun showUnifiedContextMenu(
         invoker: Component,
         x: Int,
@@ -881,12 +1072,197 @@ class ResultViewerPanel(
         targetRawDoc: Document,
         focusFieldPath: String?,
         clickedBsonValue: BsonValue?,
-        copyKeyValueText: String,
-        copyLabelKey: String = "result.doc.copyKeyValue"
+        selectedFieldItems: List<QuickFilterHelper.SelectedFieldItem>,
+        copyValueOnlyText: String,
+        copyKeyValueJsonText: String
     ) {
         val menu = JPopupMenu()
+        val normalizedFocusPath = focusFieldPath?.let { QuickFilterHelper.normalizeFilterFieldPath(it) }?.takeIf { it.isNotEmpty() }
 
-        // 1. Edit Data (disabled with tooltip in Join View)
+        // ============================================================
+        // Group 1: Dynamic Quick Filter & Sort (disabled in Join tabs)
+        // ============================================================
+        var addedGroup1 = false
+        if (!isJoinView && onMergeQuickFilter != null) {
+            val selectionKind = QuickFilterHelper.classifySelection(selectedFieldItems)
+            when (selectionKind) {
+                is QuickFilterHelper.SmartSelectionKind.SingleScalar -> {
+                    addedGroup1 = true
+                    menu.add(JMenuItem(I18n.t("result.qf.equals")).apply {
+                        addActionListener {
+                            onMergeQuickFilter.invoke(
+                                QuickFilterHelper.buildEqualsClause(selectionKind.fieldPath, selectionKind.value)
+                            )
+                        }
+                    })
+                    menu.add(JMenuItem(I18n.t("result.qf.notEquals")).apply {
+                        addActionListener {
+                            onMergeQuickFilter.invoke(
+                                QuickFilterHelper.buildNotEqualsClause(selectionKind.fieldPath, selectionKind.value)
+                            )
+                        }
+                    })
+                }
+                is QuickFilterHelper.SmartSelectionKind.SameFieldMultiValues -> {
+                    addedGroup1 = true
+                    val n = selectionKind.values.size
+                    menu.add(JMenuItem(I18n.t("result.qf.inList", n)).apply {
+                        addActionListener {
+                            onMergeQuickFilter.invoke(
+                                QuickFilterHelper.buildInClause(selectionKind.fieldPath, selectionKind.values)
+                            )
+                        }
+                    })
+                    menu.add(JMenuItem(I18n.t("result.qf.ninList", n)).apply {
+                        addActionListener {
+                            onMergeQuickFilter.invoke(
+                                QuickFilterHelper.buildNinClause(selectionKind.fieldPath, selectionKind.values)
+                            )
+                        }
+                    })
+                }
+                is QuickFilterHelper.SmartSelectionKind.SameFieldDatePair -> {
+                    addedGroup1 = true
+                    menu.add(JMenuItem(I18n.t("result.qf.dateRange")).apply {
+                        addActionListener {
+                            onMergeQuickFilter.invoke(
+                                QuickFilterHelper.buildDateRangeClause(
+                                    selectionKind.fieldPath,
+                                    selectionKind.minValue,
+                                    selectionKind.maxValue
+                                )
+                            )
+                        }
+                    })
+                    menu.add(JMenuItem(I18n.t("result.qf.dateInTwo")).apply {
+                        addActionListener {
+                            onMergeQuickFilter.invoke(
+                                QuickFilterHelper.buildInClause(
+                                    selectionKind.fieldPath,
+                                    listOf(selectionKind.minValue, selectionKind.maxValue)
+                                )
+                            )
+                        }
+                    })
+                }
+                is QuickFilterHelper.SmartSelectionKind.MultiFieldConditions -> {
+                    addedGroup1 = true
+                    val n = selectionKind.items.size
+                    menu.add(JMenuItem(I18n.t("result.qf.multiAnd", n)).apply {
+                        addActionListener {
+                            onMergeQuickFilter.invoke(
+                                QuickFilterHelper.buildMultiFieldAndClause(selectionKind.items)
+                            )
+                        }
+                    })
+                    menu.add(JMenuItem(I18n.t("result.qf.multiOr", n)).apply {
+                        addActionListener {
+                            onMergeQuickFilter.invoke(
+                                QuickFilterHelper.buildMultiFieldOrClause(selectionKind.items)
+                            )
+                        }
+                    })
+                }
+                is QuickFilterHelper.SmartSelectionKind.SingleStruct -> {
+                    addedGroup1 = true
+                    menu.add(JMenuItem(I18n.t("result.qf.existsTrue")).apply {
+                        addActionListener {
+                            onMergeQuickFilter.invoke(
+                                QuickFilterHelper.buildExistsTrueClause(selectionKind.fieldPath)
+                            )
+                        }
+                    })
+                    menu.add(JMenuItem(I18n.t("result.qf.emptyOrMissing")).apply {
+                        addActionListener {
+                            onMergeQuickFilter.invoke(
+                                QuickFilterHelper.buildEmptyOrMissingClause(selectionKind.fieldPath)
+                            )
+                        }
+                    })
+                }
+                null -> Unit
+            }
+
+            // Preserve single-click ObjectId / Date UTC range filter submenu inside Group 1
+            if (onApplyQuickFilter != null && normalizedFocusPath != null && clickedBsonValue != null &&
+                selectedFieldItems.size <= 1
+            ) {
+                when (clickedBsonValue) {
+                    is BsonObjectId -> {
+                        addedGroup1 = true
+                        val oidMenu = JMenu(I18n.t("result.timeFilter.menu")).apply {
+                            add(JMenuItem(I18n.t("result.timeFilter.gte")).apply {
+                                addActionListener {
+                                    onApplyQuickFilter.invoke(
+                                        UiHelpers.buildObjectIdTimeRangeFilter(normalizedFocusPath, clickedBsonValue.value, isGte = true)
+                                    )
+                                }
+                            })
+                            add(JMenuItem(I18n.t("result.timeFilter.lte")).apply {
+                                addActionListener {
+                                    onApplyQuickFilter.invoke(
+                                        UiHelpers.buildObjectIdTimeRangeFilter(normalizedFocusPath, clickedBsonValue.value, isGte = false)
+                                    )
+                                }
+                            })
+                        }
+                        menu.add(oidMenu)
+                    }
+                    is BsonDateTime -> {
+                        addedGroup1 = true
+                        val dateMenu = JMenu(I18n.t("result.dateFilter.menu")).apply {
+                            add(JMenuItem(I18n.t("result.dateFilter.gte")).apply {
+                                addActionListener {
+                                    onApplyQuickFilter.invoke(
+                                        UiHelpers.buildDateTimeRangeFilter(normalizedFocusPath, clickedBsonValue.value, isGte = true)
+                                    )
+                                }
+                            })
+                            add(JMenuItem(I18n.t("result.dateFilter.lte")).apply {
+                                addActionListener {
+                                    onApplyQuickFilter.invoke(
+                                        UiHelpers.buildDateTimeRangeFilter(normalizedFocusPath, clickedBsonValue.value, isGte = false)
+                                    )
+                                }
+                            })
+                        }
+                        menu.add(dateMenu)
+                    }
+                    else -> Unit
+                }
+            }
+
+            // Sort submenu (when single field is selected)
+            val distinctFields = selectedFieldItems.map { it.fieldPath }.distinct()
+            val singleSortField = when {
+                distinctFields.size == 1 -> distinctFields[0]
+                distinctFields.isEmpty() -> normalizedFocusPath
+                else -> null
+            }
+            if (onApplyQuickSort != null && singleSortField != null) {
+                addedGroup1 = true
+                val sortMenu = JMenu(I18n.t("result.qs.menu")).apply {
+                    add(JMenuItem(I18n.t("result.qs.asc")).apply {
+                        addActionListener {
+                            onApplyQuickSort.invoke(QuickFilterHelper.buildSortJson(singleSortField, ascending = true))
+                        }
+                    })
+                    add(JMenuItem(I18n.t("result.qs.desc")).apply {
+                        addActionListener {
+                            onApplyQuickSort.invoke(QuickFilterHelper.buildSortJson(singleSortField, ascending = false))
+                        }
+                    })
+                }
+                menu.add(sortMenu)
+            }
+        }
+
+        // ============================================================
+        // Group 2: Edit (`데이터 수정`)
+        // ============================================================
+        if (addedGroup1) {
+            menu.addSeparator()
+        }
         menu.add(JMenuItem(I18n.t("result.doc.editData")).apply {
             font = font.deriveFont(Font.BOLD)
             isEnabled = !isJoinView
@@ -900,94 +1276,65 @@ class ResultViewerPanel(
                 }
             }
         })
-        menu.add(JMenuItem(I18n.t(copyLabelKey)).apply {
-            addActionListener {
-                UiHelpers.copyToClipboard(copyKeyValueText)
-                UiHelpers.notify(project, I18n.t("result.copied"))
-            }
-        })
 
-        // 2. Reference Jump / Join View / Time Range Filters
-        var addedRelationalSection = false
-        if (onJumpToReferenceCollection != null &&
+        // ============================================================
+        // Group 3: Copy Submenu (Value / Key:Value JSON / Field Path)
+        // ============================================================
+        menu.addSeparator()
+        val copySubmenu = JMenu(I18n.t("result.copy.menu")).apply {
+            add(JMenuItem(I18n.t("result.copy.valueOnly")).apply {
+                addActionListener {
+                    UiHelpers.copyToClipboard(copyValueOnlyText)
+                    UiHelpers.notify(project, I18n.t("result.copied"))
+                }
+            })
+            add(JMenuItem(I18n.t("result.copy.keyValueJson")).apply {
+                addActionListener {
+                    UiHelpers.copyToClipboard(copyKeyValueJsonText)
+                    UiHelpers.notify(project, I18n.t("result.copied"))
+                }
+            })
+            add(JMenuItem(I18n.t("result.copy.fieldPath")).apply {
+                val pathToCopy = normalizedFocusPath ?: focusFieldPath
+                isEnabled = !pathToCopy.isNullOrBlank()
+                addActionListener {
+                    if (!pathToCopy.isNullOrBlank()) {
+                        UiHelpers.copyToClipboard(pathToCopy)
+                        UiHelpers.notify(project, I18n.t("result.copied"))
+                    }
+                }
+            })
+        }
+        menu.add(copySubmenu)
+
+        // ============================================================
+        // Group 4: Reference Jump & Collection Join View
+        // ============================================================
+        val canRefJump = onJumpToReferenceCollection != null &&
             focusFieldPath != null &&
             clickedBsonValue != null &&
             ReferenceJumpHelper.isReferenceCandidate(focusFieldPath, clickedBsonValue)
-        ) {
+        if (canRefJump || onRequestOpenJoinDialog != null) {
             menu.addSeparator()
-            addedRelationalSection = true
-            menu.add(JMenuItem(I18n.t("result.ref.jumpToCollection")).apply {
-                addActionListener {
-                    showReferenceCollectionPopup(invoker, Point(x, y), focusFieldPath, clickedBsonValue)
-                }
-            })
-        }
-
-        if (onRequestOpenJoinDialog != null) {
-            if (!addedRelationalSection) {
-                menu.addSeparator()
-                addedRelationalSection = true
+            if (canRefJump) {
+                menu.add(JMenuItem(I18n.t("result.ref.jumpToCollection")).apply {
+                    addActionListener {
+                        showReferenceCollectionPopup(invoker, Point(x, y), focusFieldPath!!, clickedBsonValue!!)
+                    }
+                })
             }
-            menu.add(JMenuItem(I18n.t("result.join.openDialog")).apply {
-                addActionListener {
-                    onRequestOpenJoinDialog.invoke(focusFieldPath)
-                }
-            })
-        }
-
-        if (onApplyQuickFilter != null && focusFieldPath != null && clickedBsonValue != null) {
-            when (clickedBsonValue) {
-                is BsonObjectId -> {
-                    if (!addedRelationalSection) {
-                        menu.addSeparator()
-                        addedRelationalSection = true
+            if (onRequestOpenJoinDialog != null) {
+                menu.add(JMenuItem(I18n.t("result.join.openDialog")).apply {
+                    addActionListener {
+                        onRequestOpenJoinDialog.invoke(normalizedFocusPath ?: focusFieldPath)
                     }
-                    val oidMenu = JMenu(I18n.t("result.timeFilter.menu")).apply {
-                        add(JMenuItem(I18n.t("result.timeFilter.gte")).apply {
-                            addActionListener {
-                                onApplyQuickFilter.invoke(
-                                    UiHelpers.buildObjectIdTimeRangeFilter(focusFieldPath, clickedBsonValue.value, isGte = true)
-                                )
-                            }
-                        })
-                        add(JMenuItem(I18n.t("result.timeFilter.lte")).apply {
-                            addActionListener {
-                                onApplyQuickFilter.invoke(
-                                    UiHelpers.buildObjectIdTimeRangeFilter(focusFieldPath, clickedBsonValue.value, isGte = false)
-                                )
-                            }
-                        })
-                    }
-                    menu.add(oidMenu)
-                }
-                is BsonDateTime -> {
-                    if (!addedRelationalSection) {
-                        menu.addSeparator()
-                        addedRelationalSection = true
-                    }
-                    val dateMenu = JMenu(I18n.t("result.dateFilter.menu")).apply {
-                        add(JMenuItem(I18n.t("result.dateFilter.gte")).apply {
-                            addActionListener {
-                                onApplyQuickFilter.invoke(
-                                    UiHelpers.buildDateTimeRangeFilter(focusFieldPath, clickedBsonValue.value, isGte = true)
-                                )
-                            }
-                        })
-                        add(JMenuItem(I18n.t("result.dateFilter.lte")).apply {
-                            addActionListener {
-                                onApplyQuickFilter.invoke(
-                                    UiHelpers.buildDateTimeRangeFilter(focusFieldPath, clickedBsonValue.value, isGte = false)
-                                )
-                            }
-                        })
-                    }
-                    menu.add(dateMenu)
-                }
-                else -> Unit
+                })
             }
         }
 
-        // 3. Diff Comparison (2 Selected Documents + Baseline Snapshot)
+        // ============================================================
+        // Group 5: Document Diff (2 Selected Docs + Pinned Baseline)
+        // ============================================================
         if (diffBaselineState != null) {
             menu.addSeparator()
             val canCompareTwo = selectedDocIndices.size == 2
@@ -1595,18 +1942,31 @@ class ResultViewerPanel(
                 indexBadge.text = I18n.t("result.badge.ixscan")
                 indexBadge.background = UiHelpers.COLOR_GREEN_BG
                 indexBadge.foreground = UiHelpers.COLOR_GREEN_FG
-                indexBadge.toolTipText = I18n.t("result.badge.ixscanTooltip", result.indexName ?: "index")
+                val baseTip = StringUtil.escapeXmlEntities(I18n.t("result.badge.ixscanTooltip", result.indexName ?: "index"))
+                val clickHint = StringUtil.escapeXmlEntities(I18n.t("result.badge.clickInspectHint"))
+                indexBadge.toolTipText = "<html><b>$baseTip</b><br/><i>$clickHint</i></html>"
                 indexBadge.isVisible = true
             }
             IndexScanType.COLLSCAN -> {
                 indexBadge.text = I18n.t("result.badge.collscan")
                 indexBadge.background = UiHelpers.COLOR_ORANGE_BG
                 indexBadge.foreground = UiHelpers.COLOR_ORANGE_FG
-                indexBadge.toolTipText = I18n.t("result.badge.collscanTooltip")
+                indexBadge.toolTipText = buildCollscanIndexHintTooltip(result.collectionIndexes)
                 indexBadge.isVisible = true
             }
             IndexScanType.UNKNOWN -> {
-                indexBadge.isVisible = false
+                if (!result.explainError.isNullOrBlank()) {
+                    indexBadge.text = I18n.t("result.badge.unknown")
+                    indexBadge.background = UiHelpers.COLOR_GRAY_BG
+                    indexBadge.foreground = UiHelpers.COLOR_GRAY_FG
+                    val reason = StringUtil.escapeXmlEntities(result.explainError)
+                    val title = StringUtil.escapeXmlEntities(I18n.t("result.badge.unknownTooltip"))
+                    val clickHint = StringUtil.escapeXmlEntities(I18n.t("result.badge.clickInspectHint"))
+                    indexBadge.toolTipText = "<html><b>$title</b><br/>$reason<br/><br/><i>$clickHint</i></html>"
+                    indexBadge.isVisible = true
+                } else {
+                    indexBadge.isVisible = false
+                }
             }
         }
 
@@ -1621,6 +1981,17 @@ class ResultViewerPanel(
         prevBtn.isEnabled = currentSkip > 0
         nextBtn.isEnabled = result.hasNextPage
             ?: (docs.size >= currentLimit && (result.totalCount < 0 || currentSkip + docs.size < result.totalCount))
+    }
+
+    private fun buildCollscanIndexHintTooltip(indexes: List<String>): String {
+        val warn = StringUtil.escapeXmlEntities(I18n.t("result.badge.collscanTooltip"))
+        val clickHint = StringUtil.escapeXmlEntities(I18n.t("result.badge.clickInspectHint"))
+        if (indexes.isEmpty()) return "<html><b>$warn</b><br/><i>$clickHint</i></html>"
+        val header = StringUtil.escapeXmlEntities(I18n.t("result.badge.availableIndexes"))
+        val bullets = indexes.joinToString("<br/>") { idx ->
+            "• ${StringUtil.escapeXmlEntities(idx)}"
+        }
+        return "<html><b>$warn</b><br/><br/><b>$header</b><br/>$bullets<br/><br/><i>$clickHint</i></html>"
     }
 
     private fun populateTree(docs: List<BsonDocument>) {
