@@ -59,7 +59,8 @@ class CollectionWorkspaceTab(
     diffBaselineState: DiffBaselineState? = null,
     onOpenReferenceJumpTab: ((targetCollection: String, sourceFieldPath: String, sourceValue: BsonValue) -> Unit)? = null,
     onOpenJoinTab: ((joinSpec: JoinSpec, currentFilter: String, currentSort: String) -> Unit)? = null,
-    private val onJoinTitleUpdated: ((displayJoinTitle: String) -> Unit)? = null
+    private val onJoinTitleUpdated: ((displayJoinTitle: String) -> Unit)? = null,
+    private val onOpenSettings: () -> Unit = {}
 ) : JPanel(BorderLayout()), Disposable {
 
     enum class WorkspaceMode {
@@ -253,7 +254,8 @@ class CollectionWorkspaceTab(
             breadcrumbLabel.text = "${profile.displayName}  /  $database.$joinDisplay"
             updateJoinKeysSummaryBadge(updatedSpec)
             onJoinTitleUpdated?.invoke(joinDisplay)
-        }
+        },
+        onOpenSettings = onOpenSettings
     )
 
     private val aggregationPanel = AggregationBuilderPanel(
@@ -354,6 +356,12 @@ class CollectionWorkspaceTab(
     fun refreshAfterImport() {
         if (!isDisposedFlag.get() && !findPanel.isJoinTab) {
             findPanel.executeFind(resetJoinPage = false, forceMetaRefresh = true)
+        }
+    }
+
+    fun syncToolbarState() {
+        if (!isDisposedFlag.get()) {
+            findPanel.updateToolbarStateForJoinMode(findPanel.isJoinTab)
         }
     }
 

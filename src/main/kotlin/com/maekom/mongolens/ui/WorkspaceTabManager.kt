@@ -11,6 +11,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.ui.tabs.JBTabs
 import com.intellij.ui.tabs.TabInfo
+import com.intellij.ui.tabs.TabsListener
 import com.maekom.mongolens.config.MongoConnectionProfile
 import com.maekom.mongolens.config.SavedQueryStore
 import com.maekom.mongolens.config.VariableStore
@@ -38,7 +39,8 @@ class WorkspaceTabManager(
     private val diffBaselineState: DiffBaselineState = DiffBaselineState(),
     private val onStatusUpdate: (String, Boolean) -> Unit,
     private val onReadOnlyStateChanged: () -> Unit,
-    private val onTabCountChanged: (Int) -> Unit
+    private val onTabCountChanged: (Int) -> Unit,
+    private val onOpenSettings: () -> Unit = {}
 ) {
     data class TabEntry(
         val tabId: String,
@@ -57,6 +59,13 @@ class WorkspaceTabManager(
 
     init {
         installTabMouseAndContextMenuHandlers()
+        tabs.addListener(object : TabsListener {
+            override fun selectionChanged(oldSelection: TabInfo?, newSelection: TabInfo?) {
+                if (newSelection != null) {
+                    entryByTabInfo[newSelection]?.workspaceTab?.syncToolbarState()
+                }
+            }
+        }, parentDisposable)
     }
 
     fun buildTabKey(profile: MongoConnectionProfile, database: String, collection: String): String {
@@ -215,7 +224,8 @@ class WorkspaceTabManager(
                     setText("$updatedDisplay$numberSuffix")
                     setTooltipText("${profile.displayName} / $database.$updatedDisplay$numberSuffix")
                 }
-            }
+            },
+            onOpenSettings = onOpenSettings
         )
         Disposer.register(parentDisposable, workspaceTab)
 

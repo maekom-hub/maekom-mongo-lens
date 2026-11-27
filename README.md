@@ -1,6 +1,6 @@
 # Maekom Mongo Lens
 
-[![Version](https://img.shields.io/badge/version-v0.3.0-blue.svg)](https://github.com/maekom-hub/maekom-mongo-lens/releases)
+[![Version](https://img.shields.io/badge/version-v0.3.1-blue.svg)](https://github.com/maekom-hub/maekom-mongo-lens/releases)
 [![IntelliJ IDEA](https://img.shields.io/badge/IntelliJ%20IDEA-2024.2%2B-purple.svg)](https://www.jetbrains.com/idea/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](./LICENSE)
 
@@ -20,7 +20,7 @@
 
 | Item | Specification |
 | :--- | :--- |
-| **Version** | `0.3.0` |
+| **Version** | `0.3.1` |
 | **IntelliJ IDEA** | `2024.2+` (Community / Ultimate — matches `sinceBuild = "242"`) |
 | **Java Runtime (JBR)** | Minimum `JDK 17` / Recommended `JDK 21` |
 | **Database Support** | `MongoDB 4.4 ~ 8.0` (Standalone, Replica Set, Atlas `mongodb+srv`) & `AWS DocumentDB 3.6 / 4.0 / 5.0` |
@@ -49,7 +49,7 @@
 
 ### Installation
 
-1. Download **`maekom-mongo-lens-0.3.0.zip`** from [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases).
+1. Download **`maekom-mongo-lens-0.3.1.zip`** from [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases).
 2. In IntelliJ IDEA (`2024.2+`), go to **`Settings / Preferences` → `Plugins` → ⚙️ (Gear Icon) → `Install Plugin from Disk...`**.
 3. Select the downloaded `.zip` archive and restart the IDE.
 4. Open the **`Maekom Mongo Lens`** tool window at the bottom of the IDE.
@@ -69,6 +69,14 @@
    - Use **`↑`/`↓`** and **`Enter`/`Tab`** autocomplete in `Filter`/`Sort`/`Project`, `Ctrl`/`Shift` multi-select right-click for dynamic Quick Filters, or right-click a key → **`Join with Another Collection...`** for single/composite-key joins.
 
 ---
+
+### Changelog (`v0.3.1`)
+
+- **Configurable Query Timeout (Default `40s`) + Dual Timeout Guard & Guidance Popup (`MongoLensSettings` / `QuerySettingsDialog` / `TimeoutGuideDialog`)**: Added persistent `Query Timeout (sec)` (`5–600s`, default `40s`) in the top-right Settings (`⚙`) menu, combining server-side `maxTimeMS` (with automatic AWS DocumentDB fallback retry) and a client-side watchdog timer that shows a once-per-run troubleshooting popup with a direct **`Open Timeout Settings`** button (never shown on manual Stop).
+- **Per-Tab Isolated `▶ Find` ↔ `■ Stop` Toggle & Safe Client-Side Cancellation (`QueryRunTracker`)**: Toggles the Run button into a red **`■ Stop`** button per tab during execution and cancels cleanly via monotonic `runId` tokens, `Future.cancel(true)`, and `MongoCursor.close()` (zero admin `killOp` calls), preventing late cleanup of a stopped run from clobbering a newly started run.
+- **Join Mode Toolbar Disabling with Tab-Switch Sync (`JoinToolbarStatePolicy`)**: Automatically disables single-collection-only inputs/buttons (`Filter`/`Project`/`Sort`, `Reset`, `Smart $in`, `Shell`, `Saved/History`, `Import JSON`, `Index Inspector`) with explanatory tooltips while Join View is active, keeping unified Run/Stop, Join Config, Copy Pipeline, Export, Limit, and Paging active and synchronized on tab switch.
+- **Bidirectional Pre-Filter Join Engine (`BidirectionalPreFilterJoinEngine`)**: Applies base and target `WHERE AND` conditions with schema-aware BSON typing before cross-matching keys via `normalizeJoinKey` (`Int32` ↔ `Int64` safe hash join), short-circuiting `INNER JOIN` with 0 base queries when target pre-filter yields 0 matches (with a `10,000`-doc safety cap fallback to forward `$lookup`) and batch-fetching `LEFT JOIN` targets via `$in`.
+- **Real-Time MongoDB Compass-Compatible "Copy Pipeline" & Sort Fix (`CompassPipelineSerializer`)**: Places live unsaved-UI **`Copy Pipeline`** directly beside **`Run in Join Tab ▶`** in `JoinViewDialog` as well as on the Join Result toolbar — stripping UI collection prefixes, blocking copy when no valid join keys exist, placing early `$limit` before `$lookup` for unsorted `LEFT JOIN`, putting indexable target filters at top-level `$lookup.pipeline[0].$match` separated from `"$expr": { "$and": [...] }` (`joinKey0..N`), preserving sampled schema BSON types (`String` `"1234"` stays String; 24-hex `_id` becomes `{ "$oid": "..." }`), ordering `LATEST_ONE` as `$match → $sort({ _id: -1 }) → $limit: 1`, omitting empty `{ "$sort": {} }`, flattening Extended JSON `$numberInt` sort values to pure `1`/`-1`, and formatting in `JsonMode.RELAXED` — verified by 17 automated JUnit 5 tests.
 
 ### Changelog (`v0.3.0`)
 
@@ -90,7 +98,7 @@
 ./gradlew buildPlugin --no-daemon
 ```
 
-Generated archive: `build/distributions/maekom-mongo-lens-0.3.0.zip`
+Generated archive: `build/distributions/maekom-mongo-lens-0.3.1.zip`
 
 ---
 
@@ -108,7 +116,7 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.3.0.zip`
 
 | 항목 | 사양 |
 | :--- | :--- |
-| **Version** | `0.3.0` |
+| **Version** | `0.3.1` |
 | **IntelliJ IDEA** | `2024.2+` (Community / Ultimate — `build.gradle.kts` `sinceBuild = "242"` 기준) |
 | **Java Runtime (JBR)** | 최소 `JDK 17` / 권장 `JDK 21` |
 | **Database Support** | `MongoDB 4.4 ~ 8.0` (Standalone, Replica Set, Atlas `mongodb+srv`) & `AWS DocumentDB 3.6 / 4.0 / 5.0` |
@@ -137,7 +145,7 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.3.0.zip`
 
 ### 설치 방법
 
-1. [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases)에서 **`maekom-mongo-lens-0.3.0.zip`** 파일을 다운로드합니다.
+1. [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases)에서 **`maekom-mongo-lens-0.3.1.zip`** 파일을 다운로드합니다.
 2. IntelliJ IDEA (`2024.2+`)에서 **`Settings / Preferences` → `Plugins` → ⚙️(기어 아이콘) → `Install Plugin from Disk...`** 를 선택합니다.
 3. 다운로드한 `.zip` 파일을 선택하고 IDE를 재시작합니다.
 4. 하단 ToolWindow에서 **`Maekom Mongo Lens`** 탭을 엽니다.
@@ -157,6 +165,14 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.3.0.zip`
    - `Filter`/`Sort`/`Project`에서 **`↑`/`↓`**·**`Enter`/`Tab`** 자동완성, `Ctrl`/`Shift` 다중 선택 우클릭 빠른 필터, 기준 필드 우클릭 → **`다른 컬렉션과 조인해서 보기...`** 로 단일/복합키 조인을 실행합니다.
 
 ---
+
+### 릴리즈 노트 (`v0.3.1` Changelog)
+
+- **조회 타임아웃 설정(기본 `40초`) + 이중 타임아웃 가드 & 가이드 팝업 (`MongoLensSettings` / `QuerySettingsDialog` / `TimeoutGuideDialog`)**: 상단 우측 설정(`⚙`) 메뉴에 영속화되는 `조회 타임아웃(초)` (`5~600초`, 기본 `40초`) 설정을 추가하고, 서버 측 `maxTimeMS`(AWS DocumentDB 미지원 시 자동 폴백 재시도) + 클라이언트 워치독 이중 가드 및 1회성 원인 안내 + **`[타임아웃 설정 바로가기]`** 팝업을 구현했습니다(사용자 수동 정지 시 미노출).
+- **탭 독립 `▶ 조회` ↔ `■ 정지` 토글 및 안전한 클라이언트 중단 (`QueryRunTracker`)**: 조회 중 버튼이 빨간색 **`■ 정지`** 로 전환되며, `runId` 토큰으로 탭별 실행을 완전 격리하여 `killOp` 없이 `Future.cancel(true)` + `MongoCursor.close()`로 즉시 안전 중단하고 이전 요청의 지연 `finally`가 새 조회 상태를 덮어쓰지 않도록 방어했습니다.
+- **조인 뷰 모드 툴바 비활성화 및 탭 전환 동기화 (`JoinToolbarStatePolicy`)**: 조인 뷰 활성 시 단일 컬렉션 전용 컨트롤(`Filter`/`Project`/`Sort`, `초기화`, `Smart $in`, `Shell`, `저장/기록`, `JSON 임포트`, `인덱스 조회`)을 안내 툴팁과 함께 자동 비활성화하고, 통합 `▶ 조회`/`■ 정지`·조인 설정·파이프라인 복사·내보내기·Limit·페이징은 유지하며 탭 전환 시 즉시 상태를 동기화합니다.
+- **양방향 선(先)필터링 후 교차 매칭 조인 엔진 (`BidirectionalPreFilterJoinEngine`)**: 기준/조인 대상 컬렉션 각각의 추가 필터(`WHERE AND`)를 스키마 타입 기반으로 먼저 적용해 모수를 축소한 뒤 `normalizeJoinKey` (`Int32` ↔ `Int64` 호환 해시 조인)로 교차 매칭하며, `INNER JOIN` 대상 필터 0건 시 기준 컬렉션 조회 없이 즉시 단락 반환(안전 상한 `10,000`건 초과 시 자동 `$lookup` 폴백) 및 `LEFT JOIN` `$in` 배치 조회를 지원합니다.
+- **실시간 MongoDB Compass `Aggregations` 100% 호환 "파이프라인 복사" & Sort 수정 (`CompassPipelineSerializer`)**: `JoinViewDialog` 하단(`조인 탭으로 실행 ▶` 옆) 및 조인 결과 툴바에서 현재 미저장 UI 상태를 실시간 직렬화하며(UI 접두사 제거, 빈 키 경고 차단, 정렬 없는 `LEFT JOIN` 조기 `$limit` 선배치, `$lookup.pipeline[0].$match` 최상위 일반 필터 + `$expr.$and`(`joinKey0..N`) 분리, 스키마 `String`/`$oid` 보존, `LATEST_ONE` `$match → $sort({ _id: -1 }) → $limit: 1`, 빈 `$sort: {}` 생략 및 `$numberInt` 순수 정수 평탄화, `JsonMode.RELAXED` 출력), 총 17개 JUnit 5 단위 테스트로 검증했습니다.
 
 ### 릴리즈 노트 (`v0.3.0` Changelog)
 
@@ -178,7 +194,7 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.3.0.zip`
 ./gradlew buildPlugin --no-daemon
 ```
 
-빌드 산출물: `build/distributions/maekom-mongo-lens-0.3.0.zip`
+빌드 산출물: `build/distributions/maekom-mongo-lens-0.3.1.zip`
 
 ---
 

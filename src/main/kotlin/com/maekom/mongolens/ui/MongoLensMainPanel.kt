@@ -105,7 +105,8 @@ class MongoLensMainPanel(
             onReadOnlyStateChanged = { connectionsTree.repaintTree() },
             onTabCountChanged = { count ->
                 rightCardLayout.show(rightPanel, if (count > 0) "TABS" else "WELCOME")
-            }
+            },
+            onOpenSettings = { openSettingsDialog() }
         )
 
         connectionsTree = ConnectionsTreePanel(
@@ -258,6 +259,16 @@ class MongoLensMainPanel(
             }
 
             override fun getChildren(e: AnActionEvent?): Array<AnAction> {
+                val timeoutItem = object : AnAction(
+                    I18n.t("header.settings.timeout"),
+                    I18n.t("settings.timeout.hint"),
+                    AllIcons.General.History
+                ), DumbAware {
+                    override fun actionPerformed(ev: AnActionEvent) {
+                        openSettingsDialog()
+                    }
+                }
+
                 val decryptItem = object : AnAction(
                     I18n.t("header.settings.decrypt"),
                     I18n.t("header.cryptoConfigTooltip"),
@@ -304,11 +315,15 @@ class MongoLensMainPanel(
                     }
                 }
 
-                return arrayOf(decryptItem, updateItem, langItem)
+                return arrayOf(timeoutItem, decryptItem, updateItem, langItem)
             }
         }
 
         return listOf(versionStatusAction, settingsGroup)
+    }
+
+    fun openSettingsDialog() {
+        QuerySettingsDialog(project).show()
     }
 
     fun openDecryptConfigDialog() {

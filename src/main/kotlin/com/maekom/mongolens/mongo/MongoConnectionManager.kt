@@ -4,12 +4,16 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.maekom.mongolens.config.MongoConnectionProfile
+import com.maekom.mongolens.config.MongoLensSettings
 import com.mongodb.ConnectionString
 import com.mongodb.ExplainVerbosity
 import com.mongodb.MongoClientSettings
 import com.mongodb.MongoCommandException
+import com.mongodb.MongoExecutionTimeoutException
 import com.mongodb.client.MongoClient
 import com.mongodb.client.MongoClients
+import com.mongodb.client.MongoCursor
+import com.mongodb.client.MongoIterable
 import com.mongodb.client.model.CountOptions
 import com.mongodb.client.model.Filters
 import org.bson.BsonArray
@@ -109,6 +113,77 @@ class MongoConnectionManager(project: Project) : Disposable {
             cur = cur.cause
         }
         return false
+    }
+
+    fun isExecutionTimeoutError(t: Throwable): Boolean {
+        var cur: Throwable? = t
+        while (cur != null) {
+            if (cur is MongoExecutionTimeoutException) return true
+            if (cur is MongoCommandException && cur.errorCode == 50) return true
+            val msg = cur.message?.lowercase().orEmpty()
+            if (msg.contains("exceeded time limit") || msg.contains("maxtimems")) {
+                if (!isMaxTimeUnsupportedError(cur)) return true
+            }
+            cur = cur.cause
+        }
+        return false
+    }
+
+    fun isMaxTimeUnsupportedError(t: Throwable): Boolean {
+        var cur: Throwable? = t
+        while (cur != null) {
+            val msg = cur.message?.lowercase().orEmpty()
+            if (msg.contains("maxtimems") &&
+                (msg.contains("not supported") || msg.contains("unsupported") || msg.contains("unknown") || msg.contains("invalid"))
+            ) {
+                return true
+            }
+            cur = cur.cause
+        }
+        return false
+    }
+
+    private inline fun <T> executeWithMaxTimeFallback(
+        timeoutMs: Long,
+        withMaxTime: (Long) -> T,
+        withoutMaxTime: () -> T
+    ): T {
+        return try {
+            withMaxTime(timeoutMs)
+        } catch (t: Throwable) {
+            if (isMaxTimeUnsupportedError(t)) {
+                withoutMaxTime()
+            } else {
+                throw t
+            }
+        }
+    }
+
+    private fun drainCursorCancellably(
+        iterable: MongoIterable<BsonDocument>,
+        control: QueryExecutionControl?
+    ): MutableList<BsonDocument> {
+        val docs = mutableListOf<BsonDocument>()
+        if (control?.isCancelled?.invoke() == true || Thread.currentThread().isInterrupted) {
+            return docs
+        }
+        val cursor: MongoCursor<BsonDocument> = iterable.iterator()
+        try {
+            if (control?.isCancelled?.invoke() == true || Thread.currentThread().isInterrupted) {
+                return docs
+            }
+            control?.onCursorOpened?.invoke(cursor)
+            while (cursor.hasNext()) {
+                if (control?.isCancelled?.invoke() == true || Thread.currentThread().isInterrupted) {
+                    break
+                }
+                docs.add(cursor.next())
+            }
+        } finally {
+            control?.onCursorOpened?.invoke(null)
+            runCatching { cursor.close() }
+        }
+        return docs
     }
 
     init {
@@ -431,12 +506,36 @@ class MongoConnectionManager(project: Project) : Disposable {
         sortRaw: String?,
         pageIndex: Int,
         pageSize: Int?,
-        forceRefresh: Boolean = false
+        forceRefresh: Boolean = false,
+        executionControl: QueryExecutionControl? = null
     ): QueryExecutionResult {
         val safePage = pageIndex.coerceAtLeast(0)
         val safePageSize = pageSize?.coerceIn(1, JoinSpec.MAX_UNLIMITED_DOCS)
         val filter = MongoShellNormalizer.parseBsonDocument(filterRaw?.trim().orEmpty().ifEmpty { "{}" })
         val sort = MongoShellNormalizer.parseBsonDocument(sortRaw?.trim().orEmpty().ifEmpty { "{}" })
+        val timeoutMs = MongoLensSettings.getInstance().queryTimeoutMillis()
+
+        val startNs = System.nanoTime()
+
+        // Bidirectional Pre-Filter Join: reduces both base & target collections before cross-matching keys
+        // (short-circuits on 0 target keys for INNER JOIN, avoids full-collection $lookup bottlenecks on DocumentDB & MongoDB).
+        if (BidirectionalPreFilterJoinEngine.shouldUseBidirectionalPreFilter(joinSpec)) {
+            val preFilterResult = executeJoinBidirectionalPreFilter(
+                profile = profile,
+                database = database,
+                joinSpec = joinSpec,
+                filter = filter,
+                sort = sort,
+                safePage = safePage,
+                safePageSize = safePageSize,
+                forceRefresh = forceRefresh,
+                executionControl = executionControl,
+                startNs = startNs
+            )
+            if (preFilterResult != null) {
+                return preFilterResult
+            }
+        }
 
         // AWS DocumentDB (detected statically or via prior Error 304) uses 2-phase hybrid join + session-cached slicing
         if (joinSpec.hasCompositeJoin() && isDocumentDbHybridRequired(profile)) {
@@ -448,15 +547,14 @@ class MongoConnectionManager(project: Project) : Disposable {
                 sort = sort,
                 safePage = safePage,
                 safePageSize = safePageSize,
-                forceRefresh = forceRefresh
+                forceRefresh = forceRefresh,
+                executionControl = executionControl
             )
         }
 
         val client = getOrCreateClient(profile)
         val db = client.getDatabase(database)
         val coll = db.getCollection(joinSpec.leftCollection, BsonDocument::class.java)
-
-        val startNs = System.nanoTime()
 
         val pipeline = joinSpec.buildPipeline(
             filter = filter,
@@ -466,10 +564,19 @@ class MongoConnectionManager(project: Project) : Disposable {
             probeForNextPage = true
         )
         val rawDocs = try {
-            val aggIterable = coll.aggregate(pipeline)
-                .allowDiskUse(true)
-                .maxTime(15_000, TimeUnit.MILLISECONDS)
-            aggIterable.into(mutableListOf())
+            executeWithMaxTimeFallback(
+                timeoutMs = timeoutMs,
+                withMaxTime = { ms ->
+                    val aggIterable = coll.aggregate(pipeline)
+                        .allowDiskUse(true)
+                        .maxTime(ms, TimeUnit.MILLISECONDS)
+                    drainCursorCancellably(aggIterable, executionControl)
+                },
+                withoutMaxTime = {
+                    val aggIterable = coll.aggregate(pipeline).allowDiskUse(true)
+                    drainCursorCancellably(aggIterable, executionControl)
+                }
+            )
         } catch (t: Throwable) {
             if (joinSpec.hasCompositeJoin() && isError304MultipleJoin(t)) {
                 // Record connection as DocumentDB-compatible at runtime and retry seamlessly via hybrid join
@@ -482,7 +589,8 @@ class MongoConnectionManager(project: Project) : Disposable {
                     sort = sort,
                     safePage = safePage,
                     safePageSize = safePageSize,
-                    forceRefresh = true
+                    forceRefresh = true,
+                    executionControl = executionControl
                 )
             }
             throw t
@@ -529,6 +637,103 @@ class MongoConnectionManager(project: Project) : Disposable {
     }
 
     /**
+     * Executes Bidirectional Pre-Filter Join backed by `hybridJoinCache` for zero-gap pagination.
+     * Returns `null` when the pre-filter safety cap (10,000 docs) is exceeded so caller falls back
+     * seamlessly to forward `$lookup` / AWS DocumentDB hybrid join.
+     */
+    private fun executeJoinBidirectionalPreFilter(
+        profile: MongoConnectionProfile,
+        database: String,
+        joinSpec: JoinSpec,
+        filter: BsonDocument,
+        sort: BsonDocument,
+        safePage: Int,
+        safePageSize: Int?,
+        forceRefresh: Boolean,
+        executionControl: QueryExecutionControl?,
+        startNs: Long
+    ): QueryExecutionResult? {
+        val timeoutMs = MongoLensSettings.getInstance().queryTimeoutMillis()
+        val signature = hybridJoinCache.buildSignature(
+            connectionId = profile.id,
+            database = database,
+            leftCollection = joinSpec.leftCollection,
+            filterJson = filter.toJson(),
+            sortJson = sort.toJson(),
+            joinSpecSignature = "prefilter::${joinSpec.cacheSignatureSegment()}"
+        )
+
+        val cachedSlice = if (!forceRefresh) {
+            hybridJoinCache.getPage(signature, safePage, safePageSize)
+        } else {
+            null
+        }
+
+        val slice = cachedSlice ?: run {
+            val client = getOrCreateClient(profile)
+            val db = client.getDatabase(database)
+            val source = BidirectionalPreFilterJoinEngine.CollectionQuerySource { collName, qFilter, qSort, qLimit ->
+                val c = db.getCollection(collName, BsonDocument::class.java)
+                fun buildIt(applyMaxTime: Boolean): com.mongodb.client.FindIterable<BsonDocument> {
+                    val it = c.find(qFilter)
+                    if (qSort != null && !qSort.isEmpty()) it.sort(qSort)
+                    if (qLimit != null && qLimit > 0) {
+                        it.limit(qLimit).batchSize(minOf(qLimit, 1000))
+                    }
+                    if (applyMaxTime) it.maxTime(timeoutMs, TimeUnit.MILLISECONDS)
+                    return it
+                }
+                executeWithMaxTimeFallback(
+                    timeoutMs = timeoutMs,
+                    withMaxTime = { drainCursorCancellably(buildIt(applyMaxTime = true), executionControl) },
+                    withoutMaxTime = { drainCursorCancellably(buildIt(applyMaxTime = false), executionControl) }
+                )
+            }
+
+            val allLeftJoin = joinSpec.targets.all { !it.excludeUnmatched }
+            val engineLimit = if (allLeftJoin && safePageSize != null && safePage == 0) {
+                // Keep enough buffer for Next page navigation while still bounding base fetch
+                maxOf(safePageSize * 20, MultiKeyJoinFilterEngine.MIN_HYBRID_BUFFER_LIMIT)
+                    .coerceAtMost(JoinSpec.MAX_UNLIMITED_DOCS)
+            } else {
+                JoinSpec.MAX_UNLIMITED_DOCS
+            }
+
+            when (val outcome = BidirectionalPreFilterJoinEngine.execute(
+                source = source,
+                joinSpec = joinSpec,
+                topFilter = filter,
+                sort = sort,
+                resultLimit = engineLimit
+            )) {
+                is BidirectionalPreFilterJoinEngine.PreFilterExecutionResult.FallbackToLookup -> return null
+                is BidirectionalPreFilterJoinEngine.PreFilterExecutionResult.Completed -> {
+                    hybridJoinCache.putAndSlice(profile.id, signature, outcome.documents, safePage, safePageSize)
+                }
+            }
+        }
+
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs)
+        val capHit = safePageSize == null && slice.totalCount > JoinSpec.MAX_UNLIMITED_DOCS
+        val effectiveLeftFilter = joinSpec.buildEffectiveLeftFilter(filter)
+        val isUnfilteredPreview = effectiveLeftFilter.isEmpty() && sort.isEmpty()
+        val (sampledFields, sampledFieldTypes) = extractFieldSchema(slice.pageDocs.take(20))
+
+        return QueryExecutionResult(
+            documents = slice.pageDocs,
+            totalCount = slice.totalCount.toLong(),
+            isApproximateCount = false,
+            elapsedMs = elapsedMs,
+            scanType = if (isUnfilteredPreview) IndexScanType.NO_FILTER_PREVIEW else IndexScanType.UNKNOWN,
+            indexName = null,
+            sampledFields = sampledFields,
+            sampledFieldTypes = sampledFieldTypes,
+            hasNextPage = slice.hasNextPage,
+            unlimitedCapHit = capHit
+        )
+    }
+
+    /**
      * AWS DocumentDB 100%-compatible 2-phase Hybrid Composite Join:
      * - Stage 1 (DB): Single-key standard `$lookup` (prioritizing unique ID keys) + `$slice(500)` 16MB guard,
      *   no `$skip`, bounded `$limit: maxOf(pageSize * 20, 2000)`.
@@ -543,9 +748,11 @@ class MongoConnectionManager(project: Project) : Disposable {
         sort: BsonDocument,
         safePage: Int,
         safePageSize: Int?,
-        forceRefresh: Boolean
+        forceRefresh: Boolean,
+        executionControl: QueryExecutionControl? = null
     ): QueryExecutionResult {
         val startNs = System.nanoTime()
+        val timeoutMs = MongoLensSettings.getInstance().queryTimeoutMillis()
         val signature = hybridJoinCache.buildSignature(
             connectionId = profile.id,
             database = database,
@@ -569,10 +776,19 @@ class MongoConnectionManager(project: Project) : Disposable {
                 JoinSpec.MAX_UNLIMITED_DOCS
             }
             val hybridPipeline = joinSpec.buildHybridDocumentDbPipeline(filter, sort, bufferLimit)
-            val rawDbDocs = coll.aggregate(hybridPipeline)
-                .allowDiskUse(true)
-                .maxTime(15_000, TimeUnit.MILLISECONDS)
-                .into(mutableListOf())
+            val rawDbDocs = executeWithMaxTimeFallback(
+                timeoutMs = timeoutMs,
+                withMaxTime = { ms ->
+                    val iterable = coll.aggregate(hybridPipeline)
+                        .allowDiskUse(true)
+                        .maxTime(ms, TimeUnit.MILLISECONDS)
+                    drainCursorCancellably(iterable, executionControl)
+                },
+                withoutMaxTime = {
+                    val iterable = coll.aggregate(hybridPipeline).allowDiskUse(true)
+                    drainCursorCancellably(iterable, executionControl)
+                }
+            )
             val shapedDocs = MultiKeyJoinFilterEngine.applyFullHybridJoinShaping(rawDbDocs, joinSpec)
             hybridJoinCache.putAndSlice(profile.id, signature, shapedDocs, safePage, safePageSize)
         }
@@ -706,7 +922,8 @@ class MongoConnectionManager(project: Project) : Disposable {
         projectionRaw: String?,
         sortRaw: String?,
         skip: Int,
-        limit: Int
+        limit: Int,
+        executionControl: QueryExecutionControl? = null
     ): QueryExecutionResult {
         val filter = MongoShellNormalizer.parseBsonDocument(filterRaw?.trim().orEmpty().ifEmpty { "{}" })
         val projection = MongoShellNormalizer.parseBsonDocument(projectionRaw?.trim().orEmpty().ifEmpty { "{}" })
@@ -719,20 +936,26 @@ class MongoConnectionManager(project: Project) : Disposable {
         val startNs = System.nanoTime()
         val safeSkip = skip.coerceAtLeast(0)
         val safeLimit = limit.coerceIn(1, 5000)
-        val iterable = coll.find(filter)
-            .skip(safeSkip)
-            .limit(safeLimit)
-            .batchSize(safeLimit)
-            .maxTime(15, TimeUnit.SECONDS)
+        val timeoutMs = MongoLensSettings.getInstance().queryTimeoutMillis()
 
-        if (!projection.isEmpty()) {
-            iterable.projection(projection)
-        }
-        if (!sort.isEmpty()) {
-            iterable.sort(sort)
+        fun buildFindIterable(applyMaxTime: Boolean): com.mongodb.client.FindIterable<BsonDocument> {
+            val it = coll.find(filter)
+                .skip(safeSkip)
+                .limit(safeLimit)
+                .batchSize(safeLimit)
+            if (applyMaxTime) {
+                it.maxTime(timeoutMs, TimeUnit.MILLISECONDS)
+            }
+            if (!projection.isEmpty()) it.projection(projection)
+            if (!sort.isEmpty()) it.sort(sort)
+            return it
         }
 
-        val docs = iterable.into(mutableListOf())
+        val docs = executeWithMaxTimeFallback(
+            timeoutMs = timeoutMs,
+            withMaxTime = { drainCursorCancellably(buildFindIterable(applyMaxTime = true), executionControl) },
+            withoutMaxTime = { drainCursorCancellably(buildFindIterable(applyMaxTime = false), executionControl) }
+        )
         val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs)
 
         val isUnfilteredPreview = filter.isEmpty() && sort.isEmpty()
@@ -800,9 +1023,15 @@ class MongoConnectionManager(project: Project) : Disposable {
             runCatching {
                 val client = getOrCreateClient(profile)
                 val coll = client.getDatabase(database).getCollection(collection, BsonDocument::class.java)
-                coll.countDocuments(
-                    filter,
-                    CountOptions().maxTime(META_QUERY_MAX_TIME_MS, TimeUnit.MILLISECONDS)
+                val countTimeoutMs = minOf(MongoLensSettings.getInstance().queryTimeoutMillis(), 10_000L)
+                executeWithMaxTimeFallback(
+                    timeoutMs = countTimeoutMs,
+                    withMaxTime = { ms ->
+                        coll.countDocuments(filter, CountOptions().maxTime(ms, TimeUnit.MILLISECONDS))
+                    },
+                    withoutMaxTime = {
+                        coll.countDocuments(filter)
+                    }
                 )
             }.getOrElse {
                 isApprox = true

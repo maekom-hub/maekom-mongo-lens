@@ -1,5 +1,6 @@
 package com.maekom.mongolens.ui
 
+import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
@@ -10,20 +11,26 @@ import com.intellij.ui.components.JBLabel
 import com.intellij.util.concurrency.AppExecutorUtil
 import com.intellij.util.ui.JBUI
 import java.util.concurrent.Future
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import com.maekom.mongolens.config.MongoConnectionProfile
+import com.maekom.mongolens.config.MongoLensSettings
 import com.maekom.mongolens.config.SavedQuery
 import com.maekom.mongolens.config.SavedQueryStore
 import com.maekom.mongolens.crypto.CryptoConfigStore
 import com.maekom.mongolens.i18n.I18n
 import com.intellij.notification.NotificationType
 import com.maekom.mongolens.mongo.JoinSpec
+import com.maekom.mongolens.mongo.JoinToolbarStatePolicy
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import com.maekom.mongolens.mongo.MongoShellNormalizer
+import com.maekom.mongolens.mongo.QueryExecutionControl
+import com.maekom.mongolens.mongo.QueryRunTracker
 import com.maekom.mongolens.mongo.QuickFilterHelper
 import com.maekom.mongolens.mongo.SmartInValueType
+import com.mongodb.client.MongoCursor
 import org.bson.BsonDocument
 import org.bson.BsonValue
 import java.awt.BorderLayout
@@ -63,7 +70,8 @@ class FindQueryPanel(
     private val collectionsSupplier: () -> List<String> = { emptyList() },
     private val onOpenReferenceJumpTab: ((targetCollection: String, sourceFieldPath: String, sourceValue: BsonValue) -> Unit)? = null,
     private val onOpenJoinTab: ((joinSpec: JoinSpec, currentFilter: String, currentSort: String) -> Unit)? = null,
-    private val onJoinSpecUpdated: ((updatedSpec: JoinSpec) -> Unit)? = null
+    private val onJoinSpecUpdated: ((updatedSpec: JoinSpec) -> Unit)? = null,
+    private val onOpenSettings: () -> Unit = {}
 ) : JPanel(BorderLayout()), Disposable {
 
     private data class LimitChoice(val value: Int?) {
@@ -79,10 +87,12 @@ class FindQueryPanel(
     private var joinCurrentPage: Int = 0
     private var suppressLimitComboEvents = false
 
-    // Single-Flight request control: monotonically increasing generation + cancellable Futures + disposed guard
-    private val requestGeneration = AtomicLong(0L)
+    // Per-tab isolated runId token, cursor, futures, and watchdog timer (NEVER uses admin killOp)
+    private val runTracker = QueryRunTracker()
+    private val activeCursor = AtomicReference<MongoCursor<*>?>(null)
     private val activePrimaryFuture = AtomicReference<Future<*>?>(null)
     private val activeMetaFuture = AtomicReference<Future<*>?>(null)
+    private val activeWatchdogFuture = AtomicReference<ScheduledFuture<*>?>(null)
     private val isDisposedFlag = AtomicBoolean(false)
     private val hasCompletedInitialLoad = AtomicBoolean(false)
 
@@ -301,7 +311,105 @@ class FindQueryPanel(
         }
         buildCompactQueryBar()
         add(resultViewer, BorderLayout.CENTER)
+        updateToolbarStateForJoinMode(isJoinTab)
         I18n.addListener(this) { refreshTexts() }
+    }
+
+    /**
+     * Synchronizes single-collection vs Join-view toolbar control states & disabled tooltips.
+     * Re-invoked on tab switches and Join-mode toggles so controls always reflect the active tab.
+     */
+    fun updateToolbarStateForJoinMode(isJoinActive: Boolean) {
+        val states = JoinToolbarStatePolicy.compute(isJoinActive)
+        val disabledTip = if (isJoinActive) I18n.t("join.toolbar.disabledTooltip") else null
+
+        filterEditor.isEnabled = states.filterInputEnabled
+        filterEditor.toolTipText = disabledTip
+        sortEditor.isEnabled = states.sortInputEnabled
+        sortEditor.toolTipText = disabledTip
+        projectEditor.isEnabled = states.projectInputEnabled
+        projectEditor.toolTipText = disabledTip
+        projectToggleBtn.isEnabled = states.projectInputEnabled
+        projectToggleBtn.toolTipText = disabledTip
+
+        resetBtn.isEnabled = states.resetEnabled
+        resetBtn.toolTipText = disabledTip
+        smartInBtn.isEnabled = states.smartInEnabled
+        smartInBtn.toolTipText = if (states.smartInEnabled) I18n.t("find.smartInTooltip") else disabledTip
+        toShellBtn.isEnabled = states.toShellEnabled
+        toShellBtn.toolTipText = if (states.toShellEnabled) I18n.t("find.toShellTooltip") else disabledTip
+        savedQueriesBtn.isEnabled = states.savedQueriesEnabled
+        savedQueriesBtn.toolTipText = disabledTip
+
+        // Always keep unified Run/Stop, Limit, Column Select, Join Config, Copy Pipeline, Export, and Paging active
+        runBtn.isEnabled = states.runOrStopEnabled
+        limitCombo.isEnabled = states.pageSizeEnabled
+        limitDecreaseBtn.isEnabled = states.pageSizeEnabled
+        limitIncreaseBtn.isEnabled = states.pageSizeEnabled
+
+        resultViewer.setJoinModeControlStates(
+            importEnabled = states.importJsonEnabled,
+            indexInspectEnabled = states.indexInspectorEnabled,
+            disabledTooltip = disabledTip
+        )
+    }
+
+    private fun updateRunButtonVisual(running: Boolean) {
+        if (running) {
+            runBtn.text = I18n.t("find.stop")
+            runBtn.icon = AllIcons.Actions.Suspend
+            runBtn.foreground = UiHelpers.COLOR_RED_FG
+            runBtn.toolTipText = I18n.t("find.stopTooltip")
+        } else {
+            runBtn.text = I18n.t("find.run")
+            runBtn.icon = null
+            runBtn.foreground = UiHelpers.COLOR_GREEN_FG
+            runBtn.toolTipText = I18n.t("find.runTooltip")
+        }
+        runBtn.isEnabled = true
+        runBtn.revalidate()
+        runBtn.repaint()
+    }
+
+    /**
+     * Client-side safe Stop (NEVER calls admin currentOp/killOp):
+     * 1) marks manual stop & advances runId token
+     * 2) cancels watchdog & worker futures
+     * 3) closes active MongoCursor inside try/catch
+     * 4) restores `▶ 조회` immediately on EDT
+     */
+    fun stopActiveQuery(updateUi: Boolean = true) {
+        runTracker.requestStop()
+        activeWatchdogFuture.getAndSet(null)?.cancel(false)
+        activePrimaryFuture.getAndSet(null)?.cancel(true)
+        activeMetaFuture.getAndSet(null)?.cancel(true)
+        runCatching { activeCursor.getAndSet(null)?.close() }
+
+        if (updateUi && !isDisposedFlag.get()) {
+            val restoreUi = Runnable {
+                if (isDisposedFlag.get()) return@Runnable
+                updateRunButtonVisual(running = false)
+                resultViewer.setLoading(false)
+                onStatusUpdate(I18n.t("header.status.stopped"), false)
+            }
+            if (SwingUtilities.isEventDispatchThread()) restoreUi.run() else ApplicationManager.getApplication().invokeLater(restoreUi)
+        }
+    }
+
+    private fun showTimeoutGuideIfNeeded(myRunId: Long, timeoutSeconds: Int, serverTimeoutException: Boolean) {
+        if (!runTracker.tryAcquireTimeoutAlertSlot(myRunId, serverTimeoutException)) return
+        ApplicationManager.getApplication().invokeLater {
+            if (isDisposedFlag.get() || project.isDisposed) return@invokeLater
+            if (runTracker.finishRunIfCurrent(myRunId)) {
+                activeCursor.set(null)
+                updateRunButtonVisual(running = false)
+                resultViewer.setLoading(false)
+            }
+            onStatusUpdate(I18n.t("header.status.timedOut", timeoutSeconds), true)
+            TimeoutGuideDialog(project, timeoutSeconds) {
+                onOpenSettings()
+            }.show()
+        }
     }
 
     private fun buildCompactQueryBar() {
@@ -482,7 +590,13 @@ class FindQueryPanel(
             }
         }
 
-        runBtn.addActionListener { executeFind(resetJoinPage = true, forceMetaRefresh = true) }
+        runBtn.addActionListener {
+            if (runTracker.isQueryRunning) {
+                stopActiveQuery(updateUi = true)
+            } else {
+                executeFind(resetJoinPage = true, forceMetaRefresh = true, ignoreIfRunning = true)
+            }
+        }
 
         resetBtn.addActionListener {
             resultViewer.resetTableBatchDecryption()
@@ -709,6 +823,14 @@ class FindQueryPanel(
 
     private fun copyCurrentJoinPipeline() {
         val spec = activeJoinSpec ?: return
+        if (!com.maekom.mongolens.mongo.CompassPipelineSerializer.hasValidJoinKeys(spec)) {
+            Messages.showWarningDialog(
+                project,
+                I18n.t("join.tab.copyPipelineNoValidKeys"),
+                I18n.t("join.tab.copyPipelineBtn")
+            )
+            return
+        }
         val jsonArray = spec.formatPipelineJsonArray(
             filterRaw = filterEditor.safeText(),
             sortRaw = sortEditor.safeText(),
@@ -797,13 +919,22 @@ class FindQueryPanel(
         }
     }
 
-    fun executeFind(resetJoinPage: Boolean = true, forceMetaRefresh: Boolean = false) {
+    fun executeFind(
+        resetJoinPage: Boolean = true,
+        forceMetaRefresh: Boolean = false,
+        ignoreIfRunning: Boolean = false
+    ) {
         if (isDisposedFlag.get() || project.isDisposed) return
+        if (ignoreIfRunning && runTracker.isQueryRunning) return
 
-        // Single-Flight: advance generation & cancel any in-flight primary + trailing metadata tasks
-        val gen = requestGeneration.incrementAndGet()
+        // Cancel any previous run cleanly before advancing runId token
+        activeWatchdogFuture.getAndSet(null)?.cancel(false)
         activePrimaryFuture.getAndSet(null)?.cancel(true)
         activeMetaFuture.getAndSet(null)?.cancel(true)
+        runCatching { activeCursor.getAndSet(null)?.close() }
+
+        val myRunId = runTracker.beginNewRun()
+        val timeoutSeconds = MongoLensSettings.getInstance().queryTimeoutSeconds
 
         resultViewer.resetTableBatchDecryption()
         filterEditor.dismissPopup()
@@ -823,13 +954,38 @@ class FindQueryPanel(
         val limit = currentLimit()
         val skip = currentSkip()
 
-        runBtn.isEnabled = false
+        updateRunButtonVisual(running = true)
         resultViewer.setLoading(true)
         onStatusUpdate(I18n.t("header.status.querying"), false)
 
+        val executionControl = QueryExecutionControl(
+            runId = myRunId,
+            isCancelled = { isDisposedFlag.get() || project.isDisposed || runTracker.isCancelledFor(myRunId) },
+            onCursorOpened = { cursor ->
+                if (cursor == null) {
+                    activeCursor.set(null)
+                } else if (runTracker.isCancelledFor(myRunId)) {
+                    runCatching { cursor.close() }
+                } else {
+                    activeCursor.set(cursor)
+                }
+            }
+        )
+
+        // Client-side watchdog timer paired with server maxTimeMS (Dual Timeout Guard)
+        val watchdog = AppExecutorUtil.getAppScheduledExecutorService().schedule({
+            if (isDisposedFlag.get() || project.isDisposed) return@schedule
+            if (runTracker.markTimedOutIfActive(myRunId)) {
+                activePrimaryFuture.get()?.cancel(true)
+                runCatching { activeCursor.getAndSet(null)?.close() }
+                showTimeoutGuideIfNeeded(myRunId, timeoutSeconds, serverTimeoutException = false)
+            }
+        }, timeoutSeconds.toLong(), TimeUnit.SECONDS)
+        activeWatchdogFuture.set(watchdog)
+
         val executor = AppExecutorUtil.getAppExecutorService()
         val primaryFuture = executor.submit {
-            if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@submit
+            if (isDisposedFlag.get() || project.isDisposed || runTracker.isCancelledFor(myRunId)) return@submit
             try {
                 // Phase 1: Zero-Overhead Primary Fetch (single find/join roundtrip; NO count/explain/listIndexes blocking UI)
                 val result = if (joinSpecSnapshot != null) {
@@ -841,7 +997,8 @@ class FindQueryPanel(
                         sortRaw = sortRaw,
                         pageIndex = joinPageSnapshot,
                         pageSize = joinPageSizeSnapshot,
-                        forceRefresh = forceMetaRefresh || resetJoinPage
+                        forceRefresh = forceMetaRefresh || resetJoinPage,
+                        executionControl = executionControl
                     )
                 } else {
                     connectionManager.executeFindPrimary(
@@ -852,11 +1009,12 @@ class FindQueryPanel(
                         projectionRaw = projRaw,
                         sortRaw = sortRaw,
                         skip = skip,
-                        limit = limit
+                        limit = limit,
+                        executionControl = executionControl
                     )
                 }
 
-                if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@submit
+                if (isDisposedFlag.get() || project.isDisposed || runTracker.isCancelledFor(myRunId)) return@submit
 
                 if (joinSpecSnapshot == null) {
                     runCatching {
@@ -896,10 +1054,8 @@ class FindQueryPanel(
                 }
 
                 ApplicationManager.getApplication().invokeLater {
-                    if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@invokeLater
+                    if (isDisposedFlag.get() || project.isDisposed || runTracker.isCancelledFor(myRunId)) return@invokeLater
                     hasCompletedInitialLoad.set(true)
-                    runBtn.isEnabled = true
-                    resultViewer.setLoading(false)
                     if (result.sampledFields.isNotEmpty()) {
                         onFieldsDiscovered(result.sampledFields, result.sampledFieldTypes)
                     }
@@ -926,7 +1082,7 @@ class FindQueryPanel(
 
                 // Phase 2: Trailing Async Metadata (count + conditional QUERY_PLANNER explain when Filter/Sort is non-empty)
                 val metaFuture = executor.submit {
-                    if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@submit
+                    if (isDisposedFlag.get() || project.isDisposed || runTracker.isCancelledFor(myRunId)) return@submit
                     val meta = runCatching {
                         if (joinSpecSnapshot != null) {
                             connectionManager.fetchJoinTrailingMetadata(
@@ -954,25 +1110,46 @@ class FindQueryPanel(
                         }
                     }.getOrNull() ?: return@submit
 
-                    if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@submit
+                    if (isDisposedFlag.get() || project.isDisposed || runTracker.isCancelledFor(myRunId)) return@submit
 
                     ApplicationManager.getApplication().invokeLater {
-                        if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@invokeLater
+                        if (isDisposedFlag.get() || project.isDisposed || runTracker.isCancelledFor(myRunId)) return@invokeLater
                         resultViewer.updateTrailingMetadata(meta)
                     }
                 }
                 activeMetaFuture.set(metaFuture)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
+                if (runTracker.isTimedOut) {
+                    showTimeoutGuideIfNeeded(myRunId, timeoutSeconds, serverTimeoutException = false)
+                }
             } catch (t: Throwable) {
-                if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@submit
+                if (isDisposedFlag.get() || project.isDisposed) return@submit
+                if (runTracker.isStopRequested || runTracker.currentRunId.get() != myRunId) {
+                    // User manually clicked Stop or superseded run — never display error/timeout alerts
+                    return@submit
+                }
+                if (connectionManager.isExecutionTimeoutError(t) || runTracker.isTimedOut) {
+                    showTimeoutGuideIfNeeded(myRunId, timeoutSeconds, serverTimeoutException = true)
+                    return@submit
+                }
                 val msg = t.message ?: t.javaClass.simpleName
                 ApplicationManager.getApplication().invokeLater {
-                    if (isDisposedFlag.get() || project.isDisposed || gen != requestGeneration.get()) return@invokeLater
-                    runBtn.isEnabled = true
-                    resultViewer.setLoading(false)
+                    if (isDisposedFlag.get() || project.isDisposed || runTracker.currentRunId.get() != myRunId) return@invokeLater
                     onStatusUpdate(I18n.t("header.status.error", msg.take(80)), true)
                     Messages.showErrorDialog(project, msg, I18n.t("find.run"))
+                }
+            } finally {
+                watchdog.cancel(false)
+                activeWatchdogFuture.compareAndSet(watchdog, null)
+                ApplicationManager.getApplication().invokeLater {
+                    if (isDisposedFlag.get() || project.isDisposed) return@invokeLater
+                    // Only clear UI running state if this runId is still active (never clobber a newer run!)
+                    if (runTracker.finishRunIfCurrent(myRunId)) {
+                        activeCursor.set(null)
+                        updateRunButtonVisual(running = false)
+                        resultViewer.setLoading(false)
+                    }
                 }
             }
         }
@@ -1045,8 +1222,7 @@ class FindQueryPanel(
             skipLabel.text = I18n.t("find.skip")
             limitCombo.repaint()
             updateProjectToggleText()
-            runBtn.text = I18n.t("find.run")
-            runBtn.toolTipText = I18n.t("find.runTooltip")
+            updateRunButtonVisual(runTracker.isQueryRunning)
             resetBtn.text = I18n.t("find.reset")
             smartInBtn.text = I18n.t("find.smartIn")
             smartInBtn.toolTipText = I18n.t("find.smartInTooltip")
@@ -1055,14 +1231,13 @@ class FindQueryPanel(
             savedQueriesBtn.text = I18n.t("find.savedQueries")
             limitDecreaseBtn.toolTipText = I18n.t("find.limitDecreaseTooltip")
             limitIncreaseBtn.toolTipText = I18n.t("find.limitIncreaseTooltip")
+            updateToolbarStateForJoinMode(isJoinTab)
         }
     }
 
     override fun dispose() {
         isDisposedFlag.set(true)
-        requestGeneration.incrementAndGet()
-        activePrimaryFuture.getAndSet(null)?.cancel(true)
-        activeMetaFuture.getAndSet(null)?.cancel(true)
+        stopActiveQuery(updateUi = false)
         filterEditor.dismissPopup()
         sortEditor.dismissPopup()
         projectEditor.dismissPopup()

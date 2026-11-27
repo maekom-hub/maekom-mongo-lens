@@ -511,7 +511,7 @@ class JoinViewDialog(
                     return JoinSourceRef.PreviousTarget(prevIdx) to raw.removePrefix(prevPrefix).trim()
                 }
             }
-            return JoinSourceRef.Base to raw
+            return JoinSourceRef.Base to com.maekom.mongolens.mongo.CompassPipelineSerializer.stripUiCollectionPrefix(raw)
         }
 
         fun currentForeignField(): String {
@@ -1763,16 +1763,60 @@ class JoinViewDialog(
         return null
     }
 
-    fun buildJoinSpec(): JoinSpec {
+    override fun createActions(): Array<javax.swing.Action> {
+        val copyPipelineAction = object : DialogWrapperAction(I18n.t("join.tab.copyPipelineBtn")) {
+            init {
+                putValue(javax.swing.Action.SMALL_ICON, AllIcons.Actions.Copy)
+                putValue(javax.swing.Action.SHORT_DESCRIPTION, I18n.t("join.tab.copyPipelineTooltip"))
+            }
+
+            override fun doAction(e: java.awt.event.ActionEvent?) {
+                val liveSpec = buildCurrentJoinConfigFromUi()
+                if (!com.maekom.mongolens.mongo.CompassPipelineSerializer.hasValidJoinKeys(liveSpec)) {
+                    com.intellij.openapi.ui.Messages.showWarningDialog(
+                        project,
+                        I18n.t("join.tab.copyPipelineNoValidKeys"),
+                        I18n.t("join.tab.copyPipelineBtn")
+                    )
+                    return
+                }
+                val pipelineJson = com.maekom.mongolens.mongo.CompassPipelineSerializer.formatCompassPipelineJson(liveSpec)
+                UiHelpers.copyToClipboard(pipelineJson)
+                UiHelpers.notify(project, I18n.t("join.tab.pipelineCopied"))
+            }
+        }
+        // Place [Copy Pipeline] directly beside [Run in Join Tab ▶]
+        return arrayOf(copyPipelineAction, okAction, cancelAction)
+    }
+
+    /**
+     * Collects the live, unsaved state directly from all active UI components (including un-Enter-committed
+     * text in SearchableFieldComboBox editors, radios, checkboxes, limit, and column checkboxes).
+     * Incomplete join key rows with blank source/target fields are excluded cleanly without fabricating fallback keys.
+     */
+    fun buildCurrentJoinConfigFromUi(): JoinSpec = buildJoinSpecInternal(recordHistory = false, allowEmptyKeys = true)
+
+    fun buildJoinSpec(): JoinSpec = buildJoinSpecInternal(recordHistory = true, allowEmptyKeys = false)
+
+    private fun buildJoinSpecInternal(recordHistory: Boolean, allowEmptyKeys: Boolean): JoinSpec {
         flushActiveTargetToDraft()
 
         val selectedLeft = leftFields.filter { it in selectedLeftSet }
         val builtTargets = targetDrafts.map { d ->
             val cleanPairs = d.keyPairs
-                .map { it.copy(localField = it.localField.trim(), foreignField = it.foreignField.trim()) }
+                .map {
+                    it.copy(
+                        localField = com.maekom.mongolens.mongo.CompassPipelineSerializer.stripUiCollectionPrefix(it.localField),
+                        foreignField = com.maekom.mongolens.mongo.CompassPipelineSerializer.stripUiCollectionPrefix(it.foreignField)
+                    )
+                }
                 .filter { it.localField.isNotEmpty() && it.foreignField.isNotEmpty() }
                 .distinct()
-            val primaryPair = cleanPairs.firstOrNull() ?: JoinKeyPair(JoinSourceRef.Base, "_id", "_id")
+            val primaryPair = cleanPairs.firstOrNull() ?: if (allowEmptyKeys) {
+                JoinKeyPair(JoinSourceRef.Base, "", "")
+            } else {
+                JoinKeyPair(JoinSourceRef.Base, "_id", "_id")
+            }
             val allCols = (d.allColumns + d.selectedColumns)
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
@@ -1781,7 +1825,7 @@ class JoinViewDialog(
             val cleanConds = d.conditions.filter {
                 it.field.isNotBlank() && (!it.operator.requiresValue || it.rawValue.isNotBlank())
             }
-            if (primaryPair.sourceRef is JoinSourceRef.Base) {
+            if (recordHistory && primaryPair.localField.isNotEmpty() && primaryPair.sourceRef is JoinSourceRef.Base) {
                 ReferenceJumpHelper.recordSelection(database, primaryPair.localField, d.targetCollection)
             }
             JoinTargetSpec(
@@ -1789,12 +1833,13 @@ class JoinViewDialog(
                 sourceRef = primaryPair.sourceRef,
                 localField = primaryPair.localField,
                 foreignField = primaryPair.foreignField,
-                keyPairs = cleanPairs.ifEmpty { listOf(primaryPair) },
+                keyPairs = if (allowEmptyKeys) cleanPairs else cleanPairs.ifEmpty { listOf(primaryPair) },
                 matchStrategy = d.matchStrategy,
                 allColumns = allCols,
                 selectedColumns = selectedCols,
                 conditions = cleanConds,
-                excludeUnmatched = d.excludeUnmatched
+                excludeUnmatched = d.excludeUnmatched,
+                fieldTypes = d.joinFieldCategories + d.fieldCategories
             )
         }
 
@@ -1810,7 +1855,8 @@ class JoinViewDialog(
             selectedLeftFields = selectedLeft,
             baseConditions = cleanBaseConds,
             targets = builtTargets,
-            limitOption = selectedLimitOption
+            limitOption = selectedLimitOption,
+            leftFieldTypes = sourceJoinKeyCategories + sourceFieldCategories
         )
     }
 }

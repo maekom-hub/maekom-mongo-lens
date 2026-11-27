@@ -176,6 +176,7 @@ class ResultViewerPanel(
     private var activeCopyOverlayPopup: JBPopup? = null
     private var isTreeFullyExpanded: Boolean = false
     private var joinColumnOrigins: Map<String, JoinColumnOrigin> = initialJoinColumnOrigins
+    private var indexInspectorEnabled: Boolean = true
 
     // Lazy view build & Single-Flight rendering state
     private val isDisposedFlag = AtomicBoolean(false)
@@ -469,7 +470,7 @@ class ResultViewerPanel(
         copyJoinPipelineBtn.addActionListener { onCopyJoinPipeline?.invoke() }
         indexBadge.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
-                if (!SwingUtilities.isLeftMouseButton(e)) return
+                if (!SwingUtilities.isLeftMouseButton(e) || !indexInspectorEnabled) return
                 if (onOpenIndexInspector != null) {
                     onOpenIndexInspector.invoke(currentResult)
                 } else {
@@ -2388,6 +2389,21 @@ class ResultViewerPanel(
         this.joinColumnOrigins = origins
         applyTableHeaderDisplayLabelsAndWidths()
         resultTree.repaint()
+    }
+
+    fun setJoinModeControlStates(
+        importEnabled: Boolean,
+        indexInspectEnabled: Boolean,
+        disabledTooltip: String?
+    ) {
+        this.indexInspectorEnabled = indexInspectEnabled
+        importJsonBtn.isEnabled = importEnabled
+        importJsonBtn.toolTipText = if (importEnabled) I18n.t("result.import.tooltip") else disabledTooltip
+        indexBadge.cursor = if (indexInspectEnabled) {
+            Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        } else {
+            Cursor.getDefaultCursor()
+        }
     }
 
     private fun populateTable(docs: List<BsonDocument>) {

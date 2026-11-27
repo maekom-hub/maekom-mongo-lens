@@ -370,7 +370,7 @@ object MultiKeyJoinFilterEngine {
         return working.map { doc -> projectShapedDocument(doc, origins) }
     }
 
-    private fun projectShapedDocument(
+    internal fun projectShapedDocument(
         doc: BsonDocument,
         origins: Map<String, ColumnOrigin>
     ): BsonDocument {

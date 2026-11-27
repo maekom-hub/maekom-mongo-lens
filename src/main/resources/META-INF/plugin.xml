@@ -15,6 +15,13 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>v0.3.1</h3>
+        <ul>
+            <li><b>Configurable Query Timeout (Default 40s) + Dual Timeout Guard &amp; Guidance Popup:</b> Added persistent <code>Query Timeout (sec)</code> (5–600s, default 40s) in the top-right Settings (⚙) menu via <code>MongoLensSettings</code> (<code>PersistentStateComponent</code>), pairing server-side <code>maxTimeMS</code> (with automatic AWS DocumentDB unsupported-option retry) with a client-side watchdog timer and a once-per-run <code>TimeoutGuideDialog</code> with a direct <code>Open Timeout Settings</code> button.</li>
+            <li><b>Per-Tab Isolated <code>▶ Find</code> ↔ <code>■ Stop</code> Toggle &amp; Safe Client-Side Cancellation:</b> Transforms the Run button into a red <code>■ Stop</code> button during execution (strictly isolated per tab via monotonic <code>runId</code> tokens so late cleanup from a stopped query never clobbers a newly started query), safely cancelling futures and closing active <code>MongoCursor</code> instances without ever calling admin <code>killOp</code>.</li>
+            <li><b>Join Mode Toolbar Disabling with Tab-Switch Sync:</b> Automatically disables single-collection-only inputs/actions (<code>Filter</code>/<code>Project</code>/<code>Sort</code>, <code>Reset</code>, <code>Smart $in</code>, <code>Shell</code>, <code>Saved/History</code>, <code>Import JSON</code>, <code>Index Inspector</code>) with clear tooltips while a Join View tab is active, keeping unified Run/Stop, Join Config, Copy Pipeline, Export, Limit, and Paging enabled and synchronized across tab switches.</li>
+            <li><b>Bidirectional Pre-Filter Join Engine &amp; Real-Time MongoDB Compass-Compatible "Copy Pipeline":</b> Pre-filters both base and target collections with schema-aware BSON typing before cross-matching keys via normalized numeric-safe hash joins (<code>Int32</code> ↔ <code>Int64</code>), short-circuits <code>INNER JOIN</code> immediately with 0 base queries when target pre-filter yields 0 keys (with automatic 10,000-doc safety cap fallback), and places live <code>Copy Pipeline</code> directly beside <code>Run in Join Tab ▶</code> in <code>JoinViewDialog</code> — stripping UI prefixes, guarding blank keys, placing early <code>$limit</code> before <code>$lookup</code> for unsorted <code>LEFT JOIN</code>, separating top-level indexable target filters from <code>$expr.$and</code> (<code>joinKey0..N</code>), ordering <code>LATEST_ONE</code> as <code>$match → $sort({ _id: -1 }) → $limit: 1</code>, omitting empty <code>$sort: {}</code>, flattening Extended JSON <code>$numberInt</code> sort objects, and outputting <code>JsonMode.RELAXED</code> JSON.</li>
+        </ul>
         <h3>v0.3.0</h3>
         <ul>
             <li><b>Join Target Tab Bar Refactoring (<code>JoinViewDialog</code>):</b> Removed the standalone right-side Remove button; each join target chip (<code>① collection ×</code>) displays a conditional <code>×</code> close button only when 2+ join targets exist, highlights the active tab, scrolls horizontally when many targets are added, and pairs with an inline textless green <code>+</code> icon button placed right beside the last chip (compatible with Darcula &amp; New UI Dark/Light themes).</li>
@@ -58,6 +65,7 @@
     <depends>com.intellij.modules.platform</depends>
 
     <extensions defaultExtensionNs="com.intellij">
+        <applicationService serviceImplementation="com.maekom.mongolens.config.MongoLensSettings"/>
         <toolWindow
                 id="Maekom Mongo Lens"
                 anchor="bottom"

@@ -74,7 +74,8 @@ data class JoinTargetSpec(
     val allColumns: List<String> = emptyList(),
     val selectedColumns: List<String> = emptyList(),
     val conditions: List<JoinCondition> = emptyList(),
-    val excludeUnmatched: Boolean = true
+    val excludeUnmatched: Boolean = true,
+    val fieldTypes: Map<String, String> = emptyMap()
 ) {
     fun effectiveKeyPairs(): List<JoinKeyPair> {
         val cleaned = keyPairs.filter { it.localField.isNotBlank() && it.foreignField.isNotBlank() }
@@ -104,7 +105,8 @@ data class JoinSpec(
     val selectedLeftFields: List<String>,
     val baseConditions: List<JoinCondition> = emptyList(),
     val targets: List<JoinTargetSpec>,
-    val limitOption: Int? = 50 // null = Unlimited (safely capped at MAX_UNLIMITED_DOCS)
+    val limitOption: Int? = 50, // null = Unlimited (safely capped at MAX_UNLIMITED_DOCS)
+    val leftFieldTypes: Map<String, String> = emptyMap()
 ) {
     val primaryRightCollection: String
         get() = targets.firstOrNull()?.targetCollection.orEmpty()
@@ -682,27 +684,16 @@ data class JoinSpec(
         pageSize: Int?,
         useDocumentDbHybrid: Boolean = false
     ): String {
-        val filterDoc = try {
-            MongoShellNormalizer.parseBsonDocument(filterRaw?.trim().orEmpty().ifEmpty { "{}" })
-        } catch (_: Throwable) {
-            BsonDocument()
-        }
-        val sortDoc = try {
-            MongoShellNormalizer.parseBsonDocument(sortRaw?.trim().orEmpty().ifEmpty { "{}" })
-        } catch (_: Throwable) {
-            BsonDocument()
-        }
-        val stages = if (useDocumentDbHybrid && hasCompositeJoin()) {
-            val bufferLimit = if (pageSize != null) maxOf(pageSize * 20, MultiKeyJoinFilterEngine.MIN_HYBRID_BUFFER_LIMIT) else MAX_UNLIMITED_DOCS
-            buildHybridDocumentDbPipeline(filterDoc, sortDoc, bufferLimit)
+        val effectiveSpec = if (pageSize != null && pageSize != limitOption) {
+            copy(limitOption = pageSize)
         } else {
-            buildPipeline(filterDoc, sortDoc, pageIndex, pageSize, probeForNextPage = false)
+            this
         }
-        return stages.joinToString(separator = ",\n", prefix = "[\n", postfix = "\n]") { stage ->
-            MongoShellNormalizer.formatPrettyExtended(stage)
-                .lines()
-                .joinToString("\n") { "  $it" }
-        }
+        return CompassPipelineSerializer.formatCompassPipelineJson(
+            joinSpec = effectiveSpec,
+            filterRaw = filterRaw,
+            sortRaw = sortRaw
+        )
     }
 
     fun toMongoshScript(
