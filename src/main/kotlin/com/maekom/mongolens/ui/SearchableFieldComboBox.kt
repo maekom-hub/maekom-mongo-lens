@@ -17,15 +17,17 @@ import javax.swing.text.JTextComponent
  *
  * Features:
  * - Live case-insensitive substring filtering with `startsWith` priority via `FieldSearchFilter`.
- * - Automatically opens dropdown popup when matches exist and the editor holds focus.
- * - `isFiltering` and `isAdjustingSelection` re-entrancy guards prevent keyboard arrow (`↑`/`↓`),
- *   `Enter`, `Esc`, and mouse click selection from colliding with model updates.
- * - Preserves typed text & caret position across model updates and allows typing custom nested paths
- *   not present in `masterItems` (e.g. `a_hts.sub.key`).
+ * - Builds a detached `DefaultComboBoxModel` with `selectedItem = null` BEFORE attaching to `comboBox.model`
+ *   so Swing never auto-selects item[0] or resets the editor caret to 0 during continuous typing.
+ * - Captures and restores exact `savedText` and `savedCaret` both across model replacement and immediately
+ *   after opening the dropdown popup (`isPopupVisible = true`).
+ * - `isFiltering` and `isAdjustingSelection` guards prevent arrow keys (`↑`/`↓`), `Enter`, `Esc`, and
+ *   mouse click selection from colliding with live filtering.
  */
 class SearchableFieldComboBox<T : Any>(
     val comboBox: ComboBox<T>,
-    private val model: DefaultComboBoxModel<T>,
+    @Suppress("UNUSED_PARAMETER")
+    model: DefaultComboBoxModel<T>,
     private val primaryKey: (T) -> String = { it.toString() },
     private val displayLabel: (T) -> String = { it.toString() },
     private val onTextOrSelectionChanged: () -> Unit = {}
@@ -46,6 +48,16 @@ class SearchableFieldComboBox<T : Any>(
     fun currentText(): String =
         editorTextComponent()?.text ?: comboBox.selectedItem?.toString().orEmpty()
 
+    private fun buildDetachedModel(items: List<T>): DefaultComboBoxModel<T> {
+        val newModel = DefaultComboBoxModel<T>()
+        for (item in items) {
+            newModel.addElement(item)
+        }
+        // Prevent Swing from auto-selecting items[0] and overwriting editor text / resetting caret to 0
+        newModel.selectedItem = null
+        return newModel
+    }
+
     /**
      * Replaces the master candidate list (e.g. when target collection changes or schema finishes loading)
      * while preserving the user's current text/selection safely.
@@ -54,23 +66,19 @@ class SearchableFieldComboBox<T : Any>(
         val savedText = if (preserveCurrentText) currentText() else ""
         masterItems = newItems.toList()
         runGuarded {
-            model.removeAllElements()
-            for (item in masterItems) {
-                model.addElement(item)
-            }
-            val targetValue = selectedItemOverride ?: savedText
-            if (targetValue != null) {
-                val matched = masterItems.firstOrNull { it == targetValue || displayLabel(it) == targetValue.toString() }
-                if (matched != null) {
-                    comboBox.selectedItem = matched
-                    comboBox.editor?.item = matched
-                    editorTextComponent()?.text = displayLabel(matched)
-                } else {
-                    val text = targetValue.toString()
-                    comboBox.selectedItem = text
-                    comboBox.editor?.item = text
-                    editorTextComponent()?.text = text
-                }
+            val newModel = buildDetachedModel(masterItems)
+            comboBox.model = newModel
+
+            val targetValue: Any = selectedItemOverride ?: savedText
+            val matched = masterItems.firstOrNull { it == targetValue || displayLabel(it) == targetValue.toString() }
+            if (matched != null) {
+                comboBox.selectedItem = matched
+                comboBox.editor?.item = matched
+                editorTextComponent()?.text = displayLabel(matched)
+            } else {
+                val text = targetValue.toString()
+                comboBox.editor?.item = text
+                editorTextComponent()?.text = text
             }
         }
     }
@@ -86,7 +94,6 @@ class SearchableFieldComboBox<T : Any>(
                 comboBox.editor?.item = matched
                 editorTextComponent()?.text = displayLabel(matched)
             } else {
-                comboBox.selectedItem = text
                 comboBox.editor?.item = text
                 editorTextComponent()?.text = text
             }
@@ -136,9 +143,7 @@ class SearchableFieldComboBox<T : Any>(
 
             override fun keyReleased(e: KeyEvent) {
                 when (e.keyCode) {
-                    KeyEvent.VK_UP, KeyEvent.VK_DOWN, KeyEvent.VK_PAGE_UP, KeyEvent.VK_PAGE_DOWN -> {
-                        SwingUtilities.invokeLater { isAdjustingSelection = false }
-                    }
+                    KeyEvent.VK_UP, KeyEvent.VK_DOWN, KeyEvent.VK_PAGE_UP, KeyEvent.VK_PAGE_DOWN,
                     KeyEvent.VK_ENTER, KeyEvent.VK_ESCAPE -> {
                         SwingUtilities.invokeLater { isAdjustingSelection = false }
                     }
@@ -151,6 +156,7 @@ class SearchableFieldComboBox<T : Any>(
 
             override fun popupMenuWillBecomeInvisible(e: PopupMenuEvent?) {
                 // Mouse click or Enter committing an item from the dropdown
+                if (isFiltering) return
                 isAdjustingSelection = true
                 suppressNextAutoPopup = true
                 SwingUtilities.invokeLater {
@@ -177,49 +183,67 @@ class SearchableFieldComboBox<T : Any>(
         textComp?.document?.addDocumentListener(object : DocumentAdapter() {
             override fun textChanged(e: DocumentEvent) {
                 if (isFiltering || isAdjustingSelection) return
-                val typed = textComp.text ?: ""
-                val caretPos = textComp.caretPosition
                 SwingUtilities.invokeLater {
                     if (isFiltering || isAdjustingSelection) return@invokeLater
-                    applyLiveFilter(typed, caretPos)
+                    applyLiveFilter()
                 }
             }
         })
     }
 
-    private fun applyLiveFilter(query: String, caretPos: Int) {
+    private fun applyLiveFilter() {
         if (isFiltering || isAdjustingSelection) return
-        val textComp = editorTextComponent() ?: return
+        val editorField = editorTextComponent() ?: return
+
+        // Capture freshest typed text & caret position right before model replacement
+        val savedText = editorField.text ?: ""
+        val savedCaret = editorField.caretPosition
         val filtered = FieldSearchFilter.filterItems(
             masterItems = masterItems,
-            query = query,
+            query = savedText,
             primaryKey = primaryKey,
             displayLabel = displayLabel
         )
 
         isFiltering = true
         try {
-            model.removeAllElements()
-            for (item in filtered) {
-                model.addElement(item)
+            val newModel = buildDetachedModel(filtered)
+            comboBox.model = newModel
+            if (editorField.text != savedText) {
+                editorField.text = savedText
             }
-            // Keep exact user-typed text (even if custom nested path not in masterItems) and restore caret
-            comboBox.editor?.item = query
-            if (textComp.text != query) {
-                textComp.text = query
-            }
-            val safeCaret = caretPos.coerceIn(0, textComp.text.length)
-            textComp.caretPosition = safeCaret
+            editorField.caretPosition = savedCaret.coerceIn(0, editorField.text.length)
         } finally {
             isFiltering = false
         }
 
-        if (!suppressNextAutoPopup && filtered.isNotEmpty() && textComp.isFocusOwner && comboBox.isShowing) {
+        if (!suppressNextAutoPopup && filtered.isNotEmpty() && editorField.isFocusOwner && comboBox.isShowing) {
             if (!comboBox.isPopupVisible) {
-                comboBox.isPopupVisible = true
+                isFiltering = true
+                try {
+                    comboBox.isPopupVisible = true
+                } finally {
+                    isFiltering = false
+                }
+            }
+            // Re-pin focus & caret position after popup opens so continuous typing never jumps to index 0
+            isFiltering = true
+            try {
+                editorField.requestFocusInWindow()
+                if (editorField.text != savedText) {
+                    editorField.text = savedText
+                }
+                editorField.caretPosition = savedCaret.coerceIn(0, editorField.text.length)
+            } finally {
+                isFiltering = false
             }
         } else if (filtered.isEmpty() && comboBox.isPopupVisible) {
-            comboBox.isPopupVisible = false
+            isFiltering = true
+            try {
+                comboBox.isPopupVisible = false
+            } finally {
+                isFiltering = false
+            }
         }
 
         onTextOrSelectionChanged()

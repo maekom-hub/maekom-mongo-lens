@@ -6,6 +6,7 @@ Security updates and bug fixes are actively provided for the following versions 
 
 | Version | Supported          |
 | ------- | ------------------ |
+| `0.3.x` | :white_check_mark: Supported |
 | `0.2.x` | :white_check_mark: Supported |
 | `< 0.2.0` | :x: Unsupported  |
 
