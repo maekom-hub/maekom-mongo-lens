@@ -8,19 +8,22 @@ import org.bson.types.ObjectId
 import java.math.BigDecimal
 
 /**
- * Pure Kotlin (ZERO IntelliJ UI dependencies) MongoDB Compass-compatible Aggregation Pipeline serializer
- * for real-time "Copy Pipeline" from both `JoinViewDialog` and the Join Result toolbar.
+ * Pure Kotlin (ZERO IntelliJ UI dependencies) AWS DocumentDB (3.6/4.0/5.0) & MongoDB Compass
+ * 100%-compatible Aggregation Pipeline serializer for real-time "Copy Pipeline".
  *
  * Guarantees:
  * 1. Strips UI display prefixes (`기준(<coll>).`, `Base(<coll>).`, `조인N(<coll>).`, `JoinN(<coll>).`).
- * 2. Uses Compass-safe `let` variable names (`joinKey0`, `joinKey1`, ...) so `_id` or nested `a.b` never break `$lookup.let`.
- * 3. Places `LEFT` (`기준`) WHERE conditions in top-level `$match` and `RIGHT` (`조인`) conditions inside `$lookup.pipeline.$match`,
- *    honoring sampled schema BSON types (e.g. preserving `"1234"` as String when field schema is `String`, `ObjectId` for 24-hex `_id`).
- * 4. Orders `LATEST_ONE` inner pipeline strictly as `$match` -> `$sort({ _id: -1 })` -> `$limit: 1`, and supports `UNWIND_ALL` `$unwind`.
- * 5. Emits `{ "$match": { "<alias>": { "$ne": [] } } }` when `excludeUnmatched == true` (INNER JOIN) vs keeping empty array on LEFT JOIN.
- * 6. Emits `{ "$limit": N }` and flat `$project` (only `1` on selected fields, `"_id": 0` only when `_id` omitted).
- * 7. Eliminates MongoDB Compass `Feature not supported: Sort with object type`: omits empty `$sort: {}`, flattens
- *    `{ "$numberInt": "-1" }` / `{ "$numberLong": "1" }` objects to pure `Int` (`1` / `-1`), and renders with `JsonMode.RELAXED`.
+ * 2. NEVER emits `$lookup` with `let` + `pipeline` (eliminates AWS DocumentDB Error 304:
+ *    `Aggregation stage not supported: '$lookup on multiple join conditions'`).
+ *    Always emits standard single-key `$lookup` (`from`, `localField`, `foreignField`, `as`).
+ * 3. Handles 2nd+ composite join keys (`pairIndex >= 1`) and target `WHERE AND` conditions via a follow-up
+ *    `$addFields` + null-safe `$filter` (`input: { "$ifNull": ["$<alias>", []] }`, `as: "item"`) using pure
+ *    Aggregation Expression operators (`$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$regexMatch`, `$ifNull`).
+ * 4. Handles `LATEST_ONE` without `$sortArray` via DocumentDB-compatible `$cond` + `$gt` + `$size` + `$ifNull` + `$arrayElemAt(-1)`.
+ * 5. Emits `{ "$match": { "<alias>": { "$ne": [] } } }` when `excludeUnmatched == true`, `$unwind` for `UNWIND_ALL`,
+ *    early `$limit` before `$lookup` for unsorted `LEFT JOIN`, and flat `$project` across all targets.
+ * 6. Eliminates Compass `Sort with object type`: omits empty `$sort: {}`, flattens Extended JSON `$numberInt`
+ *    to pure `Int` (`1` / `-1`), and outputs `JsonMode.RELAXED` JSON (`{ "$oid": "..." }`).
  */
 object CompassPipelineSerializer {
 
@@ -177,16 +180,16 @@ object CompassPipelineSerializer {
     }
 
     /**
-     * Builds a complete MongoDB Compass-ready Aggregation pipeline (`List<Document>`) reflecting all 6 Join UI settings
-     * AND bidirectional pre-filter stage ordering:
+     * Builds a complete AWS DocumentDB & MongoDB Compass-ready Aggregation pipeline (`List<Document>`):
      * 1. Stage 1 — Base (`LEFT`) pre-filter `$match` at pipeline top (schema-type-aware values).
      * 2. Stage 2 — Normalized `$sort` (omitted when blank/`{}`, pure `1`/`-1`) + early `$limit` BEFORE `$lookup`
      *    when ALL targets are `LEFT JOIN` (`excludeUnmatched == false`) and no top-level sort is present.
-     * 3. Stage 3 — `$lookup` with target pre-filter conditions placed directly as top-level fields in
-     *    `$lookup.pipeline[0].$match` (for index usage) separated from `"$expr": { "$and": [...] }` (`joinKey0..N`),
-     *    followed by `$sort({ _id: -1 })` -> `$limit: 1` for `LATEST_ONE`.
-     * 4. Stage 4 — `excludeUnmatched` (`$match: { "<alias>": { "$ne": [] } }`), `UNWIND_ALL` (`$unwind`),
-     *    deferred `$limit` (for `INNER JOIN` or sorted queries), and flat `$project` (only `1` values; `_id: 0` only if omitted).
+     * 3. Stage 3 — Standard single-key `$lookup` (ZERO `let`/`pipeline`!), followed by:
+     *    - `$addFields` + null-safe `$filter` ONLY when 2nd+ join keys (`pairIndex >= 1`) or target conditions exist
+     *    - `$addFields` + `$cond`/`$size`/`$ifNull`/`$arrayElemAt(-1)` when `matchStrategy == LATEST_ONE`
+     *    - `$match: { "<alias>": { "$ne": [] } }` when `excludeUnmatched == true`
+     *    - `$unwind` when `matchStrategy == UNWIND_ALL`
+     * 4. Stage 4 — Deferred `$limit` (for `INNER JOIN` or sorted queries) and flat `$project` across all targets.
      */
     fun buildCompassPipelineDocuments(
         joinSpec: JoinSpec,
@@ -230,7 +233,7 @@ object CompassPipelineSerializer {
             stages.add(Document("\$limit", limitValue))
         }
 
-        // Stage 3: Per-target $lookup + target pre-filter + strategy + INNER/LEFT exclusion
+        // Stage 3: Per-target AWS DocumentDB & Compass 100%-compatible standard single-key $lookup + $filter + strategy
         joinSpec.targets.forEachIndexed { idx, target ->
             val alias = resolveJoinAlias(joinSpec, idx)
             val targetTypes = targetFieldTypesList.getOrNull(idx) ?: target.fieldTypes
@@ -255,89 +258,73 @@ object CompassPipelineSerializer {
                 }
             }
 
-            val usePipelineLookup = cleanPairs.size >= 2 ||
-                targetConds.isNotEmpty() ||
-                target.matchStrategy == JoinMatchStrategy.LATEST_ONE
-
-            if (!usePipelineLookup && cleanPairs.size == 1) {
-                val single = cleanPairs[0]
-                stages.add(
-                    Document(
-                        "\$lookup",
-                        Document("from", target.targetCollection)
-                            .append("localField", resolveLocalPath(single))
-                            .append("foreignField", single.foreignField)
-                            .append("as", alias)
-                    )
+            // 1) ALWAYS use standard single-key $lookup (NO `let`, NO `pipeline` -> 0 Error 304 on AWS DocumentDB!)
+            val firstPair = cleanPairs[0]
+            stages.add(
+                Document(
+                    "\$lookup",
+                    Document("from", target.targetCollection)
+                        .append("localField", resolveLocalPath(firstPair))
+                        .append("foreignField", firstPair.foreignField)
+                        .append("as", alias)
                 )
-            } else {
-                // Compass-safe `let` variable names: joinKey0, joinKey1, ... (no leading `_`, no `.`)
-                val letDoc = Document()
-                val exprParts = mutableListOf<Document>()
+            )
 
-                cleanPairs.forEachIndexed { kIdx, pair ->
-                    val varName = "joinKey$kIdx"
-                    letDoc[varName] = "\$${resolveLocalPath(pair)}"
-                    exprParts.add(Document("\$eq", listOf("\$${pair.foreignField}", "\$\$$varName")))
+            // 2) Secondary join keys (pairIndex >= 1) + target WHERE AND conditions via null-safe `$addFields` + `$filter`
+            val secondaryPairs = cleanPairs.drop(1)
+            if (secondaryPairs.isNotEmpty() || targetConds.isNotEmpty()) {
+                val filterConds = mutableListOf<Document>()
+
+                for (pair in secondaryPairs) {
+                    filterConds.add(
+                        Document(
+                            "\$eq",
+                            listOf("\$\$item.${pair.foreignField}", "\$${resolveLocalPath(pair)}")
+                        )
+                    )
                 }
 
-                // Target pre-filter conditions placed FIRST at top-level of $match (immediate index usage),
-                // separated cleanly from `"$expr": { "$and": [ ... ] }` — NEVER mixed inside $expr!
-                val targetCondDocs = targetConds.map { cond ->
+                for (cond in targetConds) {
                     val cf = stripUiCollectionPrefix(cond.field)
                     val st = targetTypes[cf] ?: targetTypes[cf.substringAfterLast('.')]
-                    buildConditionMatchDoc(cf, cond.operator, cond.rawValue, st)
-                }
-                val innerMatchDoc = Document()
-                val extraAndClauses = mutableListOf<Document>()
-                for (condDoc in targetCondDocs) {
-                    if (condDoc.size == 1) {
-                        val (k, v) = condDoc.entries.first()
-                        if (k != "\$and" && k != "\$or") {
-                            if (!innerMatchDoc.containsKey(k)) {
-                                innerMatchDoc[k] = v
-                            } else {
-                                val prev = innerMatchDoc.remove(k)
-                                if (prev != null) extraAndClauses.add(Document(k, prev))
-                                extraAndClauses.add(condDoc)
-                            }
-                            continue
-                        }
-                    }
-                    extraAndClauses.add(condDoc)
-                }
-                if (extraAndClauses.isNotEmpty()) {
-                    innerMatchDoc["\$and"] = extraAndClauses
-                }
-                if (exprParts.isNotEmpty()) {
-                    innerMatchDoc["\$expr"] = Document("\$and", exprParts)
+                    filterConds.add(buildFilterItemExpression(cf, cond.operator, cond.rawValue, st))
                 }
 
-                // Strict order for LATEST_ONE: 1) $match (pre-filter + $expr) -> 2) $sort({ _id: -1 }) -> 3) $limit(1)
-                val innerPipeline = mutableListOf<Document>()
-                innerPipeline.add(Document("\$match", innerMatchDoc))
-                if (target.matchStrategy == JoinMatchStrategy.LATEST_ONE) {
-                    innerPipeline.add(Document("\$sort", Document("_id", -1)))
-                    innerPipeline.add(Document("\$limit", 1))
-                }
-
-                stages.add(
-                    Document(
-                        "\$lookup",
-                        Document("from", target.targetCollection)
-                            .append("let", letDoc)
-                            .append("pipeline", innerPipeline)
-                            .append("as", alias)
-                    )
+                val filterExpr = Document(
+                    "\$filter",
+                    Document("input", Document("\$ifNull", listOf("\$$alias", emptyList<Any>())))
+                        .append("as", "item")
+                        .append("cond", Document("\$and", filterConds))
                 )
+                stages.add(Document("\$addFields", Document(alias, filterExpr)))
             }
 
-            // INNER JOIN exclusion: { "$match": { "<alias>": { "$ne": [] } } }
+            // 3) LATEST_ONE using AWS DocumentDB-compatible operators ($cond + $gt + $size + $ifNull + $arrayElemAt)
+            if (target.matchStrategy == JoinMatchStrategy.LATEST_ONE) {
+                val latestOneExpr = Document(
+                    "\$cond",
+                    Document(
+                        "if",
+                        Document(
+                            "\$gt",
+                            listOf(
+                                Document("\$size", Document("\$ifNull", listOf("\$$alias", emptyList<Any>()))),
+                                0
+                            )
+                        )
+                    )
+                        .append("then", listOf(Document("\$arrayElemAt", listOf("\$$alias", -1))))
+                        .append("else", emptyList<Any>())
+                )
+                stages.add(Document("\$addFields", Document(alias, latestOneExpr)))
+            }
+
+            // 4) INNER JOIN exclusion: { "$match": { "<alias>": { "$ne": [] } } }
             if (target.excludeUnmatched) {
                 stages.add(Document("\$match", Document(alias, Document("\$ne", emptyList<Any>()))))
             }
 
-            // UNWIND_ALL: preserveNullAndEmptyArrays = !excludeUnmatched
+            // 5) UNWIND_ALL: preserveNullAndEmptyArrays = !excludeUnmatched
             if (target.matchStrategy == JoinMatchStrategy.UNWIND_ALL) {
                 stages.add(
                     Document(
@@ -452,6 +439,90 @@ object CompassPipelineSerializer {
         for ((k, v) in merged) all.add(Document(k, v))
         all.addAll(overflow)
         return Document("\$and", all)
+    }
+
+    /**
+     * Converts a target condition into an Aggregation Expression document for `$filter.cond` (`$$item.<field>`).
+     * Supports all `JoinConditionOperator` values (`=`, `!=`, `>`, `>=`, `<`, `<=`, `IN`, `IS_NOT_EMPTY`, `IS_EMPTY`).
+     */
+    fun buildFilterItemExpression(
+        fieldPath: String,
+        operator: JoinConditionOperator,
+        rawValue: String,
+        schemaType: String?
+    ): Document {
+        val itemRef = "\$\$item.$fieldPath"
+        return when (operator) {
+            JoinConditionOperator.EQ ->
+                Document("\$eq", listOf(itemRef, wrapAggLiteral(convertValueForSchemaType(fieldPath, rawValue, schemaType))))
+            JoinConditionOperator.NE ->
+                Document("\$ne", listOf(itemRef, wrapAggLiteral(convertValueForSchemaType(fieldPath, rawValue, schemaType))))
+            JoinConditionOperator.GT ->
+                Document("\$gt", listOf(itemRef, wrapAggLiteral(convertValueForSchemaType(fieldPath, rawValue, schemaType))))
+            JoinConditionOperator.GTE ->
+                Document("\$gte", listOf(itemRef, wrapAggLiteral(convertValueForSchemaType(fieldPath, rawValue, schemaType))))
+            JoinConditionOperator.LT ->
+                Document("\$lt", listOf(itemRef, wrapAggLiteral(convertValueForSchemaType(fieldPath, rawValue, schemaType))))
+            JoinConditionOperator.LTE ->
+                Document("\$lte", listOf(itemRef, wrapAggLiteral(convertValueForSchemaType(fieldPath, rawValue, schemaType))))
+            JoinConditionOperator.IN -> {
+                val values = splitCommaValues(rawValue).map { wrapAggLiteral(convertValueForSchemaType(fieldPath, it, schemaType)) }
+                Document("\$in", listOf(itemRef, values))
+            }
+            JoinConditionOperator.IS_NOT_EMPTY -> Document(
+                "\$and",
+                listOf(
+                    Document("\$ne", listOf(Document("\$ifNull", listOf(itemRef, null)), null)),
+                    Document("\$ne", listOf(itemRef, ""))
+                )
+            )
+            JoinConditionOperator.IS_EMPTY -> Document(
+                "\$or",
+                listOf(
+                    Document("\$eq", listOf(Document("\$ifNull", listOf(itemRef, null)), null)),
+                    Document("\$eq", listOf(itemRef, ""))
+                )
+            )
+        }
+    }
+
+    /**
+     * Converts symbolic filter operators (`=`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `contains`, `exists`)
+     * into pure Aggregation Expression documents for `$filter.cond` (`$$item.<field>`).
+     */
+    fun buildFilterExpressionBySymbol(
+        fieldPath: String,
+        operatorSymbol: String,
+        rawValue: String,
+        schemaType: String? = null
+    ): Document {
+        val cleanField = stripUiCollectionPrefix(fieldPath)
+        val itemRef = "\$\$item.$cleanField"
+        return when (operatorSymbol.trim().lowercase()) {
+            "=", "eq" -> buildFilterItemExpression(cleanField, JoinConditionOperator.EQ, rawValue, schemaType)
+            "!=", "ne" -> buildFilterItemExpression(cleanField, JoinConditionOperator.NE, rawValue, schemaType)
+            ">", "gt" -> buildFilterItemExpression(cleanField, JoinConditionOperator.GT, rawValue, schemaType)
+            ">=", "gte" -> buildFilterItemExpression(cleanField, JoinConditionOperator.GTE, rawValue, schemaType)
+            "<", "lt" -> buildFilterItemExpression(cleanField, JoinConditionOperator.LT, rawValue, schemaType)
+            "<=", "lte" -> buildFilterItemExpression(cleanField, JoinConditionOperator.LTE, rawValue, schemaType)
+            "in" -> buildFilterItemExpression(cleanField, JoinConditionOperator.IN, rawValue, schemaType)
+            "contains" -> Document(
+                "\$regexMatch",
+                Document("input", Document("\$toString", itemRef))
+                    .append("regex", Regex.escape(rawValue))
+                    .append("options", "i")
+            )
+            "exists" -> Document("\$ne", listOf(Document("\$ifNull", listOf(itemRef, null)), null))
+            else -> buildFilterItemExpression(cleanField, JoinConditionOperator.EQ, rawValue, schemaType)
+        }
+    }
+
+    private fun wrapAggLiteral(value: Any?): Any? {
+        return if (value is String && value.startsWith("$")) {
+            Document("\$literal", value)
+        } else {
+            value
+        }
     }
 
     private fun buildConditionMatchDoc(

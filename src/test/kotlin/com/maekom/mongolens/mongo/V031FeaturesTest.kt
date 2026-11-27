@@ -173,37 +173,42 @@ class V031FeaturesTest {
         assertEquals(ObjectId(sampleOid), topMatch.getObjectId("_id"))
         assertTrue(jsonArray.contains("\"\$oid\": \"$sampleOid\""))
 
-        // 2. $lookup: Compass-safe let vars `joinKey0` & `joinKey1` (no leading `_`, no `.`) + UI prefix stripped!
+        // 2. Standard single-key $lookup ONLY (NO `let`, NO `pipeline` -> AWS DocumentDB 100% compatible!)
         val lookupDoc = parsedStages[1].get("\$lookup", Document::class.java)
         assertNotNull(lookupDoc)
         assertEquals("auth_history", lookupDoc.getString("from"))
-        val letDoc = lookupDoc.get("let", Document::class.java)
-        assertEquals("\$_id", letDoc.getString("joinKey0"))
-        assertEquals("\$meta.tenant_id", letDoc.getString("joinKey1"))
+        assertEquals("_id", lookupDoc.getString("localField"))
+        assertEquals("order_id", lookupDoc.getString("foreignField"))
+        assertEquals("auth_history", lookupDoc.getString("as"))
+        assertFalse(lookupDoc.containsKey("let"))
+        assertFalse(lookupDoc.containsKey("pipeline"))
 
-        // 3. $lookup.pipeline strict order for LATEST_ONE:
-        //    1) $match (normal target filter at top-level + separate $expr.$and) -> 2) $sort({ _id: -1 }) -> 3) $limit: 1
-        val innerPipeline = lookupDoc.getList("pipeline", Document::class.java)
-        assertEquals(3, innerPipeline.size)
-        val innerMatch = innerPipeline[0].get("\$match", Document::class.java)
-        assertNotNull(innerMatch)
-        assertEquals("OK", innerMatch.getString("result"))
-        val innerExpr = innerMatch.get("\$expr", Document::class.java)
-        assertNotNull(innerExpr)
-        assertEquals(2, innerExpr.getList("\$and", Document::class.java).size)
-        assertEquals(Document("_id", -1), innerPipeline[1].get("\$sort", Document::class.java))
-        assertEquals(1, innerPipeline[2].getInteger("\$limit"))
+        // 3. $addFields + null-safe $filter for 2nd join key & target filter using Aggregation Expression operators
+        val filterStage = parsedStages[2].get("\$addFields", Document::class.java)
+        assertNotNull(filterStage)
+        val filterDoc = filterStage.get("auth_history", Document::class.java).get("\$filter", Document::class.java)
+        assertEquals(Document("\$ifNull", listOf("\$auth_history", emptyList<Any>())), filterDoc.get("input", Document::class.java))
+        assertEquals("item", filterDoc.getString("as"))
+        val filterAnd = filterDoc.get("cond", Document::class.java).getList("\$and", Document::class.java)
+        assertEquals(2, filterAnd.size)
+        assertEquals(Document("\$eq", listOf("\$\$item.tenant_id", "\$meta.tenant_id")), filterAnd[0])
+        assertEquals(Document("\$eq", listOf("\$\$item.result", "OK")), filterAnd[1])
 
-        // 4. excludeUnmatched = true -> { "$match": { "auth_history": { "$ne": [] } } }
-        val excludeStage = parsedStages[2].get("\$match", Document::class.java)
+        // 4. LATEST_ONE via DocumentDB-safe $cond + $gt($size($ifNull)) + [$arrayElemAt(-1)]
+        val latestStage = parsedStages[3].get("\$addFields", Document::class.java)
+        assertNotNull(latestStage)
+        assertNotNull(latestStage.get("auth_history", Document::class.java).get("\$cond", Document::class.java))
+
+        // 5. excludeUnmatched = true -> { "$match": { "auth_history": { "$ne": [] } } }
+        val excludeStage = parsedStages[4].get("\$match", Document::class.java)
         assertNotNull(excludeStage)
         assertEquals(emptyList<Any>(), excludeStage.get("auth_history", Document::class.java).getList("\$ne", Any::class.java))
 
-        // 5. Limit: 50
-        assertEquals(50, parsedStages[3].getInteger("\$limit"))
+        // 6. Limit: 50
+        assertEquals(50, parsedStages[5].getInteger("\$limit"))
 
-        // 6. $project: only 1s on selected fields + "_id": 0 because _id was deselected (no 0 on other fields)
-        val projStage = parsedStages[4].get("\$project", Document::class.java)
+        // 7. $project: only 1s on selected fields + "_id": 0 because _id was deselected (no 0 on other fields)
+        val projStage = parsedStages[6].get("\$project", Document::class.java)
         assertEquals(0, projStage.getInteger("_id"))
         assertEquals(1, projStage.getInteger("user_id"))
         assertEquals(1, projStage.getInteger("status"))

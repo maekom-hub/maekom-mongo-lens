@@ -370,7 +370,7 @@ class BidirectionalPreFilterAndCompassTest {
     }
 
     @Test
-    fun `e - Compass pipeline serializer enforces pre-filter order, UI prefix strip, joinKey0 let, ObjectId, and blank-key guard`() {
+    fun `e - Compass pipeline serializer uses DocumentDB-safe single-key lookup, null-safe $filter, $arrayElemAt, and ZERO let-pipeline`() {
         val sampleOid = "65f1a2b3c4d5e6f7a8b9c0d1"
 
         // Guard: spec with only blank join keys MUST fail hasValidJoinKeys
@@ -414,10 +414,11 @@ class BidirectionalPreFilterAndCompassTest {
                     allColumns = listOf("_id", "user_id", "status", "email"),
                     selectedColumns = listOf("email"),
                     conditions = listOf(
-                        JoinCondition(JoinConditionTarget.RIGHT, "status", JoinConditionOperator.EQ, "ACTIVE")
+                        JoinCondition(JoinConditionTarget.RIGHT, "status", JoinConditionOperator.EQ, "ACTIVE"),
+                        JoinCondition(JoinConditionTarget.RIGHT, "age", JoinConditionOperator.GTE, "20")
                     ),
                     excludeUnmatched = true,
-                    fieldTypes = mapOf("status" to "String", "user_id" to "String")
+                    fieldTypes = mapOf("status" to "String", "user_id" to "String", "age" to "Int32")
                 )
             ),
             limitOption = 50,
@@ -427,8 +428,11 @@ class BidirectionalPreFilterAndCompassTest {
         assertTrue(CompassPipelineSerializer.hasValidJoinKeys(spec))
 
         val json = CompassPipelineSerializer.formatCompassPipelineJson(spec, sortRaw = "{}")
-        // Must contain standard Relaxed Extended JSON ObjectId and ZERO empty $sort / ZERO UI prefix / ZERO $numberInt
+        // Must contain Relaxed Extended JSON ObjectId, ZERO `let`/`pipeline` inside $lookup, ZERO `$sortArray`, ZERO UI prefix
         assertTrue(json.contains("\"\$oid\": \"$sampleOid\""))
+        assertFalse(json.contains("\"let\""))
+        assertFalse(json.contains("\"pipeline\""))
+        assertFalse(json.contains("\$sortArray"))
         assertFalse(json.contains("기준("))
         assertFalse(json.contains("\"\$sort\": {}"))
         assertFalse(json.contains("\$numberInt"))
@@ -440,41 +444,66 @@ class BidirectionalPreFilterAndCompassTest {
         assertEquals("1234", topMatch.getString("user_id"))
         assertEquals(ObjectId(sampleOid), topMatch.getObjectId("_id"))
 
-        // Stage 1: $lookup with joinKey0 & joinKey1 (incomplete 3rd row excluded!)
+        // Stage 1: Standard single-key $lookup ONLY (NO `let`, NO `pipeline` -> 0 Error 304 on AWS DocumentDB!)
         val lookup = stages[1].get("\$lookup", Document::class.java)
         assertNotNull(lookup)
-        val letDoc = lookup.get("let", Document::class.java)
-        assertEquals(2, letDoc.size)
-        assertEquals("\$_id", letDoc.getString("joinKey0"))
-        assertEquals("\$user_id", letDoc.getString("joinKey1"))
+        assertEquals("users", lookup.getString("from"))
+        assertEquals("_id", lookup.getString("localField"))
+        assertEquals("auth_id", lookup.getString("foreignField"))
+        assertEquals("users", lookup.getString("as"))
+        assertFalse(lookup.containsKey("let"))
+        assertFalse(lookup.containsKey("pipeline"))
 
-        // $lookup.pipeline: 1) $match (normal filter `status: "ACTIVE"` at top-level + separate `$expr.$and`), 2) $sort, 3) $limit: 1
-        val inner = lookup.getList("pipeline", Document::class.java)
-        assertEquals(3, inner.size)
-        val innerMatch = inner[0].get("\$match", Document::class.java)
-        assertEquals("ACTIVE", innerMatch.getString("status"))
-        assertEquals(listOf("status", "\$expr"), innerMatch.keys.toList())
-        val innerExprAnd = innerMatch.get("\$expr", Document::class.java).getList("\$and", Document::class.java)
-        assertEquals(2, innerExprAnd.size)
-        assertEquals(Document("\$eq", listOf("\$auth_id", "\$\$joinKey0")), innerExprAnd[0])
-        assertEquals(Document("\$eq", listOf("\$user_id", "\$\$joinKey1")), innerExprAnd[1])
-        assertEquals(Document("_id", -1), inner[1].get("\$sort", Document::class.java))
-        assertEquals(1, inner[2].getInteger("\$limit"))
+        // Stage 2: $addFields + null-safe $filter with 2nd join key & target conditions as Aggregation Expressions
+        val filterStage = stages[2].get("\$addFields", Document::class.java)
+        assertNotNull(filterStage)
+        val filterDoc = filterStage.get("users", Document::class.java).get("\$filter", Document::class.java)
+        assertEquals(Document("\$ifNull", listOf("\$users", emptyList<Any>())), filterDoc.get("input", Document::class.java))
+        assertEquals("item", filterDoc.getString("as"))
+        val condAnd = filterDoc.get("cond", Document::class.java).getList("\$and", Document::class.java)
+        assertEquals(3, condAnd.size)
+        assertEquals(Document("\$eq", listOf("\$\$item.user_id", "\$user_id")), condAnd[0])
+        assertEquals(Document("\$eq", listOf("\$\$item.status", "ACTIVE")), condAnd[1])
+        assertEquals(Document("\$gte", listOf("\$\$item.age", 20)), condAnd[2])
 
-        // Stage 2: INNER JOIN excludeUnmatched `$ne: []`
-        val excludeStage = stages[2].get("\$match", Document::class.java)
+        // Stage 3: LATEST_ONE via DocumentDB-safe $cond + $gt($size($ifNull)) + [$arrayElemAt(-1)]
+        val latestStage = stages[3].get("\$addFields", Document::class.java)
+        assertNotNull(latestStage)
+        val condDoc = latestStage.get("users", Document::class.java).get("\$cond", Document::class.java)
+        assertEquals(
+            Document("\$gt", listOf(Document("\$size", Document("\$ifNull", listOf("\$users", emptyList<Any>()))), 0)),
+            condDoc.get("if", Document::class.java)
+        )
+        assertEquals(listOf(Document("\$arrayElemAt", listOf("\$users", -1))), condDoc.getList("then", Document::class.java))
+        assertEquals(emptyList<Any>(), condDoc.getList("else", Any::class.java))
+
+        // Stage 4: INNER JOIN excludeUnmatched `$ne: []`
+        val excludeStage = stages[4].get("\$match", Document::class.java)
         assertEquals(emptyList<Any>(), excludeStage.get("users", Document::class.java).getList("\$ne", Any::class.java))
 
-        // Stage 3: Deferred `$limit: 50` AFTER INNER exclude
-        assertEquals(50, stages[3].getInteger("\$limit"))
+        // Stage 5: Deferred `$limit: 50` AFTER INNER exclude
+        assertEquals(50, stages[5].getInteger("\$limit"))
 
-        // Stage 4: `$project` with `_id: 0` (since omitted) and `1` only for selected fields
-        val proj = stages[4].get("\$project", Document::class.java)
+        // Stage 6: `$project` with `_id: 0` (since omitted) and `1` only for selected fields
+        val proj = stages[6].get("\$project", Document::class.java)
         assertEquals(0, proj.getInteger("_id"))
         assertEquals(1, proj.getInteger("user_id"))
         assertEquals(1, proj.getInteger("tenant_id"))
         assertEquals(1, proj.getInteger("users.email"))
         assertFalse(proj.containsKey("created_at"))
+
+        // Verify symbolic Aggregation Expression helpers (`contains` & `exists`)
+        val containsExpr = CompassPipelineSerializer.buildFilterExpressionBySymbol("email", "contains", "a.b+c")
+        val regexMatch = containsExpr.get("\$regexMatch", Document::class.java)
+        assertEquals(Document("\$toString", "\$\$item.email"), regexMatch.get("input", Document::class.java))
+        assertEquals(Regex.escape("a.b+c"), regexMatch.getString("regex"))
+        assertEquals("i", regexMatch.getString("options"))
+
+        val existsExpr = CompassPipelineSerializer.buildFilterExpressionBySymbol("deleted_at", "exists", "")
+        assertEquals(
+            Document("\$ne", listOf(Document("\$ifNull", listOf("\$\$item.deleted_at", null)), null)),
+            existsExpr
+        )
     }
 
     @Test
@@ -501,9 +530,13 @@ class BidirectionalPreFilterAndCompassTest {
             leftFieldTypes = mapOf("user_id" to "String")
         )
 
-        // 1. Unsorted LEFT JOIN: Stage 0 = $match, Stage 1 = early $limit: 30 BEFORE Stage 2 = $lookup!
+        // 1. Unsorted LEFT JOIN with single key & no target filters:
+        //    Stage 0 = $match, Stage 1 = early $limit: 30 BEFORE Stage 2 = standard $lookup, NO $addFields/$filter!
         val jsonUnsorted = CompassPipelineSerializer.formatCompassPipelineJson(leftJoinSpec, sortRaw = "  ")
         assertFalse(jsonUnsorted.contains("\"\$sort\""))
+        assertFalse(jsonUnsorted.contains("\"\$addFields\""))
+        assertFalse(jsonUnsorted.contains("\"let\""))
+        assertFalse(jsonUnsorted.contains("\"pipeline\""))
         val stagesUnsorted = Document.parse("{\"p\": $jsonUnsorted}").getList("p", Document::class.java)
         assertTrue(stagesUnsorted[0].containsKey("\$match"))
         assertEquals(30, stagesUnsorted[1].getInteger("\$limit"))
