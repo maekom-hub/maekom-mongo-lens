@@ -17,10 +17,14 @@ import com.intellij.ui.components.JBTextField
 import com.intellij.ui.table.JBTable
 import com.intellij.util.ui.FormBuilder
 import com.intellij.util.ui.JBUI
+import com.maekom.mongolens.config.ConnectionColorTag
 import com.maekom.mongolens.config.MongoConnectionProfile
 import com.maekom.mongolens.crypto.CryptoConfigStore
 import com.maekom.mongolens.crypto.CryptoService
 import com.maekom.mongolens.i18n.I18n
+import com.maekom.mongolens.mongo.BsonFieldValidationResult
+import com.maekom.mongolens.mongo.BsonValueValidator
+import com.maekom.mongolens.mongo.EditableBsonType
 import com.maekom.mongolens.mongo.MongoConnectionManager
 import com.maekom.mongolens.mongo.MongoShellNormalizer
 import org.bson.BsonArray
@@ -791,9 +795,22 @@ class DocumentEditDialog(
             add(metaRight, BorderLayout.EAST)
         }
 
-        val bannerStack = JPanel(BorderLayout(0, 2)).apply {
-            add(readOnlyBanner, BorderLayout.NORTH)
-            add(errorBanner, BorderLayout.SOUTH)
+        val bannerStack = JPanel().apply {
+            layout = javax.swing.BoxLayout(this, javax.swing.BoxLayout.Y_AXIS)
+            if (profile.colorTag == ConnectionColorTag.RED) {
+                add(JBLabel(I18n.t("fieldEdit.prodWarningBanner"), AllIcons.General.Warning, JBLabel.LEFT).apply {
+                    isOpaque = true
+                    alignmentX = JComponent.LEFT_ALIGNMENT
+                    background = UiHelpers.COLOR_RED_BG
+                    foreground = UiHelpers.COLOR_RED_FG
+                    font = font.deriveFont(Font.BOLD)
+                    border = JBUI.Borders.empty(6, 10)
+                })
+            }
+            readOnlyBanner.alignmentX = JComponent.LEFT_ALIGNMENT
+            errorBanner.alignmentX = JComponent.LEFT_ALIGNMENT
+            add(readOnlyBanner)
+            add(errorBanner)
         }
 
         val topStack = JPanel(BorderLayout(0, 4)).apply {
@@ -1016,28 +1033,33 @@ class DocumentEditDialog(
         return try {
             when (node.type) {
                 BsonFieldType.STRING -> BsonString(raw)
-                BsonFieldType.INT32 -> BsonInt32(raw.trim().toInt())
-                BsonFieldType.INT64 -> BsonInt64(raw.trim().toLong())
-                BsonFieldType.DOUBLE -> BsonDouble(raw.trim().toDouble())
-                BsonFieldType.DECIMAL128 -> BsonDecimal128(Decimal128.parse(raw.trim()))
-                BsonFieldType.BOOLEAN -> {
-                    when (raw.trim().lowercase()) {
-                        "true" -> BsonBoolean.TRUE
-                        "false" -> BsonBoolean.FALSE
-                        else -> throw IllegalArgumentException("Expected 'true' or 'false'")
-                    }
+                BsonFieldType.INT32 -> when (val r = BsonValueValidator.validateAndParse(EditableBsonType.INT32, raw)) {
+                    is BsonFieldValidationResult.Valid -> r.bsonValue
+                    is BsonFieldValidationResult.Invalid -> throw IllegalArgumentException(r.errorMessage)
                 }
-                BsonFieldType.DATE -> {
-                    val instant = DateEditorPanel.tryParseInstant(raw.trim())
-                        ?: throw IllegalArgumentException("Invalid ISO-8601 date: '$raw'")
-                    BsonDateTime(instant.toEpochMilli())
+                BsonFieldType.INT64 -> when (val r = BsonValueValidator.validateAndParse(EditableBsonType.INT64, raw)) {
+                    is BsonFieldValidationResult.Valid -> r.bsonValue
+                    is BsonFieldValidationResult.Invalid -> throw IllegalArgumentException(r.errorMessage)
                 }
-                BsonFieldType.OBJECT_ID -> {
-                    val trimmed = raw.trim()
-                    if (!ObjectId.isValid(trimmed)) {
-                        throw IllegalArgumentException("Must be a 24-character hex ObjectId")
-                    }
-                    BsonObjectId(ObjectId(trimmed))
+                BsonFieldType.DOUBLE -> when (val r = BsonValueValidator.validateAndParse(EditableBsonType.DOUBLE, raw)) {
+                    is BsonFieldValidationResult.Valid -> r.bsonValue
+                    is BsonFieldValidationResult.Invalid -> throw IllegalArgumentException(r.errorMessage)
+                }
+                BsonFieldType.DECIMAL128 -> when (val r = BsonValueValidator.validateAndParse(EditableBsonType.DECIMAL128, raw)) {
+                    is BsonFieldValidationResult.Valid -> r.bsonValue
+                    is BsonFieldValidationResult.Invalid -> throw IllegalArgumentException(r.errorMessage)
+                }
+                BsonFieldType.BOOLEAN -> when (val r = BsonValueValidator.validateAndParse(EditableBsonType.BOOLEAN, raw)) {
+                    is BsonFieldValidationResult.Valid -> r.bsonValue
+                    is BsonFieldValidationResult.Invalid -> throw IllegalArgumentException(r.errorMessage)
+                }
+                BsonFieldType.DATE -> when (val r = BsonValueValidator.validateAndParse(EditableBsonType.DATE, raw)) {
+                    is BsonFieldValidationResult.Valid -> r.bsonValue
+                    is BsonFieldValidationResult.Invalid -> throw IllegalArgumentException(r.errorMessage)
+                }
+                BsonFieldType.OBJECT_ID -> when (val r = BsonValueValidator.validateAndParse(EditableBsonType.OBJECT_ID, raw)) {
+                    is BsonFieldValidationResult.Valid -> r.bsonValue
+                    is BsonFieldValidationResult.Invalid -> throw IllegalArgumentException(r.errorMessage)
                 }
                 BsonFieldType.UUID_TYPE -> BsonBinary(UUID.fromString(raw.trim()))
                 BsonFieldType.NULL -> BsonNull.VALUE

@@ -263,7 +263,8 @@ class AggregationBuilderPanel(
         collection = collection,
         onRequestRefresh = { executePipeline() },
         onReadOnlyChanged = onReadOnlyChanged,
-        diffBaselineState = diffBaselineState
+        diffBaselineState = diffBaselineState,
+        isAggregationView = true
     )
 
     private var activeSubMode = "UI" // "UI" or "RAW"

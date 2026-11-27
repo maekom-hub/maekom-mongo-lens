@@ -115,6 +115,7 @@ class ResultViewerPanel(
     private val onReadOnlyChanged: () -> Unit = {},
     private val diffBaselineState: DiffBaselineState? = null,
     private val isJoinView: Boolean = false,
+    private val isAggregationView: Boolean = false,
     private val initialView: String = "TREE",
     initialJoinColumnOrigins: Map<String, JoinColumnOrigin> = emptyMap(),
     private val availableColumnsSupplier: (() -> List<String>)? = null,
@@ -128,7 +129,8 @@ class ResultViewerPanel(
     private val onJumpToReferenceCollection: ((targetCollection: String, sourceFieldPath: String, sourceValue: BsonValue) -> Unit)? = null,
     private val onRequestOpenJoinDialog: ((initialLocalField: String?) -> Unit)? = null,
     private val onRequestEditJoin: (() -> Unit)? = null,
-    private val onCopyJoinPipeline: (() -> Unit)? = null
+    private val onCopyJoinPipeline: (() -> Unit)? = null,
+    private val onRequestImportJson: (() -> Unit)? = null
 ) : JPanel(BorderLayout()), Disposable {
 
     /**
@@ -238,6 +240,11 @@ class ResultViewerPanel(
         isVisible = isJoinView && onCopyJoinPipeline != null
     }
 
+    private val importJsonBtn = JButton(I18n.t("result.import.btn"), AllIcons.Actions.Upload).apply {
+        margin = JBUI.insets(1, 6)
+        toolTipText = I18n.t("result.import.tooltip")
+        isVisible = !isJoinView && !isAggregationView && onRequestImportJson != null
+    }
     private val exportBtn = JButton(I18n.t("result.export.btn")).apply {
         margin = JBUI.insets(1, 6)
         isEnabled = false
@@ -498,9 +505,11 @@ class ResultViewerPanel(
             }
         }
 
+        importJsonBtn.addActionListener { onRequestImportJson?.invoke() }
         exportBtn.addActionListener { showExportMenu() }
 
         val rightBar = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 2)).apply {
+            add(importJsonBtn)
             add(exportBtn)
             if (onPrevPage != null && onNextPage != null) {
                 prevBtn.isEnabled = false
@@ -1289,23 +1298,61 @@ class ResultViewerPanel(
         }
 
         // ============================================================
-        // Group 2: Edit (`데이터 수정`)
+        // Group 2: Edit (`데이터 수정` — strict BSON field edit + full doc edit)
         // ============================================================
         if (addedGroup1) {
             group.addSeparator()
         }
+        val isReadOnlyProfile = connectionManager.isEffectivelyReadOnly(profile)
+        val hasDocumentId = targetBsonDoc.containsKey("_id")
+        val editFieldPath = focusFieldPath?.let {
+            com.maekom.mongolens.mongo.BsonValueValidator.normalizeMongoUpdatePath(it)
+        }?.takeIf { it.isNotEmpty() }
+        val isIdFieldTarget = editFieldPath == "_id"
+        val canEditDocument = !isJoinView && !isAggregationView && !isReadOnlyProfile && hasDocumentId
+        val docEditDisabledReason = when {
+            isJoinView -> I18n.t("join.editDisabledTooltip")
+            isAggregationView -> I18n.t("agg.editDisabledTooltip")
+            isReadOnlyProfile -> I18n.t("edit.dialog.readOnlyBanner")
+            !hasDocumentId -> I18n.t("fieldEdit.error.missingId")
+            else -> null
+        }
+        val fieldEditEnabled = canEditDocument && !isIdFieldTarget
+        val fieldEditDisabledReason = docEditDisabledReason
+            ?: if (isIdFieldTarget) I18n.t("fieldEdit.error.idReadOnly") else null
+
         group.add(
             popupAction(
                 text = I18n.t("result.doc.editData"),
                 icon = AllIcons.Actions.Edit,
-                enabled = !isJoinView,
-                description = if (isJoinView) I18n.t("join.editDisabledTooltip") else null
+                enabled = fieldEditEnabled,
+                description = fieldEditDisabledReason
             ) {
                 ApplicationManager.getApplication().invokeLater {
-                    openDocumentEditDialog(docIndex, targetBsonDoc, toRawDocument(targetBsonDoc), focusFieldPath)
+                    if (editFieldPath != null) {
+                        val origFieldVal = com.maekom.mongolens.mongo.BsonValueValidator.extractValueAtPath(targetBsonDoc, editFieldPath)
+                            ?: clickedBsonValue
+                        openFieldEditDialog(docIndex, targetBsonDoc, editFieldPath, origFieldVal)
+                    } else {
+                        openDocumentEditDialog(docIndex, targetBsonDoc, toRawDocument(targetBsonDoc), focusFieldPath)
+                    }
                 }
             }
         )
+        if (editFieldPath != null) {
+            group.add(
+                popupAction(
+                    text = I18n.t("result.doc.editFullDocument"),
+                    icon = AllIcons.Actions.EditSource,
+                    enabled = canEditDocument,
+                    description = docEditDisabledReason
+                ) {
+                    ApplicationManager.getApplication().invokeLater {
+                        openDocumentEditDialog(docIndex, targetBsonDoc, toRawDocument(targetBsonDoc), focusFieldPath)
+                    }
+                }
+            )
+        }
 
         // ============================================================
         // Group 3: Copy Submenu (Value / Key:Value JSON / Field Path)
@@ -1781,6 +1828,33 @@ class ResultViewerPanel(
             is BsonString -> value.value
             is BsonDocument, is BsonArray -> UiHelpers.bsonPureTextValue(value)
             else -> UiHelpers.bsonTableDisplayValue(value)
+        }
+    }
+
+    private fun openFieldEditDialog(
+        docIndex: Int,
+        targetBsonDoc: BsonDocument,
+        fieldPath: String,
+        originalValue: BsonValue?
+    ) {
+        try {
+            FieldEditDialog(
+                project = project,
+                connectionManager = connectionManager,
+                profile = profile,
+                database = database,
+                collection = collection,
+                originalDoc = targetBsonDoc,
+                rawFieldPath = fieldPath,
+                originalValue = originalValue,
+                onUpdatedInDb = { updatedDoc -> replaceDocumentInPlace(docIndex, updatedDoc) }
+            ).show()
+        } catch (t: Throwable) {
+            Messages.showErrorDialog(
+                project,
+                "${t.javaClass.simpleName}: ${t.message ?: "Unknown error while opening Edit Data dialog."}",
+                I18n.t("result.doc.editTitle")
+            )
         }
     }
 
@@ -2347,6 +2421,8 @@ class ResultViewerPanel(
 
     private fun refreshTexts() {
         SwingUtilities.invokeLater {
+            importJsonBtn.text = I18n.t("result.import.btn")
+            importJsonBtn.toolTipText = I18n.t("result.import.tooltip")
             exportBtn.text = I18n.t("result.export.btn")
             editJoinBtn.text = I18n.t("join.tab.editBtn")
             editJoinBtn.toolTipText = I18n.t("join.tab.editBtnTooltip")

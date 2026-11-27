@@ -12,6 +12,7 @@ import com.mongodb.client.MongoClient
 import com.mongodb.client.MongoClients
 import com.mongodb.client.model.CountOptions
 import com.mongodb.client.model.Filters
+import org.bson.BsonArray
 import org.bson.BsonDocument
 import org.bson.BsonObjectId
 import org.bson.BsonValue
@@ -1053,8 +1054,88 @@ class MongoConnectionManager(project: Project) : Disposable {
         check(!isEffectivelyReadOnly(profile)) { "Write blocked: profile '${profile.displayName}' is READ-ONLY" }
         val client = getOrCreateClient(profile)
         val coll = client.getDatabase(database).getCollection(collection, BsonDocument::class.java)
-        coll.replaceOne(Filters.eq("_id", originalId), replacement)
+        val result = coll.replaceOne(Filters.eq("_id", originalId), replacement)
+        if (result.matchedCount == 0L) {
+            throw IllegalStateException(
+                com.maekom.mongolens.i18n.I18n.t("fieldEdit.error.matchedZero")
+            )
+        }
         invalidateCollectionMetaCache(profile.id, database, collection)
+    }
+
+    /**
+     * Updates a single field using `Document("$set", Document(fieldPath, typedNativeValue))`
+     * matching the document strictly by its original typed `_id` value (ObjectId / String / Int32 / Int64, etc.).
+     * Deliberately omits `maxTimeMS` on write operations for full AWS DocumentDB compatibility.
+     */
+    fun updateDocumentField(
+        profile: MongoConnectionProfile,
+        database: String,
+        collection: String,
+        originalId: BsonValue,
+        fieldPath: String,
+        typedBsonValue: BsonValue,
+        typedNativeValue: Any?,
+        fallbackDoc: BsonDocument
+    ): BsonDocument {
+        check(!isEffectivelyReadOnly(profile)) { "Write blocked: profile '${profile.displayName}' is READ-ONLY" }
+        val normalizedPath = BsonValueValidator.normalizeMongoUpdatePath(fieldPath)
+        require(normalizedPath.isNotEmpty() && normalizedPath != "_id") {
+            com.maekom.mongolens.i18n.I18n.t("fieldEdit.error.idReadOnly")
+        }
+
+        val client = getOrCreateClient(profile)
+        val db = client.getDatabase(database)
+        val docColl = db.getCollection(collection)
+        val originalRawId = BsonValueValidator.bsonToNativeValue(originalId)
+        val updatePayload = Document("\$set", Document(normalizedPath, typedNativeValue))
+        val result = docColl.updateOne(Filters.eq("_id", originalRawId), updatePayload)
+        if (result.matchedCount == 0L) {
+            throw IllegalStateException(
+                com.maekom.mongolens.i18n.I18n.t("fieldEdit.error.matchedZero")
+            )
+        }
+
+        invalidateCollectionMetaCache(profile.id, database, collection)
+
+        val bsonColl = db.getCollection(collection, BsonDocument::class.java)
+        return runCatching {
+            bsonColl.find(Filters.eq("_id", originalId)).first()
+        }.getOrNull() ?: applyFieldPatchLocally(fallbackDoc, normalizedPath, typedBsonValue)
+    }
+
+    private fun applyFieldPatchLocally(
+        source: BsonDocument,
+        dotPath: String,
+        newValue: BsonValue
+    ): BsonDocument {
+        val cloned = BsonDocument.parse(source.toJson())
+        val segments = dotPath.split('.').filter { it.isNotEmpty() }
+        if (segments.isEmpty()) return cloned
+        var cur: BsonValue = cloned
+        for (i in 0 until segments.lastIndex) {
+            val seg = segments[i]
+            cur = when (cur) {
+                is BsonDocument -> cur[seg] ?: return cloned
+                is BsonArray -> {
+                    val idx = seg.toIntOrNull() ?: return cloned
+                    if (idx in 0 until cur.size) cur[idx] else return cloned
+                }
+                else -> return cloned
+            }
+        }
+        val lastSeg = segments.last()
+        when (cur) {
+            is BsonDocument -> cur[lastSeg] = newValue
+            is BsonArray -> {
+                val idx = lastSeg.toIntOrNull()
+                if (idx != null && idx in 0 until cur.size) {
+                    cur[idx] = newValue
+                }
+            }
+            else -> Unit
+        }
+        return cloned
     }
 
     fun cloneDocument(
@@ -1072,6 +1153,19 @@ class MongoConnectionManager(project: Project) : Disposable {
         coll.insertOne(clone)
         invalidateCollectionMetaCache(profile.id, database, collection)
         return newId
+    }
+
+    fun getRawDocumentCollection(
+        profile: MongoConnectionProfile,
+        database: String,
+        collection: String
+    ): com.mongodb.client.MongoCollection<Document> {
+        val client = getOrCreateClient(profile)
+        return client.getDatabase(database).getCollection(collection)
+    }
+
+    fun invalidateMetaCacheForCollection(profileId: String, database: String, collection: String) {
+        invalidateCollectionMetaCache(profileId, database, collection)
     }
 
     fun deleteDocument(

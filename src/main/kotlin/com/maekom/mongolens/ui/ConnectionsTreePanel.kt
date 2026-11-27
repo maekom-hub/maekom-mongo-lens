@@ -59,6 +59,7 @@ class ConnectionsTreePanel(
     private val onOpenAggTab: (MongoConnectionProfile, String, String) -> Unit,
     private val onOpenShellTab: (MongoConnectionProfile, String, String) -> Unit,
     private val onInspectIndexes: (MongoConnectionProfile, String, String) -> Unit,
+    private val onImportJson: (MongoConnectionProfile, String, String) -> Unit,
     private val onOpenConnectionSettings: (MongoConnectionProfile) -> Unit,
     private val onDeleteCustomProfile: (MongoConnectionProfile) -> Unit
 ) : JPanel(BorderLayout()) {
@@ -524,6 +525,9 @@ class ConnectionsTreePanel(
                 group.addSeparator()
                 group.add(popupAction(I18n.t("tree.ctx.inspectIndexes"), AllIcons.Actions.Preview) {
                     onInspectIndexes(data.profile, data.database, data.collection)
+                })
+                group.add(popupAction(I18n.t("tree.ctx.importJson"), AllIcons.Actions.Upload) {
+                    onImportJson(data.profile, data.database, data.collection)
                 })
                 group.addSeparator()
                 group.add(popupAction(I18n.t("tree.ctx.copyName"), AllIcons.Actions.Copy) {

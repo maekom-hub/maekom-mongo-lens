@@ -1,7 +1,7 @@
 # Maekom Mongo Lens
 
-[![Version](https://img.shields.io/badge/version-v0.2.6-blue.svg)](https://github.com/maekom-hub/maekom-mongo-lens/releases)
-[![IntelliJ IDEA](https://img.shields.io/badge/IntelliJ%20IDEA-2024.1%20~%202026.x-purple.svg)](https://www.jetbrains.com/idea/)
+[![Version](https://img.shields.io/badge/version-v0.2.7-blue.svg)](https://github.com/maekom-hub/maekom-mongo-lens/releases)
+[![IntelliJ IDEA](https://img.shields.io/badge/IntelliJ%20IDEA-2024.2%2B-purple.svg)](https://www.jetbrains.com/idea/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](./LICENSE)
 
 **[English](#english) | [한국어](#한국어)**
@@ -12,40 +12,45 @@
 
 ### Overview
 
-**Maekom Mongo Lens** is an IntelliJ IDEA (Community & Ultimate) plugin built for safe querying, real-time debugging, index diagnosis, and multi-collection join analysis on **MongoDB** and **AWS DocumentDB**. It automatically discovers Spring Boot `application*.yml` profiles (Zero-Config), provides a MongoDB Compass-style 4-tab connection manager with IntelliJ `PasswordSafe` credential protection and AWS DocumentDB TLS/CA bundle support, locks production (`prd`/`prod`) databases as Read-Only by default, and delivers fast, freeze-free performance even on massive collections.
+**Maekom Mongo Lens** is an IntelliJ IDEA (Community & Ultimate) plugin built for safe querying, type-safe data editing, real-time debugging, index diagnosis, and multi-collection join analysis on **MongoDB** and **AWS DocumentDB**. It automatically discovers Spring Boot `application*.yml` profiles (Zero-Config), provides a MongoDB Compass-style 4-tab connection manager with IntelliJ `PasswordSafe` credential protection and AWS DocumentDB TLS/CA bundle support, locks production (`prd`/`prod`) databases as Read-Only by default, and delivers fast, freeze-free performance even on massive collections.
+
+---
+
+### Requirements & License
+
+| Item | Specification |
+| :--- | :--- |
+| **Version** | `0.2.7` |
+| **IntelliJ IDEA** | `2024.2+` (Community / Ultimate — matches `sinceBuild = "242"`) |
+| **Java Runtime (JBR)** | Minimum `JDK 17` / Recommended `JDK 21` |
+| **Database Support** | `MongoDB 4.4 ~ 8.0` (Standalone, Replica Set, Atlas `mongodb+srv`) & `AWS DocumentDB 3.6 / 4.0 / 5.0` |
+| **License** | `Apache-2.0` ([Apache License 2.0](LICENSE)) |
 
 ---
 
 ### Key Features
 
+- **Type-Safe BSON Data Editing & Real-Time Validation (`FieldEditDialog` & `DocumentEditDialog`)**
+  - Detects and preserves the exact original BSON type (`Int32`, `Int64`, `Double`, `Decimal128`, `String`, `Boolean`, `ObjectId`, `Date`, `Null`, `JSON (Object/Array)`), preventing accidental string overwrites on numeric/date/ObjectId fields.
+  - Real-time `DocumentListener` validation highlights invalid values (Int32 overflow hints, decimal/NaN/Infinity guards, 24-hex ObjectId regex, strict Boolean, flexible `Date` parser supporting ISO-8601/`+09:00`/`yyyy-MM-dd HH:mm:ss` UTC/13-digit Epoch ms with **`[Now]`** button + live UTC ISO preview) and disables **`OK`** until valid.
+  - Protects `_id`, blocks edits on Read-Only / Join / Aggregation / `_id`-less results, displays a **`Red (Prod)`** warning banner on production connections, and executes typed `$set` `updateOne` matching the original `_id` type (`matchedCount == 0` error reporting, array dot-path preservation such as `items.0.price`, and zero `maxTimeMS` on writes for AWS DocumentDB compatibility).
+- **Collection JSON Data Import & 4-Stage Atomic Pre-Flight Validation (`ImportJsonDialog`)**
+  - Import via Connections tree right-click → **`Import JSON Data...`** or the result toolbar **`Import JSON`** button (blocked immediately on Read-Only profiles).
+  - Supports **single JSON object (`{...}`)**, **JSON array (`[...]`)**, and **NDJSON (`mongoexport` line-delimited)** with UTF-8 BOM stripping, Extended JSON (`$oid`, `$date`, `$numberLong`, `$numberDecimal`), **`Load .json File`** (`10MB` safety cap), **`Format JSON`**, **`Strip existing _id`**, and **`Validate Only (Dry-Run)`**.
+  - Runs 4-stage atomic Pre-Flight checks off-EDT before touching the DB: (1) JSON syntax & DB-specific key rules (blocks `.` keys on AWS DocumentDB while allowing them on MongoDB), (2) in-batch + 500-item chunked DB `_id` duplicate detection (with Int/Long cross-checks), (3) recursive nested schema type mismatch checks against 50 sampled documents with safe numeric widening promotion, and (4) detailed copyable error alert aborting all writes on any error, or 500-doc chunked `insertMany` + automatic tab refresh when clean.
 - **MongoDB Compass-Style 4-Tab Connection Manager & Bidirectional URI Sync**
-  - Configure connections cleanly across **`General`**, **`Authentication`**, **`TLS/SSL`**, and **`Advanced`** tabs with real-time two-way MongoDB URI sync (`Edit Connection String` toggle, RFC-3986 password encoding, `mongodb+srv` port/flag rules, and a lossless Extra Query Params table).
-  - **Secure Credential Storage & AWS DocumentDB TLS**: Passwords are stored in IntelliJ **`PasswordSafe`** (OS Keychain, keyed by `connectionId`) rather than plaintext JSON. Supports multi-certificate PEM CA bundles such as AWS DocumentDB **`global-bundle.pem`**, mTLS client certificates (`.pem`/`.p12`/`.jks`), `retryWrites=false`, and non-blocking async **`Test Connection`**.
-  - **Connections Tree Root Actions & Environment Color Tags**: Right-click any `[YAML]` or `[Custom]` connection to open **`Connection Settings / View URI...`** (YAML connections stay read-only with one-click **`Clone to Custom Connection & Edit...`** and **`Open Source YAML File`**), copy **Full URI / Masked URI (`***`) / `mongosh` CLI command**, or assign visual **Environment Color Tags** (`Green (Dev)`, `Orange (Stg)`, `Red (Prod)`) shown on both tree nodes and workspace tabs.
+  - Configure connections cleanly across **`General`**, **`Authentication`**, **`TLS/SSL`**, and **`Advanced`** tabs with live two-way MongoDB URI sync (`Edit Connection String` toggle, RFC-3986 password encoding, `mongodb+srv` rules, lossless Extra Query Params table), IntelliJ **`PasswordSafe`** credential storage, AWS DocumentDB **`global-bundle.pem`** multi-CA & mTLS client certificates, Environment Color Tags (`Dev`/`Stg`/`Prod`), and root-node context actions (`Connection Settings / View URI...`, Full/Masked URI & `mongosh` CLI copy, YAML read-only inspect + clone-to-Custom).
 - **Zero-Overhead Initial Preview & Read-Only Index Inspector (`IndexInspectorDialog`)**
-  - Clicking a collection opens the workspace tab immediately with a loading spinner and fetches documents in a single roundtrip (`.limit(N).batchSize(N)`), skipping `explain()` / `listIndexes()` when no `Filter`/`Sort` is active (`No Filter (Preview)` badge).
-  - When a `Filter` or `Sort` is specified, asynchronously inspects `QUERY_PLANNER` plans (`IXSCAN` / `COLLSCAN` / `UNKNOWN` with 1,500ms `maxTimeMS` and zero full-scan `EXECUTION_STATS`).
-  - Click the execution plan badge or right-click any collection → **`Inspect Indexes & Query Guide...`** to inspect indexes (60s TTL cache), apply one-click Filter templates, and copy ESR (`Equality → Sort → Range`) `createIndex` recommendations — strictly **100% read-only**.
-- **Smart Keyboard Autocomplete for `Filter` / `Sort` / `Project`**
-  - Navigate suggestions seamlessly with **`↑` / `↓`** (wrap-around + auto-scroll), confirm with **`Enter` / `Tab`** (replaces typed prefix cleanly on a single line — e.g. `{cr}` → `{"created_at": }` with zero stray newlines or accidental execution), and dismiss with **`Esc`**.
-  - Automatically suppresses unwanted immediate re-opening after confirmation until the next character is typed.
-- **IntelliJ New UI Native Context Menu (5 Groups + `AllIcons`)**
-  - Preserves `Ctrl`/`Shift` multi-selection across **Tree** and **Table** views with instant native `ActionPopupMenu` styling and 16×16 `AllIcons`:
-    - **Dynamic Quick Filter & Sort**: single `=` / `!=`, same-field `$in` / `$nin`, 2-date range `$gte ~ $lte`, cross-field `AND` / `$or` (safely wraps existing `$or` in `$and`), nested `$exists` / empty, UTC time range filters, and quick Sort (`1` / `-1`).
-    - **Edit**, **Copy Submenu** (Value / Key:Value JSON / Field Path), **Reference Jump & Join**, and **Document Diff** (2-doc compare + cross-tab Baseline pin).
-- **Collection Join View (`A ⋈ B ⋈ C`) — Composite Join Keys & Auto-Match**
-  - **Composite Join Keys (`AND` Matching) & Auto-Match Common Keys**: Add 1..N join key pairs via **`Add Join Condition`** (dialog height auto-expands up to 3 rows, scrolling internally for 4+) or append shared field names (excluding `_id`) without overwriting existing rows via **`Auto-Match Common Keys`**.
-  - **Hybrid `$lookup` Pipeline**: Uses index-friendly `localField`/`foreignField` for single-key joins and automatically switches to MongoDB & AWS DocumentDB (4.0/5.0) compatible `let` + `pipeline` (`local_k0..kN`, `null`/missing guard, dynamic `$cond($isArray)`, and `LATEST_ONE` `$sort`/`$limit: 1` pushdown) for 2+ keys — protected by `15,000ms maxTimeMS` and Single-Flight cancellation.
-  - **Nested / `Array<Object>` Keys, Consistent Paging & Unlimited Mode**: Supports dot-notation paths (e.g. `items.product_id`), `LATEST_ONE` / `UNWIND_ALL` (`1:1` / `1:N`), deterministic post-join `$skip`/`$limit(N+1)`, **`20 / 50 / 100 / 500 / Unlimited (5,000 cap)`**, live **`Edit Join`**, **`Copy Pipeline`**, and join-key summary badges.
-- **Intuitive Mode/View Navigation & Real-Time KO/EN UI**
-  - Bottom-accent mode tabs (`Documents (Find)` / `Aggregations` / `Mongo Shell`), icon-backed segmented view switcher (`Tree` | `Table` | `JSON`) with Lazy off-EDT rendering & display truncation, AES temporary field decryption, and instant Korean/English switching without restarting the IDE.
+  - Opens tabs immediately with `.limit(N).batchSize(N)` single-roundtrip preview (`No Filter (Preview)` badge, skipping `explain()`/`listIndexes()` when unfiltered), runs bounded `QUERY_PLANNER` plans (`IXSCAN`/`COLLSCAN`/`UNKNOWN`) on filtered queries, and offers 100% read-only index inspection with Filter templates and ESR `createIndex` recommendations.
+- **Smart Keyboard Autocomplete, 5-Group Native Context Menu & Composite-Key Collection Join View (`A ⋈ B ⋈ C`)**
+  - `↑`/`↓` + `Enter`/`Tab` single-line autocomplete for `Filter`/`Sort`/`Project`; multi-selection Quick Filter & Sort; Document Diff; Star & Chain multi-collection joins with 1..N composite `AND` keys, **`Auto-Match Common Keys`**, hybrid `$lookup` compatible with MongoDB & AWS DocumentDB, AES temporary field decryption, and instant `KO ↔ EN` UI switching.
 
 ---
 
 ### Installation
 
-1. Download **`maekom-mongo-lens-0.2.6.zip`** from [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases).
-2. In IntelliJ IDEA, go to **`Settings / Preferences` → `Plugins` → ⚙️ (Gear Icon) → `Install Plugin from Disk...`**.
+1. Download **`maekom-mongo-lens-0.2.7.zip`** from [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases).
+2. In IntelliJ IDEA (`2024.2+`), go to **`Settings / Preferences` → `Plugins` → ⚙️ (Gear Icon) → `Install Plugin from Disk...`**.
 3. Select the downloaded `.zip` archive and restart the IDE.
 4. Open the **`Maekom Mongo Lens`** tool window at the bottom of the IDE.
 
@@ -55,24 +60,21 @@
 
 1. **Manage Connections (Zero-Config YAML or 4-Tab Custom Dialog)**
    - Spring Boot `application*.yml` profiles appear automatically in the left **Connections** tree (`prd`/`prod` profiles are auto-locked as **`READ-ONLY 🔒`**).
-   - Select **`+ Add Custom URI...`** or right-click any `[YAML]`/`[Custom]` connection → **`Connection Settings / View URI...`** to configure Hosts, Auth, AWS DocumentDB TLS/CA (`global-bundle.pem`), `retryWrites=false`, Color Tags, or copy a ready-to-run **`mongosh` CLI command**.
-2. **Instant Preview & Conditional Execution Plan**
-   - Click any collection to open its tab immediately in **`No Filter (Preview)`** mode.
-   - Type in `Filter` / `Sort` / `Project` using **`↑`/`↓`** and **`Enter`/`Tab`** autocomplete, then press `Ctrl + Enter` (`Cmd + Enter`) to run and inspect **`IXSCAN`** / **`COLLSCAN`** plans.
-3. **Multi-Selection Quick Filter**
-   - Select one or multiple cells/fields with `Ctrl` / `Shift`, then right-click to filter (`=`, `!=`, `$in`, `$nin`, Date `$gte ~ $lte`, `AND`, `$or`) or sort immediately.
-4. **Single & Composite-Key Collection Join View**
-   - Right-click any key field → **`Join with Another Collection...`** → pick target collection(s), add extra keys with **`Add Join Condition`** or **`Auto-Match Common Keys`**, select columns & limit mode, and click **`Run in Join Tab ▶`**.
+   - Right-click any `[YAML]`/`[Custom]` connection → **`Connection Settings / View URI...`** to configure Hosts, Auth, AWS DocumentDB TLS/CA (`global-bundle.pem`), `retryWrites=false`, Color Tags, or copy a **`mongosh` CLI command**.
+2. **Type-Safe Data Editing**
+   - Right-click any field/cell in **Tree** or **Table** → **`Edit Data...`** to modify the field with its exact original BSON type preserved and real-time validation (or **`Edit Full Document...`** for structural/raw JSON edits).
+3. **Pre-Flight Validated JSON Import**
+   - Right-click any collection in the Connections tree → **`Import JSON Data...`** (or click **`Import JSON`** on the result toolbar), paste single/array/NDJSON or load a `.json` file, click **`Validate Only (Dry-Run)`** to verify syntax, `_id` uniqueness, and nested schema types, then click **`Import`**.
+4. **Query, Quick Filter & Composite-Key Join View**
+   - Use **`↑`/`↓`** and **`Enter`/`Tab`** autocomplete in `Filter`/`Sort`/`Project`, `Ctrl`/`Shift` multi-select right-click for dynamic Quick Filters, or right-click a key → **`Join with Another Collection...`** for single/composite-key joins.
 
 ---
 
-### Changelog (`v0.2.6`)
+### Changelog (`v0.2.7`)
 
-- **Compass-Style 4-Tab Connection Settings & Bidirectional URI Sync**: Added `General` / `Authentication` / `TLS/SSL` / `Advanced` tabs with live URI sync, `PasswordSafe` credential storage, multi-cert PEM (`global-bundle.pem`) & client certificate SSLContext loading, Environment Color Tags (`Dev`/`Stg`/`Prod`), and non-blocking async `Test Connection` with guaranteed temporary client cleanup.
-- **Connections Tree Root Context Menu (YAML & Custom)**: Added `Connection Settings / View URI...` (with YAML read-only inspection, `Clone to Custom Connection & Edit...`, and `Open Source YAML File`), `Copy Connection String / CLI` submenu (Full URI, Masked URI, `mongosh` CLI), and immediate client invalidation on `Reconnect & Refresh`.
-- **v0.2.5 UX Bug Fixes**:
-  - `JoinViewDialog`: Auto-expands join-key mapping area & dialog height up to 3 rows (scrolls for 4+) and removes duplicate `+` text prefixes on icon buttons.
-  - `Filter` / `Sort` / `Project` Autocomplete: Intercepts `Enter`/`Tab` before IntelliJ's `EditorEnter` action so typed prefixes (e.g. `{cr}`) are cleanly replaced on a single line with zero newline residue.
+- **Strict BSON Type Preservation & Real-Time Validation (`FieldEditDialog` / `BsonValueValidator`)**: Preserves original BSON types (`Int32`, `Int64`, `Double`, `Decimal128`, `String`, `Boolean`, `ObjectId`, `Date`, `Null`, `JSON`), adds live `DocumentListener` validation blocking `OK` on invalid inputs, `Date [Now]` button + live UTC ISO preview, `Red (Prod)` warning banner, Read-Only / Join / Aggregation / `_id` entry guards, and typed `$set` `updateOne` matching exact original `_id` type (`matchedCount == 0` check, AWS DocumentDB compatible).
+- **Collection JSON Data Import & 4-Stage Atomic Pre-Flight Validation (`JsonImportEngine` / `ImportJsonDialog`)**: Supports single object (`{...}`), JSON array (`[...]`), and NDJSON with UTF-8 BOM stripping, `.json` file loader (`10MB` cap), `Format JSON`, `Strip existing _id`, `Validate Only (Dry-Run)`, DB-specific key checks (AWS DocumentDB vs MongoDB), in-batch & 500-chunk DB `_id` duplicate checks, recursive nested schema type mismatch detection with safe numeric promotion, detailed copyable error alert aborting writes atomically, and 500-doc chunked `insertMany`.
+- **Compatibility & Licensing Alignment**: Aligned `sinceBuild = "242"` (`IntelliJ IDEA 2024.2+`), verified Apache-2.0 `LICENSE` & dependencies, and added Requirements & License tables to `README.md`.
 
 ---
 
@@ -82,7 +84,7 @@
 ./gradlew buildPlugin --no-daemon
 ```
 
-Generated archive: `build/distributions/maekom-mongo-lens-0.2.6.zip`
+Generated archive: `build/distributions/maekom-mongo-lens-0.2.7.zip`
 
 ---
 
@@ -92,40 +94,45 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.2.6.zip`
 
 ### 개요
 
-**Maekom Mongo Lens**는 **MongoDB** 및 **AWS DocumentDB** 환경에서 안전한 데이터 조회, 실시간 디버깅, 인덱스 진단, 다중 컬렉션 조인 분석을 수행할 수 있는 IntelliJ IDEA (Community & Ultimate) 플러그인입니다. Spring Boot의 `application*.yml`을 자동으로 탐색(Zero-Config)하고, MongoDB Compass 스타일 4탭 연결 설정(IntelliJ `PasswordSafe` 비밀번호 보호 · AWS DocumentDB `global-bundle.pem` TLS 지원)과 운영(`prd`/`prod`) 기본 읽기 전용 보호를 제공하며, 대용량 컬렉션에서도 UI 프리징 없이 쾌적하게 동작합니다.
+**Maekom Mongo Lens**는 **MongoDB** 및 **AWS DocumentDB** 환경에서 안전한 데이터 조회, BSON 타입 보존 데이터 편집, 실시간 디버깅, 인덱스 진단, 다중 컬렉션 조인 분석을 수행할 수 있는 IntelliJ IDEA (Community & Ultimate) 플러그인입니다. Spring Boot의 `application*.yml`을 자동으로 탐색(Zero-Config)하고, MongoDB Compass 스타일 4탭 연결 설정(IntelliJ `PasswordSafe` 비밀번호 보호 · AWS DocumentDB `global-bundle.pem` TLS 지원)과 운영(`prd`/`prod`) 기본 읽기 전용 보호를 제공하며, 대용량 컬렉션에서도 UI 프리징 없이 쾌적하게 동작합니다.
+
+---
+
+### 최소 / 권장 사양 및 라이선스
+
+| 항목 | 사양 |
+| :--- | :--- |
+| **Version** | `0.2.7` |
+| **IntelliJ IDEA** | `2024.2+` (Community / Ultimate — `build.gradle.kts` `sinceBuild = "242"` 기준) |
+| **Java Runtime (JBR)** | 최소 `JDK 17` / 권장 `JDK 21` |
+| **Database Support** | `MongoDB 4.4 ~ 8.0` (Standalone, Replica Set, Atlas `mongodb+srv`) & `AWS DocumentDB 3.6 / 4.0 / 5.0` |
+| **License** | `Apache-2.0` ([Apache License 2.0](LICENSE)) |
 
 ---
 
 ### 주요 기능
 
+- **BSON 타입 보존 "데이터 수정" 팝업 & 실시간 입력 검증 (`FieldEditDialog` & `DocumentEditDialog`)**
+  - 원본 필드의 실제 BSON 타입(`Int32`, `Int64`, `Double`, `Decimal128`, `String`, `Boolean`, `ObjectId`, `Date`, `Null`, `JSON (Object/Array)`)을 자동 감지·유지하여 숫자/날짜/ObjectId가 문자열로 덮어써지는 사고를 원천 차단합니다.
+  - 입력 중 `DocumentListener` 실시간 검증으로 오입력(Int32 범위 초과 안내·소수점 차단, Double/Decimal128 `NaN`/`Infinity` 차단, 24자리 16진수 ObjectId, 엄격 Boolean, ISO-8601/`+09:00`/`yyyy-MM-dd HH:mm:ss` UTC/13자리 Epoch ms `Date` 파싱 + **`[현재 시각 (Now)]`** 버튼 및 실시간 UTC ISO 미리보기) 시 즉시 빨간색 경고·테두리 하이라이트와 함께 **`OK` 버튼을 비활성화**합니다.
+  - `Read-Only` 연결·조인/집계 결과 뷰·`_id` 누락 문서·`_id` 필드를 보호하고, `Red (Prod)` 연결에는 상단 운영 주의 배너를 표시하며, 원본 `_id` 타입 그대로 매칭(`matchedCount == 0` 오류 알림) + 배열 경로(`items.0.price`) 보존 + AWS DocumentDB 호환(`updateOne`에 `maxTimeMS` 미사용) `$set` 업데이트를 수행합니다.
+- **컬렉션 JSON 데이터 임포트(단건·다건·NDJSON) & 4단계 사전 무결성 검증 알럿 중단 (`ImportJsonDialog`)**
+  - 좌측 트리 컬렉션 우클릭 → **`JSON 데이터 임포트...`** 또는 결과 탭 상단 **`JSON 임포트`** 버튼으로 진입합니다(`Read-Only` 연결은 진입 즉시 차단 알럿 표시).
+  - **단건 JSON 객체(`{...}`)**, **다건 JSON 배열(`[...]`)**, **NDJSON(`mongoexport` 줄바꿈 포맷)**과 UTF-8 BOM 제거, Extended JSON(`$oid`, `$date`, `$numberLong`, `$numberDecimal`), **`[.json 파일 불러오기]`**(`10MB` 제한), **`[JSON 정렬]`**, **`[기존 _id 필드 제거 후 신규 자동 생성]`**, **`[검증만 실행 (Dry-Run)]`** 을 지원합니다.
+  - DB 쓰기 전 백그라운드에서 4단계 사전 무결성 검증을 원자적으로 수행합니다: (1) JSON 문법 및 DB별 키 제약(AWS DocumentDB에서는 필드명 `.` 차단, 일반 MongoDB는 허용), (2) 배치 내부 및 500건 청크 분할 DB `_id` 중복 검증(Int/Long 숫자형 교차 체크), (3) 기존 샘플 최대 50건 기반 중첩 스키마 타입 불일치 검증 및 안전한 숫자형 승격, (4) 단 1건이라도 오류 발견 시 DB 쓰기 0건 전면 중단 + 상세 원인 테이블/클립보드 복사 알럿 노출, 검증 통과 시 500건 청크 `insertMany` 후 결과 탭 자동 새로고침.
 - **MongoDB Compass 스타일 4탭 연결 설정 & URI 양방향 실시간 동기화**
-  - **`General` / `Authentication` / `TLS/SSL` / `Advanced`** 4개 탭과 상단 MongoDB URI 입력창이 실시간 양방향 동기화됩니다(`URI 직접 편집` 토글, RFC-3986 비밀번호 특수문자 자동 인코딩, `mongodb+srv` 포트/옵션 자동 정리, 미지정 파라미터 무손실 테이블).
-  - **보안 저장 & AWS DocumentDB TLS 지원**: 비밀번호는 프로젝트 평문 파일이 아닌 IntelliJ **`PasswordSafe`(OS 키체인)**에 분리 저장됩니다. AWS DocumentDB **`global-bundle.pem`** 다중 CA 인증서 묶음, mTLS 클라이언트 인증서(`.pem`/`.p12`/`.jks`), `retryWrites=false`, 비동기 **`연결 테스트`** 를 기본 지원합니다.
-  - **좌측 트리 연결 우클릭 메뉴 & 환경 컬러 태그**: `[YAML]` / `[Custom]` 연결 우클릭 → **`연결 설정 / URI 보기...`**(YAML 연결은 원본 파일 변경 없이 **`Custom 연결로 복제하여 편집...`** · **`원본 YAML 파일 열기`** 제공), **`연결 문자열 / 명령어 복사`** 서브메뉴(전체 URI / 비밀번호 마스킹 `***` / **`mongosh` CLI 명령어**), **`초록(Dev)` / `주황(Stg)` / `빨강(Prod)` 환경 컬러 태그**(트리 노드 및 열린 탭 동시 표시)를 지원합니다.
-- **컬렉션 클릭 즉시 미리보기(Zero-Overhead) & 100% 읽기 전용 인덱스 뷰어 / Filter 가이드 (`IndexInspectorDialog`)**
-  - `Filter`/`Sort` 조건 없이 컬렉션을 클릭하면 즉시 탭과 로딩 스피너를 열고 `.limit(N).batchSize(N)` 단 1회 왕복으로 본 데이터만 빠르게 표시합니다(`조건 없음 (Preview)` 배지, `explain()`/`listIndexes()` 생략).
-  - 조건을 입력해 조회할 때만 비동기로 `QUERY_PLANNER` 실행 계획(`IXSCAN` / `COLLSCAN` / `UNKNOWN`, 1,500ms `maxTimeMS`, 풀스캔 유발 `EXECUTION_STATS` 미사용)을 분석합니다.
-  - 실행 계획 배지를 클릭하거나 좌측 트리 컬렉션 우클릭 → **`인덱스 조회 및 쿼리 가이드...`** 에서 60초 캐시된 인덱스 목록, 원클릭 Filter 템플릿 적용, 운영/DBA 협의용 ESR(`Equality → Sort → Range`) `createIndex` 복사 전용 구문을 확인할 수 있습니다(100% 읽기 전용).
-- **`Filter` / `Sort` / `Project` 스마트 자동완성 (키보드 `↑`/`↓` 이동 및 `Enter`/`Tab` 적용)**
-  - 자동완성 팝업 표시 중 **`↑` / `↓`** 로 순환 이동, **`Enter` / `Tab`** 으로 입력 중인 접두사를 한 줄에서 깔끔하게 치환(예: `{cr}` → `{"created_at": }`, 개행·오실행 완전 방지), **`Esc`** 로 닫기를 지원합니다.
-  - 항목 확정 직후에는 다음 문자 타이핑 전까지 팝업 재오픈을 1회 억제하여 이어지는 `Enter` 실행을 방해하지 않습니다.
-- **New UI 네이티브 컨텍스트 메뉴 (5개 논리 그룹 + 전 항목 `AllIcons`)**
-  - **Tree** / **Table** 뷰에서 `Ctrl`/`Shift` 다중 선택을 유지한 채 우클릭하면 IntelliJ New UI 네이티브 `ActionPopupMenu`와 16×16 아이콘 메뉴가 0ms로 열립니다:
-    - **동적 빠른 필터 & 정렬**: 단일 `=`/`!=`, 동일 필드 `$in`/`$nin`, 2개 날짜 범위 `$gte ~ $lte`, 이종 필드 `AND`/`$or`(기존 `$or` 보존을 위해 `$and` 안전 래핑), 중첩 `$exists`/비어있음, `ObjectId`/`Date` UTC 범위 필터, 즉시 정렬(`1`/`-1`).
-    - **데이터 수정**, **키/값 복사 서브메뉴**(값만/JSON/필드 경로), **참조 컬렉션 점프 & 조인**, **문서 Diff 비교**(2건 비교 + 크로스탭 Baseline 고정).
-- **컬렉션 조인 뷰 (`A ⋈ B ⋈ C`) — 다중 연결키 `AND` 복합 매칭 & 공통 키 자동 매칭**
-  - **다중 연결키 & 공통 키 자동 매칭**: **`연결 조건 추가`** 로 1~N개 연결키 행을 동적으로 추가(최대 3행까지 팝업 높이 자동 확장, 4행 이상 내부 스크롤)하고, **`공통 키 자동 매칭`** 으로 기존 입력 행을 덮어쓰지 않은 채 이름이 동일한 공통 필드(`_id` 제외)만 하단에 자동 추가합니다.
-  - **하이브리드 `$lookup` 파이프라인**: 단일 키는 인덱스 효율이 높은 표준 `localField`/`foreignField`를 유지하고, 2개 이상 복합 키에서는 MongoDB 및 AWS DocumentDB(4.0/5.0) 호환 `let` + `pipeline`(`local_k0..kN`, `null == null` 매칭 폭발 방지 가드, `$cond($isArray)` 동적 분기, 최신 1건 모드 `$sort`/`$limit: 1` 푸시다운)으로 자동 전환되며 `15,000ms maxTimeMS` 및 Single-Flight 취소 안전장치가 적용됩니다.
-  - **`Array<Object>` 내부 키, 일관된 페이징 & 전체 조회**: `items.product_id` 등 중첩/배열 경로 지원, `1:1`(최신 1건)/`1:N`(전체 펼치기), 조인 후 단일 `$skip`/`$limit(N+1)` 페이징, **`20 / 50 / 100 / 500 / 전체 조회 (5,000건 안전 상한)`**, **`조건/컬럼 수정`**, **`파이프라인 복사`**, 상단 연결키 요약 배지를 제공합니다.
-- **직관적인 모드/뷰 전환 UI & 실시간 한/영 전환**
-  - 하단 강조 바가 적용된 모드 탭(`Documents (Find)` / `Aggregations` / `Mongo Shell`), 아이콘 세그먼트 뷰 스위처(`Tree` | `Table` | `JSON`, Lazy 백그라운드 렌더링 및 대용량 표시 절삭), AES 임시 복호화, IDE 재시작 없는 `KO ↔ EN` 즉시 전환을 지원합니다.
+  - `General` / `Authentication` / `TLS/SSL` / `Advanced` 4탭 양방향 URI 동기화, IntelliJ **`PasswordSafe`** 비밀번호 보안 저장, AWS DocumentDB **`global-bundle.pem`** 다중 CA/클라이언트 인증서, 환경 컬러 태그(`Dev`/`Stg`/`Prod`), 연결 노드 우클릭 메뉴(`연결 설정 / URI 보기...`, 전체/마스킹 URI 및 `mongosh` CLI 복사, YAML 읽기 전용 보기 + Custom 복제).
+- **Zero-Overhead 초기 미리보기 & 100% 읽기 전용 인덱스 뷰어 (`IndexInspectorDialog`)**
+  - 조건 없는 컬렉션 클릭 시 즉시 미리보기(`조건 없음 (Preview)`), 조건 조회 시 비동기 `QUERY_PLANNER`(`IXSCAN`/`COLLSCAN`/`UNKNOWN`), 60초 캐시 인덱스 조회 및 ESR `createIndex` 권장 구문 복사.
+- **스마트 키보드 자동완성, 5그룹 네이티브 컨텍스트 메뉴 & 다중 연결키 조인 뷰 (`A ⋈ B ⋈ C`)**
+  - `Filter`/`Sort`/`Project` 키보드 자동완성, 다중 선택 빠른 필터/정렬, 문서 Diff 비교, 다중 연결키(`AND`) 및 공통 키 자동 매칭 조인 뷰, AES 임시 복호화, 실시간 `KO ↔ EN` 전환을 지원합니다.
 
 ---
 
 ### 설치 방법
 
-1. [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases)에서 **`maekom-mongo-lens-0.2.6.zip`** 파일을 다운로드합니다.
-2. IntelliJ IDEA에서 **`Settings / Preferences` → `Plugins` → ⚙️(기어 아이콘) → `Install Plugin from Disk...`** 를 선택합니다.
+1. [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases)에서 **`maekom-mongo-lens-0.2.7.zip`** 파일을 다운로드합니다.
+2. IntelliJ IDEA (`2024.2+`)에서 **`Settings / Preferences` → `Plugins` → ⚙️(기어 아이콘) → `Install Plugin from Disk...`** 를 선택합니다.
 3. 다운로드한 `.zip` 파일을 선택하고 IDE를 재시작합니다.
 4. 하단 ToolWindow에서 **`Maekom Mongo Lens`** 탭을 엽니다.
 
@@ -135,24 +142,21 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.2.6.zip`
 
 1. **커넥션 등록 및 관리 (Zero-Config YAML & Compass 스타일 4탭 설정)**
    - 프로젝트의 Spring Boot `application*.yml` 프로필이 좌측 **Connections** 트리에 자동 표시됩니다(`prd`/`prod`는 자동 **`READ-ONLY 🔒`** 보호).
-   - 드롭다운의 **`+ Custom URI 추가...`** 또는 트리 연결 노드 우클릭 → **`연결 설정 / URI 보기...`** 에서 호스트, 인증, AWS DocumentDB TLS/CA(`global-bundle.pem`), `retryWrites=false`, 환경 컬러 태그를 설정하거나 **`mongosh` CLI 명령어**를 원클릭 복사할 수 있습니다.
-2. **컬렉션 클릭 조회 & 조건부 실행 계획 확인**
-   - 컬렉션을 클릭하면 **`조건 없음 (Preview)`** 상태로 즉시 조회됩니다.
-   - `Filter` / `Sort` / `Project` 입력창에서 **`↑`/`↓`** 이동 및 **`Enter`/`Tab`** 자동완성으로 조건을 작성한 뒤 `Ctrl + Enter` (`Cmd + Enter`)로 조회하면 **`IXSCAN`** / **`COLLSCAN`** 분석 배지가 표시됩니다.
-3. **다중 선택 우클릭 빠른 필터**
-   - `Table` 셀 또는 `Tree` 노드를 `Ctrl`/`Shift`로 여러 개 선택한 뒤 우클릭하면 선택 조합에 맞는 필터(`=`, `!=`, `$in`, `$nin`, 날짜 `$gte ~ $lte`, `AND`, `$or`)나 정렬이 즉시 적용됩니다.
-4. **단일 / 다중 연결키 컬렉션 조인 뷰 실행**
-   - 기준 필드 우클릭 → **`다른 컬렉션과 조인해서 보기...`** → 대상 컬렉션 선택 후 **`연결 조건 추가`** 또는 **`공통 키 자동 매칭`** 으로 복합 연결키를 설정하고, 컬럼·조회 건수를 선택해 **`조인 탭으로 실행 ▶`** 을 클릭합니다.
+   - 연결 노드 우클릭 → **`연결 설정 / URI 보기...`** 에서 호스트, 인증, AWS DocumentDB TLS/CA(`global-bundle.pem`), `retryWrites=false`, 환경 컬러 태그를 설정하거나 **`mongosh` CLI 명령어**를 원클릭 복사할 수 있습니다.
+2. **BSON 타입 보존 데이터 수정**
+   - **Tree** 또는 **Table** 뷰에서 필드/셀 우클릭 → **`데이터 수정`** 을 선택해 원본 BSON 타입을 유지한 채 실시간 검증과 함께 안전하게 값을 수정합니다(전체 문서 구조/Raw JSON 편집은 **`전체 문서 편집...`** 선택).
+3. **사전 무결성 검증 JSON 임포트**
+   - 좌측 트리 컬렉션 우클릭 → **`JSON 데이터 임포트...`** (또는 결과 탭 상단 **`JSON 임포트`** 버튼) → 단건/배열/NDJSON 붙여넣기 또는 `.json` 파일 불러오기 → **`[검증만 실행 (Dry-Run)]`** 으로 문법·`_id` 중복·중첩 스키마 타입을 사전 확인한 뒤 **`[임포트 실행]`** 을 클릭합니다.
+4. **쿼리, 다중 선택 빠른 필터 & 다중 연결키 조인 뷰**
+   - `Filter`/`Sort`/`Project`에서 **`↑`/`↓`**·**`Enter`/`Tab`** 자동완성, `Ctrl`/`Shift` 다중 선택 우클릭 빠른 필터, 기준 필드 우클릭 → **`다른 컬렉션과 조인해서 보기...`** 로 단일/복합키 조인을 실행합니다.
 
 ---
 
-### 릴리즈 노트 (`v0.2.6` Changelog)
+### 릴리즈 노트 (`v0.2.7` Changelog)
 
-- **Compass 스타일 4탭 연결 설정 다이얼로그 & URI 양방향 실시간 동기화**: `General` / `Authentication` / `TLS/SSL` / `Advanced` 4탭 구성, `URI 직접 편집` 양방향 동기화, IntelliJ `PasswordSafe` 비밀번호 보안 저장, AWS DocumentDB `global-bundle.pem` 다중 CA/클라이언트 인증서 `SSLContext`, 환경 컬러 태그(`Dev`/`Stg`/`Prod`), 비동기 `연결 테스트` 및 임시 클라이언트 즉시 해제.
-- **좌측 트리 연결 노드 우클릭 메뉴 확장 (`[YAML]` / `Custom` 공통)**: `연결 설정 / URI 보기...` (YAML 읽기 전용 뷰 + `Custom 연결로 복제하여 편집...` + `원본 YAML 파일 열기`), `연결 문자열 / 명령어 복사` 서브메뉴(전체 URI / 마스킹 URI / `mongosh` CLI), `연결 새로고침` 시 기존 클라이언트 캐시 즉시 무효화.
-- **v0.2.5 긴급 UX 버그 2건 수정**:
-  - `JoinViewDialog` 연결 키 매핑 영역 및 팝업 세로 높이 3행 자동 확장(4행부터 스크롤) 및 아이콘 버튼 중복 `+` 문자 제거.
-  - `Filter` / `Sort` / `Project` 자동완성에서 `{cr}` + `Enter` 확정 시 `EditorEnter` 개행 선삽입 차단 및 접두사 깔끔한 단일 라인 치환.
+- **"데이터 수정" 팝업 BSON 타입 보존 및 실시간 입력 검증 강화 (`FieldEditDialog` / `BsonValueValidator`)**: 원본 BSON 타입(`Int32`/`Int64`/`Double`/`Decimal128`/`String`/`Boolean`/`ObjectId`/`Date`/`Null`/`JSON`) 자동 감지·고정, `DocumentListener` 실시간 유효성 검증 및 오입력 시 `OK` 비활성화, `Date [현재 시각 (Now)]` 버튼 및 UTC ISO 미리보기, `Red (Prod)` 운영 경고 배너, `Read-Only`/조인/집계/`_id` 보호 가드, 원본 `_id` 타입 매칭(`matchedCount == 0` 알림) 및 AWS DocumentDB 호환 `$set` `updateOne` 구현.
+- **컬렉션 JSON 데이터 임포트 및 4단계 사전 무결성 검증 알럿 중단 (`JsonImportEngine` / `ImportJsonDialog`)**: 단건(`{...}`)/다건(`[...]`)/NDJSON 3가지 포맷 및 UTF-8 BOM 제거, `.json` 파일 불러오기(`10MB` 제한), `[JSON 정렬]`, `[기존 _id 제거 후 신규 자동 생성]`, `[검증만 실행 (Dry-Run)]`, DB별 키 제약(DocumentDB `.` 차단 vs MongoDB 허용), 배치 및 500건 청크 DB `_id` 중복 검증, 중첩 스키마 타입 불일치 사전 감지 및 안전 숫자 승격, 오류 시 DB 쓰기 전면 중단 및 상세 복사 가능 알럿, 통과 시 500건 청크 `insertMany` + 자동 새로고침 구현.
+- **호환성 및 라이선스 정비**: `build.gradle.kts` `sinceBuild = "242"`(`IntelliJ IDEA 2024.2+`) 일치화, Apache-2.0 `LICENSE` 및 외부 의존성 라이선스 검증, `README.md` 최소/권장 사양 및 라이선스 표 반영.
 
 ---
 
@@ -162,7 +166,7 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.2.6.zip`
 ./gradlew buildPlugin --no-daemon
 ```
 
-빌드 산출물: `build/distributions/maekom-mongo-lens-0.2.6.zip`
+빌드 산출물: `build/distributions/maekom-mongo-lens-0.2.7.zip`
 
 ---
 

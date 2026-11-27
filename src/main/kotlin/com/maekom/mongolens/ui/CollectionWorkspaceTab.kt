@@ -351,6 +351,12 @@ class CollectionWorkspaceTab(
         }
     }
 
+    fun refreshAfterImport() {
+        if (!isDisposedFlag.get() && !findPanel.isJoinTab) {
+            findPanel.executeFind(resetJoinPage = false, forceMetaRefresh = true)
+        }
+    }
+
     fun applyQuickFilterAndRun(filterJson: String) {
         switchMode(WorkspaceMode.FIND)
         findPanel.applyQuickFilterAndRun(filterJson)

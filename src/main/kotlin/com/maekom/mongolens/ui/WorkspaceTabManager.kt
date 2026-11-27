@@ -321,6 +321,16 @@ class WorkspaceTabManager(
         entriesById.values.forEach { it.workspaceTab.updateReadOnlyBadge() }
     }
 
+    fun refreshCollectionTabs(profileId: String, database: String, collection: String) {
+        entriesById.values
+            .filter {
+                it.workspaceTab.profile.id == profileId &&
+                    it.workspaceTab.database == database &&
+                    it.workspaceTab.collection == collection
+            }
+            .forEach { it.workspaceTab.refreshAfterImport() }
+    }
+
     fun clearRegistry() {
         entriesById.clear()
         entriesByKey.clear()

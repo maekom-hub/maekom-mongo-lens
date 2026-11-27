@@ -277,7 +277,18 @@ class FindQueryPanel(
             openJoinConfigurationDialog(initialField)
         } else null,
         onRequestEditJoin = if (initialJoinSpec != null) ({ openEditCurrentJoinDialog() }) else null,
-        onCopyJoinPipeline = if (initialJoinSpec != null) ({ copyCurrentJoinPipeline() }) else null
+        onCopyJoinPipeline = if (initialJoinSpec != null) ({ copyCurrentJoinPipeline() }) else null,
+        onRequestImportJson = if (initialJoinSpec == null) ({
+            ImportJsonDialog.openIfWritable(
+                project = project,
+                connectionManager = connectionManager,
+                profile = profile,
+                database = database,
+                collection = collection
+            ) {
+                executeFind(resetJoinPage = false, forceMetaRefresh = true)
+            }
+        }) else null
     )
 
     init {

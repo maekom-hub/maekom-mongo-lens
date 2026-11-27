@@ -15,6 +15,11 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>v0.2.7</h3>
+        <ul>
+            <li><b>Strict BSON Type Preservation &amp; Real-Time Validation in Edit Data:</b> Added focused single-field BSON editor (<code>FieldEditDialog</code>) preserving original BSON types (<code>Int32</code>, <code>Int64</code>, <code>Double</code>, <code>Decimal128</code>, <code>String</code>, <code>Boolean</code>, <code>ObjectId</code>, <code>Date</code>, <code>Null</code>, <code>JSON</code>), real-time <code>DocumentListener</code> validation blocking invalid saves, <code>Date [Now]</code> + live UTC ISO preview, <code>Red (Prod)</code> warning banner, <code>_id</code> &amp; Join/Aggregation/Read-Only guards, and typed <code>$set</code> <code>updateOne</code> matching original <code>_id</code> type (compatible with MongoDB &amp; AWS DocumentDB).</li>
+            <li><b>Collection JSON Data Import &amp; 4-Stage Atomic Pre-Flight Validation:</b> Added <code>Import JSON Data...</code> in Connections tree and result toolbar supporting single object (<code>{...}</code>), JSON array (<code>[...]</code>), and NDJSON formats, UTF-8 BOM stripping, <code>[.json File]</code> loader (10MB cap), <code>[Format JSON]</code>, <code>[Strip existing _id]</code>, and <code>[Validate Only (Dry-Run)]</code>. Runs 4-stage Pre-Flight checks (syntax &amp; AWS DocumentDB vs MongoDB key rules, in-batch + chunked DB <code>_id</code> duplicate detection, nested schema type mismatch checks with safe numeric promotion) — atomically aborting with a detailed copyable error report before any DB write, and inserting in 500-doc chunks when clean.</li>
+        </ul>
         <h3>v0.2.6</h3>
         <ul>
             <li><b>MongoDB Compass-Style 4-Tab Connection Settings &amp; Bidirectional URI Sync:</b> Redesigned connection configuration into 4 tabs (<code>General</code>, <code>Authentication</code>, <code>TLS/SSL</code>, <code>Advanced</code>) with live two-way MongoDB URI sync (RFC-3986 credential encoding, <code>mongodb+srv</code> rules, lossless extra query parameter table), IntelliJ <code>PasswordSafe</code> credential storage, AWS DocumentDB <code>global-bundle.pem</code> multi-CA &amp; client certificate SSLContext support, environment color tags (Dev/Stg/Prod), and non-blocking async <code>Test Connection</code>.</li>

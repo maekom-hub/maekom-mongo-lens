@@ -148,6 +148,17 @@ class MongoLensMainPanel(
                     }
                 ).show()
             },
+            onImportJson = { profile, db, coll ->
+                ImportJsonDialog.openIfWritable(
+                    project = project,
+                    connectionManager = connectionManager,
+                    profile = profile,
+                    database = db,
+                    collection = coll
+                ) {
+                    tabManager.refreshCollectionTabs(profile.id, db, coll)
+                }
+            },
             onOpenConnectionSettings = { existing -> openConnectionSettingsDialog(existing) },
             onDeleteCustomProfile = { existing ->
                 connectionManager.closeClient(existing.id)
@@ -192,7 +203,7 @@ class MongoLensMainPanel(
 
     /**
      * Simplified native ToolWindow title bar actions: ONLY 2 items:
-     * 1. Version & Connection Status ("v0.2.6 · 연결됨 (126ms)")
+     * 1. Version & Connection Status ("v0.2.7 · 연결됨 (126ms)")
      * 2. [⚙ 설정 / Settings] popup group (Decrypt Config, Check/Install Update, Language Switch)
      */
     fun createTitleActions(): List<AnAction> {

@@ -194,16 +194,9 @@ class DateEditorPanel(initialIsoOrMillis: String = "") : JPanel() {
 
         fun tryParseInstant(raw: String): Instant? {
             if (raw.isEmpty()) return null
+            com.maekom.mongolens.mongo.BsonValueValidator.parseFlexibleInstant(raw)?.let { return it }
             raw.toLongOrNull()?.let { return Instant.ofEpochMilli(it) }
-            return try {
-                Instant.parse(raw)
-            } catch (_: Throwable) {
-                try {
-                    LocalDateTime.parse(raw.replace(' ', 'T')).toInstant(ZoneOffset.UTC)
-                } catch (_: Throwable) {
-                    null
-                }
-            }
+            return null
         }
 
         private fun parseInitialInstant(raw: String): Instant = tryParseInstant(raw.trim()) ?: Instant.now()
