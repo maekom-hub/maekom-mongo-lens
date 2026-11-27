@@ -1,0 +1,35 @@
+name: Feature Request
+description: Suggest a new feature or UX improvement for Maekom Mongo Lens
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Motivation
+      description: What workflow pain point or limitation are you trying to solve?
+      placeholder: "When debugging collections with ..., it is currently hard to ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the feature, UI flow, or behavior you would like to see.
+      placeholder: "Add an option / dialog / shortcut that ..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: target_db
+    attributes:
+      label: Target Database / Scope
+      description: Which environment does this feature apply to?
+      options:
+        - Both MongoDB & AWS DocumentDB
+        - MongoDB Only
+        - AWS DocumentDB Only
+        - IntelliJ UI / Developer Experience
+    validations:
+      required: true
