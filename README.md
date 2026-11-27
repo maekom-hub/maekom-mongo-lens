@@ -1,6 +1,6 @@
 # Maekom Mongo Lens
 
-[![Version](https://img.shields.io/badge/version-v0.2.8-blue.svg)](https://github.com/maekom-hub/maekom-mongo-lens/releases)
+[![Version](https://img.shields.io/badge/version-v0.2.9-blue.svg)](https://github.com/maekom-hub/maekom-mongo-lens/releases)
 [![IntelliJ IDEA](https://img.shields.io/badge/IntelliJ%20IDEA-2024.2%2B-purple.svg)](https://www.jetbrains.com/idea/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](./LICENSE)
 
@@ -20,7 +20,7 @@
 
 | Item | Specification |
 | :--- | :--- |
-| **Version** | `0.2.8` |
+| **Version** | `0.2.9` |
 | **IntelliJ IDEA** | `2024.2+` (Community / Ultimate — matches `sinceBuild = "242"`) |
 | **Java Runtime (JBR)** | Minimum `JDK 17` / Recommended `JDK 21` |
 | **Database Support** | `MongoDB 4.4 ~ 8.0` (Standalone, Replica Set, Atlas `mongodb+srv`) & `AWS DocumentDB 3.6 / 4.0 / 5.0` |
@@ -49,7 +49,7 @@
 
 ### Installation
 
-1. Download **`maekom-mongo-lens-0.2.8.zip`** from [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases).
+1. Download **`maekom-mongo-lens-0.2.9.zip`** from [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases).
 2. In IntelliJ IDEA (`2024.2+`), go to **`Settings / Preferences` → `Plugins` → ⚙️ (Gear Icon) → `Install Plugin from Disk...`**.
 3. Select the downloaded `.zip` archive and restart the IDE.
 4. Open the **`Maekom Mongo Lens`** tool window at the bottom of the IDE.
@@ -69,6 +69,12 @@
    - Use **`↑`/`↓`** and **`Enter`/`Tab`** autocomplete in `Filter`/`Sort`/`Project`, `Ctrl`/`Shift` multi-select right-click for dynamic Quick Filters, or right-click a key → **`Join with Another Collection...`** for single/composite-key joins.
 
 ---
+
+### Changelog (`v0.2.9`)
+
+- **Inline Green `+` Join Target Tab Bar (`JoinViewDialog`)**: Placed the compact textless green `+` icon button inline right beside the last join target chip (`6px` gap) inside a horizontally scrollable strip, with conditional per-tab `×` close buttons (shown only when 2+ targets exist) and active tab highlighting across Darcula and New UI Dark/Light themes.
+- **Real-Time Searchable Field ComboBoxes (`SearchableFieldComboBox` / `FieldSearchFilter`)**: Enabled instant case-insensitive typing search with `startsWith` priority sorting, automatic popup opening, arrow/mouse selection conflict guards, caret preservation, and custom nested path input across all join-key mapping (source & target) and `WHERE AND` condition field selectors.
+- **Bidirectional MongoDB & AWS DocumentDB Multi-Key Join Engine + JUnit 5 Tests**: Native `$lookup` on MongoDB + seamless hybrid 2-phase single-key `$lookup` / `$slice(500)` / `MultiKeyJoinFilterEngine` / signature-isolated cached `Next`/`Prev` paging on AWS DocumentDB (and automatic `Error 304` runtime fallback), verified with JUnit 5 tests covering 35-doc composite matching, mixed `INNER`/`LEFT` multi-joins, `Next`/`Prev` slicing, and `FieldSearchFilter` priority ranking.
 
 ### Changelog (`v0.2.8`)
 
@@ -90,7 +96,7 @@
 ./gradlew buildPlugin --no-daemon
 ```
 
-Generated archive: `build/distributions/maekom-mongo-lens-0.2.8.zip`
+Generated archive: `build/distributions/maekom-mongo-lens-0.2.9.zip`
 
 ---
 
@@ -108,7 +114,7 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.2.8.zip`
 
 | 항목 | 사양 |
 | :--- | :--- |
-| **Version** | `0.2.8` |
+| **Version** | `0.2.9` |
 | **IntelliJ IDEA** | `2024.2+` (Community / Ultimate — `build.gradle.kts` `sinceBuild = "242"` 기준) |
 | **Java Runtime (JBR)** | 최소 `JDK 17` / 권장 `JDK 21` |
 | **Database Support** | `MongoDB 4.4 ~ 8.0` (Standalone, Replica Set, Atlas `mongodb+srv`) & `AWS DocumentDB 3.6 / 4.0 / 5.0` |
@@ -137,7 +143,7 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.2.8.zip`
 
 ### 설치 방법
 
-1. [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases)에서 **`maekom-mongo-lens-0.2.8.zip`** 파일을 다운로드합니다.
+1. [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases)에서 **`maekom-mongo-lens-0.2.9.zip`** 파일을 다운로드합니다.
 2. IntelliJ IDEA (`2024.2+`)에서 **`Settings / Preferences` → `Plugins` → ⚙️(기어 아이콘) → `Install Plugin from Disk...`** 를 선택합니다.
 3. 다운로드한 `.zip` 파일을 선택하고 IDE를 재시작합니다.
 4. 하단 ToolWindow에서 **`Maekom Mongo Lens`** 탭을 엽니다.
@@ -157,6 +163,12 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.2.8.zip`
    - `Filter`/`Sort`/`Project`에서 **`↑`/`↓`**·**`Enter`/`Tab`** 자동완성, `Ctrl`/`Shift` 다중 선택 우클릭 빠른 필터, 기준 필드 우클릭 → **`다른 컬렉션과 조인해서 보기...`** 로 단일/복합키 조인을 실행합니다.
 
 ---
+
+### 릴리즈 노트 (`v0.2.9` Changelog)
+
+- **조인 설정 상단 탭 바 인라인 초록색 `+` 버튼 & 조건부 `×` 닫기 (`JoinViewDialog`)**: 우측 단독 삭제 버튼을 제거하고 2개 이상 조인 시 각 탭 우측에 `×` 닫기 버튼을 조건부 표시하며, 텍스트 없는 초록색 `+` 아이콘 버튼을 가로 스크롤 컨테이너 내 마지막 조인 탭 바로 오른쪽 옆(6px 간격)에 인라인 밀착 배치했습니다.
+- **조인 설정 필드 콤보박스 실시간 타이핑 검색 (`SearchableFieldComboBox` / `FieldSearchFilter`)**: 연결 키 매핑(기준/대상 컬렉션 키) 및 `WHERE AND` 추가 필터의 모든 필드 콤보박스에서 타이핑 시 대소문자 무시 부분 일치 + 접두사(`startsWith`) 우선 정렬 필터링, 드롭다운 자동 오픈, 방향키/마우스 선택 충돌 방지 가드, 직접 입력 중첩 경로 지원을 적용했습니다.
+- **일반 MongoDB / AWS DocumentDB 양방향 다중 조인 엔진 & JUnit 5 단위 테스트 검증**: MongoDB 네이티브 다중 `$lookup`과 AWS DocumentDB(`Error 304` 런타임 폴백 포함) 하이브리드 2단계 조인·시그니처 격리 세션 캐시 페이징을 구현하고, 35건 복합키·혼합 `INNER`/`LEFT` 다중 조인·`다음`/`이전` 슬라이싱·`FieldSearchFilter` 우선순위 정렬을 검증하는 JUnit 5 테스트를 통과시켰습니다.
 
 ### 릴리즈 노트 (`v0.2.8` Changelog)
 
@@ -178,7 +190,7 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.2.8.zip`
 ./gradlew buildPlugin --no-daemon
 ```
 
-빌드 산출물: `build/distributions/maekom-mongo-lens-0.2.8.zip`
+빌드 산출물: `build/distributions/maekom-mongo-lens-0.2.9.zip`
 
 ---
 

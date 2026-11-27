@@ -15,6 +15,12 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>v0.2.9</h3>
+        <ul>
+            <li><b>Inline Green <code>+</code> Join Target Button &amp; Conditional Tab Close (<code>JoinViewDialog</code>):</b> Placed the compact textless green <code>+</code> button inline directly next to the last join target chip (6px spacing) inside a horizontally scrollable tab strip, with conditional per-tab <code>×</code> close buttons (visible only when 2+ join targets exist) and active tab highlight.</li>
+            <li><b>Real-Time Searchable Field ComboBoxes (<code>SearchableFieldComboBox</code> &amp; <code>FieldSearchFilter</code>):</b> Added instant case-insensitive typing search with prefix-first priority sorting (<code>startsWith</code> before <code>contains</code>), automatic dropdown opening, keyboard/mouse selection conflict guards (<code>isFiltering</code> / <code>isAdjustingSelection</code>), and custom nested path support across all join-key mapping (source &amp; target) and <code>WHERE AND</code> condition field selectors.</li>
+            <li><b>Bidirectional MongoDB &amp; AWS DocumentDB Multi-Key Join Engine + JUnit 5 Verification:</b> Preserves native multi-condition <code>$lookup</code> on MongoDB while transparently running 2-phase hybrid single-key <code>$lookup</code> + <code>$slice(500)</code> + in-memory <code>MultiKeyJoinFilterEngine</code> + signature-isolated cached <code>Next</code>/<code>Prev</code> slicing on AWS DocumentDB (and runtime <code>Error 304</code> fallback), verified by automated JUnit 5 unit tests.</li>
+        </ul>
         <h3>v0.2.8</h3>
         <ul>
             <li><b>Join Target Tab Bar UI Refactoring (<code>JoinViewDialog</code>):</b> Removed the standalone right-side Remove button; each join target chip now features a conditional <code>×</code> close button (visible only when 2+ join targets exist), active-tab highlight, horizontal scrolling, and a compact textless green <code>+</code> icon button compatible with IntelliJ Darcula and New UI Dark/Light themes.</li>

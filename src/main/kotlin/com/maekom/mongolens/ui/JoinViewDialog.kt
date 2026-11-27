@@ -155,8 +155,8 @@ class JoinViewDialog(
     private val schemaRequestSeq = AtomicLong(0L)
     private var suppressEditorEvents = false
 
-    // Top bar: [ ① <target1> (×) ] [ ② <target2> (×) ] ... (horizontal scroll)  [+]
-    private val targetTabsPanel = JPanel(FlowLayout(FlowLayout.LEFT, 5, 2)).apply {
+    // Top bar: [ ① <target1> (×) ] [ ② <target2> (×) ] [+]  (inline FlowLayout inside horizontal scroll pane)
+    private val targetTabsPanel = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4)).apply {
         isOpaque = false
     }
     private val targetTabsScrollPane = JBScrollPane(
@@ -168,8 +168,8 @@ class JoinViewDialog(
         viewportBorder = JBUI.Borders.empty()
         isOpaque = false
         viewport.isOpaque = false
-        preferredSize = Dimension(JBUI.scale(680), JBUI.scale(34))
-        minimumSize = Dimension(JBUI.scale(260), JBUI.scale(34))
+        preferredSize = Dimension(JBUI.scale(720), JBUI.scale(38))
+        minimumSize = Dimension(JBUI.scale(260), JBUI.scale(38))
     }
 
     private val addJoinBtn = object : JButton() {
@@ -367,6 +367,38 @@ class JoinViewDialog(
         private var rowSuppressEvents = false
         private var currentSourceOptions: List<SourceKeyOption> = emptyList()
 
+        private val sourceSearchHelper = SearchableFieldComboBox(
+            comboBox = sourceKeyCombo,
+            model = sourceModel,
+            primaryKey = { item -> (item as? SourceKeyOption)?.fieldName ?: item.toString() },
+            displayLabel = { item -> item.toString() },
+            onTextOrSelectionChanged = {
+                if (!suppressEditorEvents && !rowSuppressEvents) {
+                    val draft = activeDraft()
+                    val (_, localField) = currentSourceRefAndField()
+                    if (draft.joinKeyFields.isNotEmpty() && !draft.preserveExistingSelectionOnFirstLoad) {
+                        val autoForeign = suggestForeignFieldForLocal(localField, draft)
+                        if (autoForeign != null && currentForeignField().isEmpty()) {
+                            setForeignText(autoForeign)
+                        }
+                    }
+                    syncActiveRowsToDraftAndWarnings()
+                }
+            }
+        )
+
+        private val foreignSearchHelper = SearchableFieldComboBox(
+            comboBox = foreignFieldCombo,
+            model = foreignModel,
+            primaryKey = { it },
+            displayLabel = { it },
+            onTextOrSelectionChanged = {
+                if (!suppressEditorEvents && !rowSuppressEvents) {
+                    syncActiveRowsToDraftAndWarnings()
+                }
+            }
+        )
+
         init {
             maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(32))
             alignmentX = JComponent.LEFT_ALIGNMENT
@@ -384,45 +416,6 @@ class JoinViewDialog(
 
             refreshSourceOptions(activeTargetIdx, initialPair.sourceRef, initialPair.localField)
             refreshForeignOptions(activeDraft(), initialPair.foreignField)
-
-            sourceKeyCombo.addActionListener {
-                if (suppressEditorEvents || rowSuppressEvents) return@addActionListener
-                val draft = activeDraft()
-                val (_, localField) = currentSourceRefAndField()
-                if (draft.joinKeyFields.isNotEmpty() && !draft.preserveExistingSelectionOnFirstLoad) {
-                    val autoForeign = suggestForeignFieldForLocal(localField, draft)
-                    if (autoForeign != null && currentForeignField().isEmpty()) {
-                        setForeignText(autoForeign)
-                    }
-                }
-                syncActiveRowsToDraftAndWarnings()
-            }
-
-            (sourceKeyCombo.editor?.editorComponent as? JTextComponent)?.document?.addDocumentListener(
-                object : DocumentAdapter() {
-                    override fun textChanged(e: DocumentEvent) {
-                        if (!suppressEditorEvents && !rowSuppressEvents) {
-                            syncActiveRowsToDraftAndWarnings()
-                        }
-                    }
-                }
-            )
-
-            foreignFieldCombo.addActionListener {
-                if (!suppressEditorEvents && !rowSuppressEvents) {
-                    syncActiveRowsToDraftAndWarnings()
-                }
-            }
-
-            (foreignFieldCombo.editor?.editorComponent as? JTextComponent)?.document?.addDocumentListener(
-                object : DocumentAdapter() {
-                    override fun textChanged(e: DocumentEvent) {
-                        if (!suppressEditorEvents && !rowSuppressEvents) {
-                            syncActiveRowsToDraftAndWarnings()
-                        }
-                    }
-                }
-            )
 
             removeBtn.addActionListener {
                 removeJoinKeyRow(this)
@@ -448,25 +441,16 @@ class JoinViewDialog(
 
             rowSuppressEvents = true
             try {
-                sourceModel.removeAllElements()
-                options.forEach { sourceModel.addElement(it) }
-
                 val matched = options.firstOrNull {
                     it.sourceRef == curRef && it.fieldName == curField
                 } ?: options.firstOrNull {
                     it.sourceRef is JoinSourceRef.Base && it.fieldName == curField
                 }
-
-                if (matched != null) {
-                    sourceKeyCombo.selectedItem = matched
-                    sourceKeyCombo.editor?.item = matched
-                    (sourceKeyCombo.editor?.editorComponent as? JTextComponent)?.text = matched.toString()
-                } else {
-                    val fallbackText = curField
-                    sourceKeyCombo.selectedItem = fallbackText
-                    sourceKeyCombo.editor?.item = fallbackText
-                    (sourceKeyCombo.editor?.editorComponent as? JTextComponent)?.text = fallbackText
-                }
+                sourceSearchHelper.updateMasterItems(
+                    newItems = options,
+                    selectedItemOverride = matched ?: curField,
+                    preserveCurrentText = false
+                )
             } finally {
                 rowSuppressEvents = false
             }
@@ -482,9 +466,11 @@ class JoinViewDialog(
 
             rowSuppressEvents = true
             try {
-                foreignModel.removeAllElements()
-                pool.forEach { foreignModel.addElement(it) }
-                setForeignTextInternal(savedText)
+                foreignSearchHelper.updateMasterItems(
+                    newItems = pool,
+                    selectedItemOverride = savedText,
+                    preserveCurrentText = false
+                )
             } finally {
                 rowSuppressEvents = false
             }
@@ -493,16 +479,10 @@ class JoinViewDialog(
         fun setForeignText(text: String) {
             rowSuppressEvents = true
             try {
-                setForeignTextInternal(text)
+                foreignSearchHelper.setTextProgrammatically(text)
             } finally {
                 rowSuppressEvents = false
             }
-        }
-
-        private fun setForeignTextInternal(text: String) {
-            foreignFieldCombo.selectedItem = text
-            foreignFieldCombo.editor?.item = text
-            (foreignFieldCombo.editor?.editorComponent as? JTextComponent)?.text = text
         }
 
         fun currentSourceRefAndField(): Pair<JoinSourceRef, String> {
@@ -579,6 +559,12 @@ class JoinViewDialog(
             isEditable = true
             preferredSize = Dimension(JBUI.scale(155), JBUI.scale(26))
         }
+        private val fieldSearchHelper = SearchableFieldComboBox(
+            comboBox = fieldCombo,
+            model = fieldModel,
+            primaryKey = { it },
+            displayLabel = { it }
+        )
 
         val operatorCombo = ComboBox(JoinConditionOperator.values()).apply {
             selectedItem = initial?.operator ?: JoinConditionOperator.EQ
@@ -676,17 +662,16 @@ class JoinViewDialog(
                 }
             }.distinct()
 
-            fieldModel.removeAllElements()
-            mergedChoices.forEach { fieldModel.addElement(it) }
-
             val targetText = when {
                 !savedText.isNullOrBlank() -> savedText
                 mergedChoices.isNotEmpty() -> mergedChoices.first()
                 else -> ""
             }
-            fieldCombo.selectedItem = targetText
-            fieldCombo.editor?.item = targetText
-            (fieldCombo.editor?.editorComponent as? JTextComponent)?.text = targetText
+            fieldSearchHelper.updateMasterItems(
+                newItems = mergedChoices,
+                selectedItemOverride = targetText,
+                preserveCurrentText = false
+            )
         }
 
         fun toCondition(): JoinCondition = JoinCondition(
@@ -1183,6 +1168,8 @@ class JoinViewDialog(
                 )
             )
         }
+        // Place the green '+' icon button inline directly beside the last join target chip (6px gap)
+        targetTabsPanel.add(addJoinBtn)
         targetTabsPanel.revalidate()
         targetTabsPanel.repaint()
         targetTabsScrollPane.revalidate()
@@ -1603,14 +1590,9 @@ class JoinViewDialog(
     }
 
     override fun createCenterPanel(): JComponent {
-        // 1. Multi-Join Target Tab Bar (horizontally scrollable chips with conditional '×' + green '+' icon button)
-        val addBtnWrapper = JPanel(FlowLayout(FlowLayout.LEFT, 2, 4)).apply {
-            isOpaque = false
-            add(addJoinBtn)
-        }
+        // 1. Multi-Join Target Tab Bar (horizontally scrollable chips with conditional '×' + inline green '+' beside last chip)
         val tabBarRow = JPanel(BorderLayout(6, 0)).apply {
             add(targetTabsScrollPane, BorderLayout.CENTER)
-            add(addBtnWrapper, BorderLayout.EAST)
         }
         val topHeaderStack = JPanel(BorderLayout(0, 4)).apply {
             add(tabBarRow, BorderLayout.NORTH)
