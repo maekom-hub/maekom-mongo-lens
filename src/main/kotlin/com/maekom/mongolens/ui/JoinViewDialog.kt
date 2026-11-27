@@ -1,5 +1,6 @@
 package com.maekom.mongolens.ui
 
+import com.intellij.icons.AllIcons
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.project.Project
@@ -8,6 +9,7 @@ import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.ValidationInfo
 import com.intellij.ui.ComboboxSpeedSearch
 import com.intellij.ui.DocumentAdapter
+import com.intellij.ui.JBColor
 import com.intellij.ui.JBSplitter
 import com.intellij.ui.ScreenUtil
 import com.intellij.ui.SimpleListCellRenderer
@@ -23,6 +25,7 @@ import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.JoinCondition
 import com.maekom.mongolens.mongo.JoinConditionOperator
 import com.maekom.mongolens.mongo.JoinConditionTarget
+import com.maekom.mongolens.mongo.JoinKeyPair
 import com.maekom.mongolens.mongo.JoinMatchStrategy
 import com.maekom.mongolens.mongo.JoinSourceRef
 import com.maekom.mongolens.mongo.JoinSpec
@@ -84,9 +87,7 @@ class JoinViewDialog(
 
     private class MutableTargetDraft(
         var targetCollection: String,
-        var sourceRef: JoinSourceRef = JoinSourceRef.Base,
-        var localField: String = "_id",
-        var foreignField: String = "_id",
+        var keyPairs: MutableList<JoinKeyPair>,
         var matchStrategy: JoinMatchStrategy = JoinMatchStrategy.LATEST_ONE,
         var allColumns: MutableList<String> = mutableListOf(),
         var selectedColumns: LinkedHashSet<String> = linkedSetOf(),
@@ -118,7 +119,9 @@ class JoinViewDialog(
         initialLocalField?.takeIf { it.isNotBlank() }?.let { add(it.trim()) }
         existingJoinSpec?.let { spec ->
             spec.baseConditions.forEach { add(it.field) }
-            spec.targets.filter { it.sourceRef is JoinSourceRef.Base }.forEach { add(it.localField) }
+            spec.targets.forEach { t ->
+                t.effectiveKeyPairs().filter { it.sourceRef is JoinSourceRef.Base }.forEach { add(it.localField) }
+            }
         }
     }.map { it.trim() }.filter { it.isNotEmpty() }.distinct().ifEmpty { listOf("_id") }
 
@@ -135,7 +138,7 @@ class JoinViewDialog(
         val ranked = ReferenceJumpHelper.rankCollections(
             database = database,
             currentCollection = sourceCollection,
-            fieldPath = existingJoinSpec?.targets?.firstOrNull()?.localField ?: initialLocalField,
+            fieldPath = existingJoinSpec?.targets?.firstOrNull()?.effectiveKeyPairs()?.firstOrNull()?.localField ?: initialLocalField,
             allCollections = basePool
         ).map { it.name }
         ranked.filter { it != sourceCollection } + ranked.filter { it == sourceCollection }
@@ -154,10 +157,10 @@ class JoinViewDialog(
 
     // Top bar: [ ① <target1> ] [ ② <target2> ] ... [+ 조인 추가]  |  [이 조인 삭제]
     private val targetTabsPanel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
-    private val addJoinBtn = JButton(I18n.t("join.dialog.addJoinTarget")).apply {
+    private val addJoinBtn = JButton(I18n.t("join.dialog.addJoinTarget"), AllIcons.General.Add).apply {
         margin = JBUI.insets(2, 8)
     }
-    private val removeJoinBtn = JButton(I18n.t("join.dialog.removeJoinTarget")).apply {
+    private val removeJoinBtn = JButton(I18n.t("join.dialog.removeJoinTarget"), AllIcons.General.Remove).apply {
         margin = JBUI.insets(2, 8)
     }
     private val multiUnwindWarningLabel = UiHelpers.createBadgeLabel(
@@ -170,14 +173,43 @@ class JoinViewDialog(
 
     // Active target controls
     private val targetCollectionCombo = ComboBox(candidateCollections.toTypedArray())
-    private val sourceKeyModel = DefaultComboBoxModel<SourceKeyOption>()
-    private val sourceKeyCombo = ComboBox(sourceKeyModel)
-    private val foreignFieldModel = DefaultComboBoxModel<String>()
-    private val foreignFieldCombo = ComboBox(foreignFieldModel).apply {
-        isEditable = true
+
+    // Dynamic Composite Join Key Mapping Rows (1..N AND key pairs)
+    private val addJoinKeyBtn = JButton(I18n.t("join.dialog.addKeyPair"), AllIcons.General.Add).apply {
+        margin = JBUI.insets(1, 8)
     }
+    private val autoMatchCommonKeysBtn = JButton(I18n.t("join.dialog.autoMatchCommonKeys"), AllIcons.Actions.Refresh).apply {
+        margin = JBUI.insets(1, 8)
+        toolTipText = I18n.t("join.dialog.autoMatchCommonKeysTooltip")
+    }
+    private val joinKeysListPanel = JPanel().apply {
+        layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        border = JBUI.Borders.empty(2, 4)
+    }
+    private val joinKeysScrollPane = JBScrollPane(joinKeysListPanel).apply {
+        preferredSize = Dimension(JBUI.scale(720), JBUI.scale(48))
+        minimumSize = Dimension(JBUI.scale(400), JBUI.scale(40))
+    }
+    private val joinKeyRows = mutableListOf<JoinKeyMappingRow>()
+
     private val statusOrMismatchLabel = JBLabel(" ").apply {
         font = font.deriveFont(Font.BOLD)
+    }
+
+    // Composite Join ($expr) BSON type & performance guidance banner (visible when >= 2 join keys)
+    private val compositeKeyInfoLabel = JBLabel(
+        "<html>${I18n.t("join.dialog.compositeInfoBanner")}</html>",
+        AllIcons.General.BalloonInformation,
+        JBLabel.LEFT
+    ).apply {
+        isOpaque = true
+        background = UiHelpers.COLOR_BLUE_BG
+        foreground = UiHelpers.COLOR_BLUE_FG
+        border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(JBColor.border(), 1, true),
+            JBUI.Borders.empty(4, 8)
+        )
+        isVisible = false
     }
 
     private val latestOneRadio = JBRadioButton(I18n.t("join.dialog.strategyLatestOne"), true)
@@ -195,7 +227,7 @@ class JoinViewDialog(
     }
 
     // WHERE AND conditions builder
-    private val addConditionBtn = JButton(I18n.t("join.dialog.addCondition")).apply {
+    private val addConditionBtn = JButton(I18n.t("join.dialog.addCondition"), AllIcons.General.Add).apply {
         margin = JBUI.insets(1, 6)
     }
     private val conditionsListPanel = JPanel().apply {
@@ -203,8 +235,8 @@ class JoinViewDialog(
         border = JBUI.Borders.empty(2, 4)
     }
     private val conditionsScrollPane = JBScrollPane(conditionsListPanel).apply {
-        preferredSize = Dimension(JBUI.scale(720), JBUI.scale(68))
-        minimumSize = Dimension(JBUI.scale(400), JBUI.scale(52))
+        preferredSize = Dimension(JBUI.scale(720), JBUI.scale(62))
+        minimumSize = Dimension(JBUI.scale(400), JBUI.scale(48))
     }
     private val conditionRows = mutableListOf<ConditionRow>()
 
@@ -219,11 +251,228 @@ class JoinViewDialog(
         ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED
     ).apply {
         border = JBUI.Borders.empty()
-        preferredSize = Dimension(JBUI.scale(760), JBUI.scale(215))
-        minimumSize = Dimension(JBUI.scale(400), JBUI.scale(150))
+        preferredSize = Dimension(JBUI.scale(760), JBUI.scale(200))
+        minimumSize = Dimension(JBUI.scale(400), JBUI.scale(140))
     }
 
     private val rootContainerPanel = JPanel(BorderLayout(0, 6))
+
+    /**
+     * Dynamic single join-key mapping row:
+     *   [Source Key (Editable ComboBox)]  =  [Target Field (Editable ComboBox)]  [Remove]
+     */
+    private inner class JoinKeyMappingRow(initialPair: JoinKeyPair) : JPanel(GridBagLayout()) {
+        private val sourceModel = DefaultComboBoxModel<Any>()
+        val sourceKeyCombo = ComboBox<Any>(sourceModel).apply {
+            isEditable = true
+            preferredSize = Dimension(JBUI.scale(280), JBUI.scale(26))
+        }
+
+        private val equalsLabel = JBLabel("=").apply {
+            font = font.deriveFont(Font.BOLD)
+            horizontalAlignment = JBLabel.CENTER
+            preferredSize = Dimension(JBUI.scale(20), JBUI.scale(26))
+        }
+
+        private val foreignModel = DefaultComboBoxModel<String>()
+        val foreignFieldCombo = ComboBox<String>(foreignModel).apply {
+            isEditable = true
+            preferredSize = Dimension(JBUI.scale(280), JBUI.scale(26))
+        }
+
+        val removeBtn = JButton(AllIcons.General.Remove).apply {
+            margin = JBUI.insets(1, 5)
+            toolTipText = I18n.t("join.dialog.removeKeyPairTooltip")
+            preferredSize = Dimension(JBUI.scale(28), JBUI.scale(26))
+        }
+
+        private var rowSuppressEvents = false
+        private var currentSourceOptions: List<SourceKeyOption> = emptyList()
+
+        init {
+            maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(32))
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            border = JBUI.Borders.empty(2, 0)
+
+            val gbc = GridBagConstraints().apply {
+                gridy = 0
+                insets = JBUI.insets(0, 2)
+                fill = GridBagConstraints.HORIZONTAL
+            }
+            gbc.gridx = 0; gbc.weightx = 0.5; add(sourceKeyCombo, gbc)
+            gbc.gridx = 1; gbc.weightx = 0.0; gbc.fill = GridBagConstraints.NONE; add(equalsLabel, gbc)
+            gbc.gridx = 2; gbc.weightx = 0.5; gbc.fill = GridBagConstraints.HORIZONTAL; add(foreignFieldCombo, gbc)
+            gbc.gridx = 3; gbc.weightx = 0.0; gbc.fill = GridBagConstraints.NONE; add(removeBtn, gbc)
+
+            refreshSourceOptions(activeTargetIdx, initialPair.sourceRef, initialPair.localField)
+            refreshForeignOptions(activeDraft(), initialPair.foreignField)
+
+            sourceKeyCombo.addActionListener {
+                if (suppressEditorEvents || rowSuppressEvents) return@addActionListener
+                val draft = activeDraft()
+                val (_, localField) = currentSourceRefAndField()
+                if (draft.joinKeyFields.isNotEmpty() && !draft.preserveExistingSelectionOnFirstLoad) {
+                    val autoForeign = suggestForeignFieldForLocal(localField, draft)
+                    if (autoForeign != null && currentForeignField().isEmpty()) {
+                        setForeignText(autoForeign)
+                    }
+                }
+                syncActiveRowsToDraftAndWarnings()
+            }
+
+            (sourceKeyCombo.editor?.editorComponent as? JTextComponent)?.document?.addDocumentListener(
+                object : DocumentAdapter() {
+                    override fun textChanged(e: DocumentEvent) {
+                        if (!suppressEditorEvents && !rowSuppressEvents) {
+                            syncActiveRowsToDraftAndWarnings()
+                        }
+                    }
+                }
+            )
+
+            foreignFieldCombo.addActionListener {
+                if (!suppressEditorEvents && !rowSuppressEvents) {
+                    syncActiveRowsToDraftAndWarnings()
+                }
+            }
+
+            (foreignFieldCombo.editor?.editorComponent as? JTextComponent)?.document?.addDocumentListener(
+                object : DocumentAdapter() {
+                    override fun textChanged(e: DocumentEvent) {
+                        if (!suppressEditorEvents && !rowSuppressEvents) {
+                            syncActiveRowsToDraftAndWarnings()
+                        }
+                    }
+                }
+            )
+
+            removeBtn.addActionListener {
+                removeJoinKeyRow(this)
+            }
+        }
+
+        fun setControlsEnabled(enabled: Boolean) {
+            foreignFieldCombo.isEnabled = enabled
+        }
+
+        fun setRemovable(removable: Boolean) {
+            removeBtn.isEnabled = removable
+        }
+
+        fun refreshSourceOptions(targetIdx: Int, preserveRef: JoinSourceRef? = null, preserveField: String? = null) {
+            val (curRef, curField) = if (preserveRef != null && preserveField != null) {
+                preserveRef to preserveField
+            } else {
+                currentSourceRefAndField()
+            }
+            val options = buildSourceKeyOptions(targetIdx)
+            currentSourceOptions = options
+
+            rowSuppressEvents = true
+            try {
+                sourceModel.removeAllElements()
+                options.forEach { sourceModel.addElement(it) }
+
+                val matched = options.firstOrNull {
+                    it.sourceRef == curRef && it.fieldName == curField
+                } ?: options.firstOrNull {
+                    it.sourceRef is JoinSourceRef.Base && it.fieldName == curField
+                }
+
+                if (matched != null) {
+                    sourceKeyCombo.selectedItem = matched
+                    sourceKeyCombo.editor?.item = matched
+                    (sourceKeyCombo.editor?.editorComponent as? JTextComponent)?.text = matched.toString()
+                } else {
+                    val fallbackText = curField
+                    sourceKeyCombo.selectedItem = fallbackText
+                    sourceKeyCombo.editor?.item = fallbackText
+                    (sourceKeyCombo.editor?.editorComponent as? JTextComponent)?.text = fallbackText
+                }
+            } finally {
+                rowSuppressEvents = false
+            }
+        }
+
+        fun refreshForeignOptions(draft: MutableTargetDraft, explicitForeign: String? = null) {
+            val savedText = explicitForeign ?: currentForeignField()
+            val pool = buildList {
+                addAll(draft.joinKeyFields)
+                addAll(draft.allColumns)
+                if (savedText.isNotBlank()) add(savedText)
+            }.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+
+            rowSuppressEvents = true
+            try {
+                foreignModel.removeAllElements()
+                pool.forEach { foreignModel.addElement(it) }
+                setForeignTextInternal(savedText)
+            } finally {
+                rowSuppressEvents = false
+            }
+        }
+
+        fun setForeignText(text: String) {
+            rowSuppressEvents = true
+            try {
+                setForeignTextInternal(text)
+            } finally {
+                rowSuppressEvents = false
+            }
+        }
+
+        private fun setForeignTextInternal(text: String) {
+            foreignFieldCombo.selectedItem = text
+            foreignFieldCombo.editor?.item = text
+            (foreignFieldCombo.editor?.editorComponent as? JTextComponent)?.text = text
+        }
+
+        fun currentSourceRefAndField(): Pair<JoinSourceRef, String> {
+            val editorText = (sourceKeyCombo.editor?.editorComponent as? JTextComponent)?.text?.trim()
+            val selected = sourceKeyCombo.selectedItem
+            if (selected is SourceKeyOption && (editorText == null || editorText == selected.toString())) {
+                return selected.sourceRef to selected.fieldName
+            }
+            val raw = editorText ?: selected?.toString()?.trim().orEmpty()
+            if (raw.isEmpty()) return JoinSourceRef.Base to ""
+
+            // Exact match against any dropdown option display label
+            currentSourceOptions.firstOrNull { it.toString() == raw }?.let {
+                return it.sourceRef to it.fieldName
+            }
+            // Strip optional `Base(coll).` prefix if user manually edited the field suffix
+            val basePrefix = "${I18n.t("join.dialog.sourceBasePrefix", sourceCollection)}."
+            if (raw.startsWith(basePrefix)) {
+                return JoinSourceRef.Base to raw.removePrefix(basePrefix).trim()
+            }
+            // Strip optional `JoinN(coll).` prefix if user edited a previous target's field suffix
+            for (prevIdx in 0 until activeTargetIdx) {
+                val prevColl = targetDrafts.getOrNull(prevIdx)?.targetCollection ?: continue
+                val prevPrefix = "${I18n.t("join.dialog.sourcePrevPrefix", prevIdx + 1, prevColl)}."
+                if (raw.startsWith(prevPrefix)) {
+                    return JoinSourceRef.PreviousTarget(prevIdx) to raw.removePrefix(prevPrefix).trim()
+                }
+            }
+            return JoinSourceRef.Base to raw
+        }
+
+        fun currentForeignField(): String {
+            val editorComp = foreignFieldCombo.editor?.editorComponent as? JTextComponent
+            if (editorComp != null) {
+                return (editorComp.text as String?)?.trim().orEmpty()
+            }
+            return (foreignFieldCombo.editor?.item?.toString() ?: foreignFieldCombo.selectedItem?.toString())?.trim().orEmpty()
+        }
+
+        fun toKeyPair(): JoinKeyPair {
+            val (ref, local) = currentSourceRefAndField()
+            return JoinKeyPair(
+                sourceRef = ref,
+                localField = local,
+                foreignField = currentForeignField()
+            )
+        }
+    }
 
     private inner class ConditionRow(initial: JoinCondition? = null) : JPanel(GridBagLayout()) {
         val targetCombo = ComboBox(arrayOf(JoinConditionTarget.LEFT, JoinConditionTarget.RIGHT)).apply {
@@ -387,7 +636,9 @@ class JoinViewDialog(
         // Initialize drafts from existingJoinSpec (edit mode) or 1 fresh default target
         if (existingJoinSpec != null && existingJoinSpec.targets.isNotEmpty()) {
             existingJoinSpec.targets.forEach { t ->
-                val mergedCols = (t.allColumns + t.selectedColumns + t.foreignField + t.conditions.map { it.field })
+                val pairs = t.effectiveKeyPairs().toMutableList()
+                val foreignKeys = pairs.map { it.foreignField }
+                val mergedCols = (t.allColumns + t.selectedColumns)
                     .map { it.trim() }
                     .filter { it.isNotEmpty() }
                     .distinct()
@@ -395,13 +646,11 @@ class JoinViewDialog(
                 targetDrafts.add(
                     MutableTargetDraft(
                         targetCollection = t.targetCollection,
-                        sourceRef = t.sourceRef,
-                        localField = t.localField,
-                        foreignField = t.foreignField,
+                        keyPairs = pairs,
                         matchStrategy = t.matchStrategy,
                         allColumns = mergedCols,
                         selectedColumns = LinkedHashSet(t.selectedColumns),
-                        joinKeyFields = (mergedCols + t.foreignField + t.conditions.map { it.field })
+                        joinKeyFields = (mergedCols + foreignKeys + t.conditions.map { it.field })
                             .map { it.trim() }.filter { it.isNotEmpty() }.distinct().toMutableList(),
                         conditions = t.conditions.toMutableList(),
                         excludeUnmatched = t.excludeUnmatched,
@@ -421,9 +670,7 @@ class JoinViewDialog(
             targetDrafts.add(
                 MutableTargetDraft(
                     targetCollection = defaultTarget,
-                    sourceRef = JoinSourceRef.Base,
-                    localField = defaultLocal,
-                    foreignField = defaultLocal,
+                    keyPairs = mutableListOf(JoinKeyPair(JoinSourceRef.Base, defaultLocal, defaultLocal)),
                     matchStrategy = JoinMatchStrategy.LATEST_ONE,
                     excludeUnmatched = true
                 )
@@ -435,6 +682,7 @@ class JoinViewDialog(
         loadActiveDraftIntoEditor(triggerSchemaFetch = false)
         rebuildAllColumnCheckboxPanels()
         updateMultiUnwindWarning()
+        updateCompositeInfoBanner()
 
         init()
 
@@ -442,7 +690,6 @@ class JoinViewDialog(
         SwingUtilities.invokeLater {
             if (!isDisposed) {
                 loadSchemaForDraftAsync(activeTargetIdx, forceFetch = true)
-                // Also warm remaining targets in edit mode so their column panels have type tags
                 for (i in targetDrafts.indices) {
                     if (i != activeTargetIdx) {
                         loadSchemaForDraftAsync(i, forceFetch = false)
@@ -462,12 +709,23 @@ class JoinViewDialog(
     private fun currentTargetCollectionName(): String =
         targetCollectionCombo.selectedItem?.toString()?.trim().orEmpty()
 
-    private fun currentForeignFieldText(): String {
-        val editorComp = foreignFieldCombo.editor?.editorComponent as? JTextComponent
-        if (editorComp != null) {
-            return (editorComp.text as String?)?.trim().orEmpty()
+    private fun buildSourceKeyOptions(targetIdx: Int): List<SourceKeyOption> {
+        val options = mutableListOf<SourceKeyOption>()
+        for (lf in leftJoinKeyFields) {
+            options.add(SourceKeyOption(JoinSourceRef.Base, sourceCollection, lf))
         }
-        return (foreignFieldCombo.editor?.item?.toString() ?: foreignFieldCombo.selectedItem?.toString())?.trim().orEmpty()
+        for (prevIdx in 0 until targetIdx) {
+            val prev = targetDrafts[prevIdx]
+            val prevFields = (prev.joinKeyFields + prev.allColumns + prev.selectedColumns + prev.keyPairs.map { it.foreignField })
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct()
+                .ifEmpty { listOf("_id") }
+            for (pf in prevFields) {
+                options.add(SourceKeyOption(JoinSourceRef.PreviousTarget(prevIdx), prev.targetCollection, pf))
+            }
+        }
+        return options
     }
 
     private fun wireListeners() {
@@ -477,14 +735,12 @@ class JoinViewDialog(
             val nextColl = candidateCollections.firstOrNull { it != sourceCollection && it !in usedColls }
                 ?: candidateCollections.firstOrNull { it != sourceCollection }
                 ?: sourceCollection
-            val defaultLocal = leftFields.firstOrNull { it != "_id" && (it.endsWith("Id") || it.endsWith("_id")) }
-                ?: leftFields.first()
+            val defaultLocal = leftJoinKeyFields.firstOrNull { it != "_id" && (it.endsWith("Id") || it.endsWith("_id")) }
+                ?: leftJoinKeyFields.first()
             targetDrafts.add(
                 MutableTargetDraft(
                     targetCollection = nextColl,
-                    sourceRef = JoinSourceRef.Base,
-                    localField = defaultLocal,
-                    foreignField = defaultLocal,
+                    keyPairs = mutableListOf(JoinKeyPair(JoinSourceRef.Base, defaultLocal, defaultLocal)),
                     matchStrategy = JoinMatchStrategy.LATEST_ONE,
                     excludeUnmatched = true
                 )
@@ -494,6 +750,7 @@ class JoinViewDialog(
             loadActiveDraftIntoEditor(triggerSchemaFetch = true)
             rebuildAllColumnCheckboxPanels()
             updateMultiUnwindWarning()
+            updateCompositeInfoBanner()
             adjustDialogSizeDynamically(initialOpen = false)
         }
 
@@ -506,16 +763,23 @@ class JoinViewDialog(
             // Re-index any subsequent target referencing an earlier join target
             for (i in removedIdx until targetDrafts.size) {
                 val d = targetDrafts[i]
-                val ref = d.sourceRef
-                if (ref is JoinSourceRef.PreviousTarget) {
-                    if (ref.targetIndex == removedIdx) {
-                        // Fallback safely to Base collection's first field
-                        d.sourceRef = JoinSourceRef.Base
-                        d.localField = leftFields.firstOrNull() ?: "_id"
-                    } else if (ref.targetIndex > removedIdx) {
-                        d.sourceRef = JoinSourceRef.PreviousTarget(ref.targetIndex - 1)
+                d.keyPairs = d.keyPairs.map { pair ->
+                    val ref = pair.sourceRef
+                    if (ref is JoinSourceRef.PreviousTarget) {
+                        when {
+                            ref.targetIndex == removedIdx -> pair.copy(
+                                sourceRef = JoinSourceRef.Base,
+                                localField = leftFields.firstOrNull() ?: "_id"
+                            )
+                            ref.targetIndex > removedIdx -> pair.copy(
+                                sourceRef = JoinSourceRef.PreviousTarget(ref.targetIndex - 1)
+                            )
+                            else -> pair
+                        }
+                    } else {
+                        pair
                     }
-                }
+                }.toMutableList()
             }
 
             activeTargetIdx = (removedIdx - 1).coerceAtLeast(0)
@@ -523,6 +787,7 @@ class JoinViewDialog(
             loadActiveDraftIntoEditor(triggerSchemaFetch = false)
             rebuildAllColumnCheckboxPanels()
             updateMultiUnwindWarning()
+            updateCompositeInfoBanner()
             adjustDialogSizeDynamically(initialOpen = false)
         }
 
@@ -538,46 +803,34 @@ class JoinViewDialog(
                 draft.allColumns.clear()
                 draft.selectedColumns.clear()
                 draft.fieldCategories.clear()
+                draft.joinKeyFields.clear()
+                draft.joinFieldCategories.clear()
                 rebuildTargetTabsBar()
                 conditionRows.forEach { it.refreshTargetDisplay() }
                 loadSchemaForDraftAsync(activeTargetIdx, forceFetch = true)
             }
         }
 
-        sourceKeyCombo.addActionListener {
-            if (suppressEditorEvents) return@addActionListener
-            val selectedOpt = sourceKeyCombo.selectedItem as? SourceKeyOption ?: return@addActionListener
+        addJoinKeyBtn.addActionListener {
             val draft = activeDraft()
-            draft.sourceRef = selectedOpt.sourceRef
-            draft.localField = selectedOpt.fieldName
-            if (draft.allColumns.isNotEmpty() && !draft.preserveExistingSelectionOnFirstLoad) {
-                suppressEditorEvents = true
-                try {
-                    autoMatchForeignField(draft)
-                } finally {
-                    suppressEditorEvents = false
-                }
+            val usedLocals = joinKeyRows.map { it.toKeyPair().localField }.toSet()
+            val nextLocal = leftJoinKeyFields.firstOrNull { it != "_id" && it !in usedLocals }
+                ?: leftJoinKeyFields.firstOrNull { it !in usedLocals }
+                ?: ""
+            val suggestedForeign = if (nextLocal.isNotEmpty()) {
+                suggestForeignFieldForLocal(nextLocal, draft) ?: ""
+            } else {
+                ""
             }
-            updateTypeMismatchWarning()
+            addJoinKeyRowInternal(JoinKeyPair(JoinSourceRef.Base, nextLocal, suggestedForeign))
+            refreshJoinKeyRowsState()
+            syncActiveRowsToDraftAndWarnings()
+            adjustDialogSizeDynamically(initialOpen = false)
         }
 
-        foreignFieldCombo.addActionListener {
-            if (!suppressEditorEvents) {
-                activeDraft().foreignField = currentForeignFieldText()
-                updateTypeMismatchWarning()
-            }
+        autoMatchCommonKeysBtn.addActionListener {
+            handleAutoMatchCommonKeys()
         }
-
-        (foreignFieldCombo.editor?.editorComponent as? JTextComponent)?.document?.addDocumentListener(
-            object : DocumentAdapter() {
-                override fun textChanged(e: DocumentEvent) {
-                    if (!suppressEditorEvents) {
-                        activeDraft().foreignField = currentForeignFieldText()
-                        updateTypeMismatchWarning()
-                    }
-                }
-            }
-        )
 
         latestOneRadio.addActionListener {
             if (!suppressEditorEvents) {
@@ -603,6 +856,90 @@ class JoinViewDialog(
         }
     }
 
+    /**
+     * Finds fields with identical names (excluding `_id`) between source and target schemas,
+     * preserving ALL existing user rows and ONLY appending pairs not already mapped.
+     */
+    private fun handleAutoMatchCommonKeys() {
+        val draft = activeDraft()
+        val targetPool = (draft.joinKeyFields + draft.allColumns).map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (targetPool.isEmpty()) {
+            statusOrMismatchLabel.text = I18n.t("join.dialog.autoMatchNone")
+            statusOrMismatchLabel.foreground = UiHelpers.COLOR_BLUE_FG
+            return
+        }
+        val targetSet = targetPool.toSet()
+
+        // Existing mapped pairs (preserved untouched!)
+        val existingPairs = joinKeyRows.map { row ->
+            val p = row.toKeyPair()
+            p.localField to p.foreignField
+        }.toSet()
+
+        val commonFields = leftJoinKeyFields
+            .filter { it != "_id" && it in targetSet && (it to it) !in existingPairs }
+            .distinct()
+
+        if (commonFields.isEmpty()) {
+            statusOrMismatchLabel.text = I18n.t("join.dialog.autoMatchNone")
+            statusOrMismatchLabel.foreground = UiHelpers.COLOR_BLUE_FG
+            return
+        }
+
+        for (field in commonFields) {
+            addJoinKeyRowInternal(JoinKeyPair(JoinSourceRef.Base, field, field))
+        }
+        refreshJoinKeyRowsState()
+        syncActiveRowsToDraftAndWarnings()
+        statusOrMismatchLabel.text = I18n.t("join.dialog.autoMatchAdded", commonFields.size)
+        statusOrMismatchLabel.foreground = UiHelpers.COLOR_GREEN_FG
+        adjustDialogSizeDynamically(initialOpen = false)
+    }
+
+    private fun addJoinKeyRowInternal(pair: JoinKeyPair) {
+        val row = JoinKeyMappingRow(pair)
+        joinKeyRows.add(row)
+        joinKeysListPanel.add(row)
+    }
+
+    private fun removeJoinKeyRow(row: JoinKeyMappingRow) {
+        if (joinKeyRows.size <= 1 || joinKeyRows.indexOf(row) == 0) return
+        joinKeyRows.remove(row)
+        joinKeysListPanel.remove(row)
+        refreshJoinKeyRowsState()
+        syncActiveRowsToDraftAndWarnings()
+        adjustDialogSizeDynamically(initialOpen = false)
+    }
+
+    private fun refreshJoinKeyRowsState() {
+        joinKeyRows.forEachIndexed { idx, row ->
+            row.setRemovable(idx > 0 && joinKeyRows.size > 1)
+        }
+        joinKeysListPanel.revalidate()
+        joinKeysListPanel.repaint()
+
+        val rowHeightPx = JBUI.scale(34)
+        val minH = JBUI.scale(42)
+        val maxH = JBUI.scale(136) // Scroll cleanly once 4+ rows are added
+        val desiredH = (joinKeyRows.size.coerceAtLeast(1) * rowHeightPx + JBUI.scale(8)).coerceIn(minH, maxH)
+        joinKeysScrollPane.preferredSize = Dimension(joinKeysScrollPane.preferredSize.width.coerceAtLeast(JBUI.scale(680)), desiredH)
+        joinKeysScrollPane.revalidate()
+        joinKeysScrollPane.repaint()
+        updateCompositeInfoBanner()
+    }
+
+    private fun syncActiveRowsToDraftAndWarnings() {
+        val draft = activeDraft()
+        draft.keyPairs = joinKeyRows.map { it.toKeyPair() }.toMutableList()
+        updateCompositeInfoBanner()
+        updateTypeMismatchWarning()
+    }
+
+    private fun updateCompositeInfoBanner() {
+        val hasComposite = joinKeyRows.size >= 2 || targetDrafts.any { it.keyPairs.size >= 2 }
+        compositeKeyInfoLabel.isVisible = hasComposite
+    }
+
     private fun flushActiveTargetToDraft() {
         if (activeTargetIdx !in targetDrafts.indices) return
         val draft = activeDraft()
@@ -610,15 +947,10 @@ class JoinViewDialog(
         if (chosenTarget.isNotEmpty()) {
             draft.targetCollection = chosenTarget
         }
-        (sourceKeyCombo.selectedItem as? SourceKeyOption)?.let { opt ->
-            draft.sourceRef = opt.sourceRef
-            draft.localField = opt.fieldName
-        }
-        draft.foreignField = currentForeignFieldText()
+        draft.keyPairs = joinKeyRows.map { it.toKeyPair() }.toMutableList()
         draft.matchStrategy = if (latestOneRadio.isSelected) JoinMatchStrategy.LATEST_ONE else JoinMatchStrategy.UNWIND_ALL
         draft.excludeUnmatched = excludeUnmatchedCheckBox.isSelected
 
-        // Split active condition rows back into baseConditionDrafts (LEFT) & draft.conditions (RIGHT)
         baseConditionDrafts.clear()
         draft.conditions.clear()
         for (row in conditionRows) {
@@ -666,14 +998,15 @@ class JoinViewDialog(
         suppressEditorEvents = true
         try {
             targetCollectionCombo.selectedItem = draft.targetCollection
-            rebuildSourceKeyCombo(activeTargetIdx, draft)
 
-            foreignFieldModel.removeAllElements()
-            val foreignPool = (draft.joinKeyFields + draft.allColumns + draft.foreignField).filter { it.isNotBlank() }.distinct()
-            foreignPool.forEach { foreignFieldModel.addElement(it) }
-            foreignFieldCombo.selectedItem = draft.foreignField
-            foreignFieldCombo.editor?.item = draft.foreignField
-            (foreignFieldCombo.editor?.editorComponent as? JTextComponent)?.text = draft.foreignField
+            // Rebuild dynamic join key rows from draft.keyPairs
+            joinKeyRows.clear()
+            joinKeysListPanel.removeAll()
+            val pairsToShow = draft.keyPairs.ifEmpty {
+                mutableListOf(JoinKeyPair(JoinSourceRef.Base, leftJoinKeyFields.first(), leftJoinKeyFields.first()))
+            }
+            pairsToShow.forEach { addJoinKeyRowInternal(it) }
+            refreshJoinKeyRowsState()
 
             latestOneRadio.isSelected = draft.matchStrategy == JoinMatchStrategy.LATEST_ONE
             unwindAllRadio.isSelected = draft.matchStrategy == JoinMatchStrategy.UNWIND_ALL
@@ -693,39 +1026,6 @@ class JoinViewDialog(
             loadSchemaForDraftAsync(activeTargetIdx, forceFetch = true)
         } else {
             updateTypeMismatchWarning()
-        }
-    }
-
-    private fun rebuildSourceKeyCombo(targetIdx: Int, draft: MutableTargetDraft) {
-        sourceKeyModel.removeAllElements()
-        val options = mutableListOf<SourceKeyOption>()
-        for (lf in leftJoinKeyFields) {
-            options.add(SourceKeyOption(JoinSourceRef.Base, sourceCollection, lf))
-        }
-        // Chain Join support: allow linking from ANY previous join target (0 until targetIdx)
-        for (prevIdx in 0 until targetIdx) {
-            val prev = targetDrafts[prevIdx]
-            val prevFields = (prev.joinKeyFields + prev.allColumns + prev.selectedColumns + prev.foreignField)
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .distinct()
-                .ifEmpty { listOf("_id") }
-            for (pf in prevFields) {
-                options.add(SourceKeyOption(JoinSourceRef.PreviousTarget(prevIdx), prev.targetCollection, pf))
-            }
-        }
-        options.forEach { sourceKeyModel.addElement(it) }
-
-        val matched = options.firstOrNull {
-            it.sourceRef == draft.sourceRef && it.fieldName == draft.localField
-        } ?: options.firstOrNull {
-            it.sourceRef is JoinSourceRef.Base && it.fieldName == draft.localField
-        } ?: options.firstOrNull()
-
-        if (matched != null) {
-            sourceKeyCombo.selectedItem = matched
-            draft.sourceRef = matched.sourceRef
-            draft.localField = matched.fieldName
         }
     }
 
@@ -753,9 +1053,9 @@ class JoinViewDialog(
 
     private fun refreshConditionsViewportHeight() {
         val rowHeightPx = JBUI.scale(34)
-        val minH = JBUI.scale(56)
-        val maxH = JBUI.scale(170)
-        val desiredH = (conditionRows.size.coerceAtLeast(1) * rowHeightPx + JBUI.scale(12)).coerceIn(minH, maxH)
+        val minH = JBUI.scale(52)
+        val maxH = JBUI.scale(150)
+        val desiredH = (conditionRows.size.coerceAtLeast(1) * rowHeightPx + JBUI.scale(10)).coerceIn(minH, maxH)
         conditionsScrollPane.preferredSize = Dimension(conditionsScrollPane.preferredSize.width.coerceAtLeast(JBUI.scale(680)), desiredH)
         conditionsScrollPane.revalidate()
         conditionsScrollPane.repaint()
@@ -769,7 +1069,6 @@ class JoinViewDialog(
 
         val isActive = draftIndex == activeTargetIdx
 
-        // Fast path: cached schema already available
         val cached = schemaCache[targetColl]
         if (cached != null && !forceFetch) {
             applySampledSchemaToDraft(draftIndex, targetColl, cached, null)
@@ -780,7 +1079,8 @@ class JoinViewDialog(
         if (isActive) {
             statusOrMismatchLabel.text = I18n.t("join.dialog.loadingTarget")
             statusOrMismatchLabel.foreground = UiHelpers.BSON_NULL_COLOR
-            foreignFieldCombo.isEnabled = false
+            joinKeyRows.forEach { it.setControlsEnabled(false) }
+            autoMatchCommonKeysBtn.isEnabled = false
             isOKActionEnabled = false
         }
 
@@ -801,7 +1101,8 @@ class JoinViewDialog(
                     if (isDisposed) return@invokeLater
                     if (isActive && reqSeq != schemaRequestSeq.get()) return@invokeLater
                     if (isActive) {
-                        foreignFieldCombo.isEnabled = true
+                        joinKeyRows.forEach { it.setControlsEnabled(true) }
+                        autoMatchCommonKeysBtn.isEnabled = true
                         isOKActionEnabled = true
                     }
                     if (sampled != null) {
@@ -847,7 +1148,6 @@ class JoinViewDialog(
                 draft.allColumns.clear()
                 draft.selectedColumns.clear()
                 draft.joinKeyFields.clear()
-                draft.foreignField = draft.localField.ifBlank { "_id" }
             }
         } else {
             draft.lastError = null
@@ -861,7 +1161,7 @@ class JoinViewDialog(
             val sampledJoinKeys = (schema.joinFieldTypes.keys + sampledKeys).distinct()
             draft.joinKeyFields.clear()
             draft.joinKeyFields.addAll(
-                (sampledJoinKeys + draft.foreignField + draft.conditions.map { it.field })
+                (sampledJoinKeys + draft.keyPairs.map { it.foreignField } + draft.conditions.map { it.field })
                     .map { it.trim() }
                     .filter { it.isNotEmpty() }
                     .distinct()
@@ -879,19 +1179,24 @@ class JoinViewDialog(
                 draft.allColumns.addAll(sampledKeys)
                 draft.selectedColumns.clear()
                 draft.selectedColumns.addAll(sampledKeys)
-                autoMatchForeignField(draft)
+                // Auto-match foreign field for the initial 1st key pair on fresh collection selection
+                if (draft.keyPairs.isNotEmpty()) {
+                    val first = draft.keyPairs[0]
+                    val suggested = suggestForeignFieldForLocal(first.localField, draft)
+                    if (suggested != null) {
+                        draft.keyPairs[0] = first.copy(foreignField = suggested)
+                    }
+                }
             }
         }
 
         if (draftIndex == activeTargetIdx) {
             suppressEditorEvents = true
             try {
-                foreignFieldModel.removeAllElements()
-                val pool = (draft.joinKeyFields + draft.allColumns + draft.foreignField).filter { it.isNotBlank() }.distinct()
-                pool.forEach { foreignFieldModel.addElement(it) }
-                foreignFieldCombo.selectedItem = draft.foreignField
-                foreignFieldCombo.editor?.item = draft.foreignField
-                (foreignFieldCombo.editor?.editorComponent as? JTextComponent)?.text = draft.foreignField
+                joinKeyRows.forEachIndexed { idx, row ->
+                    val explicit = if (!restoring && idx == 0) draft.keyPairs.getOrNull(0)?.foreignField else null
+                    row.refreshForeignOptions(draft, explicitForeign = explicit)
+                }
             } finally {
                 suppressEditorEvents = false
             }
@@ -899,10 +1204,9 @@ class JoinViewDialog(
                 .forEach { it.refreshFieldChoices(preserveCurrentText = true) }
             updateTypeMismatchWarning()
         } else if (draftIndex < activeTargetIdx) {
-            // If an earlier target finished loading, refresh active target's Chain Join sourceKeyCombo!
             suppressEditorEvents = true
             try {
-                rebuildSourceKeyCombo(activeTargetIdx, activeDraft())
+                joinKeyRows.forEach { it.refreshSourceOptions(activeTargetIdx) }
             } finally {
                 suppressEditorEvents = false
             }
@@ -911,27 +1215,21 @@ class JoinViewDialog(
         rebuildAllColumnCheckboxPanels()
     }
 
-    private fun autoMatchForeignField(draft: MutableTargetDraft) {
+    private fun suggestForeignFieldForLocal(localField: String, draft: MutableTargetDraft): String? {
         val candidates = (draft.joinKeyFields + draft.allColumns).distinct()
-        if (candidates.isEmpty()) return
-        val localFull = draft.localField.trim()
+        if (candidates.isEmpty()) return null
+        val localFull = localField.trim()
         val localLeaf = localFull.substringAfterLast('.')
         val snake = ReferenceJumpHelper.camelToSnake(localLeaf)
         val camel = ReferenceJumpHelper.snakeToCamel(localLeaf)
 
-        val matched = when {
+        return when {
             localFull.isNotEmpty() && localFull != "_id" && localFull in candidates -> localFull
             localLeaf.isNotEmpty() && localLeaf != "_id" && localLeaf in candidates -> localLeaf
             snake.isNotEmpty() && snake != "_id" && snake in candidates -> snake
             camel.isNotEmpty() && camel != "_id" && camel in candidates -> camel
             "_id" in candidates -> "_id"
             else -> candidates.first()
-        }
-        draft.foreignField = matched
-        if (draft === activeDraft()) {
-            foreignFieldCombo.selectedItem = matched
-            foreignFieldCombo.editor?.item = matched
-            (foreignFieldCombo.editor?.editorComponent as? JTextComponent)?.text = matched
         }
     }
 
@@ -949,28 +1247,29 @@ class JoinViewDialog(
             return
         }
 
-        val sourceOpt = sourceKeyCombo.selectedItem as? SourceKeyOption
-        val localCat: String? = when (val ref = sourceOpt?.sourceRef) {
-            is JoinSourceRef.Base -> sourceJoinKeyCategories[sourceOpt.fieldName]
-                ?: sourceFieldCategories[sourceOpt.fieldName]
-                ?: if (sourceOpt.fieldName == "_id") "ObjectId" else null
-            is JoinSourceRef.PreviousTarget -> {
-                val prevDraft = targetDrafts.getOrNull(ref.targetIndex)
-                prevDraft?.joinFieldCategories?.get(sourceOpt.fieldName)
-                    ?: prevDraft?.fieldCategories?.get(sourceOpt.fieldName)
-                    ?: if (sourceOpt.fieldName == "_id") "ObjectId" else null
+        // Check every key mapping row for potential BSON type mismatch
+        for (row in joinKeyRows) {
+            val pair = row.toKeyPair()
+            if (pair.localField.isBlank() || pair.foreignField.isBlank()) continue
+            val localCat: String? = when (val ref = pair.sourceRef) {
+                is JoinSourceRef.Base -> sourceJoinKeyCategories[pair.localField]
+                    ?: sourceFieldCategories[pair.localField]
+                    ?: if (pair.localField == "_id") "ObjectId" else null
+                is JoinSourceRef.PreviousTarget -> {
+                    val prevDraft = targetDrafts.getOrNull(ref.targetIndex)
+                    prevDraft?.joinFieldCategories?.get(pair.localField)
+                        ?: prevDraft?.fieldCategories?.get(pair.localField)
+                        ?: if (pair.localField == "_id") "ObjectId" else null
+                }
             }
-            null -> null
+            val foreignCat = draft.joinFieldCategories[pair.foreignField] ?: draft.fieldCategories[pair.foreignField]
+            if (localCat != null && foreignCat != null && localCat != foreignCat) {
+                statusOrMismatchLabel.text = "⚠ ${pair.localField}=${pair.foreignField}: ${I18n.t("join.dialog.typeMismatchWarning", localCat, foreignCat)}"
+                statusOrMismatchLabel.foreground = UiHelpers.COLOR_ORANGE_FG
+                return
+            }
         }
-        val foreign = currentForeignFieldText()
-        val foreignCat = draft.joinFieldCategories[foreign] ?: draft.fieldCategories[foreign]
-
-        if (localCat != null && foreignCat != null && localCat != foreignCat) {
-            statusOrMismatchLabel.text = "⚠ ${I18n.t("join.dialog.typeMismatchWarning", localCat, foreignCat)}"
-            statusOrMismatchLabel.foreground = UiHelpers.COLOR_ORANGE_FG
-        } else {
-            statusOrMismatchLabel.text = " "
-        }
+        statusOrMismatchLabel.text = " "
     }
 
     private fun updateMultiUnwindWarning() {
@@ -994,7 +1293,6 @@ class JoinViewDialog(
     private fun rebuildAllColumnCheckboxPanels() {
         columnsRowPanel.removeAll()
 
-        // Panel 0: Base collection
         val basePanel = buildColumnPanelCard(
             title = I18n.t("join.dialog.colPanelBase", sourceCollection),
             fields = leftFields,
@@ -1003,7 +1301,6 @@ class JoinViewDialog(
         )
         columnsRowPanel.add(basePanel)
 
-        // Panels 1..N: Each Join Target
         targetDrafts.forEachIndexed { idx, draft ->
             columnsRowPanel.add(Box.createHorizontalStrut(JBUI.scale(8)))
             val targetPanel = buildColumnPanelCard(
@@ -1074,8 +1371,8 @@ class JoinViewDialog(
                 BorderFactory.createLineBorder(JBUI.CurrentTheme.ToolWindow.borderColor(), 1, true),
                 JBUI.Borders.empty(4, 6)
             )
-            minimumSize = Dimension(minW, JBUI.scale(150))
-            preferredSize = Dimension(JBUI.scale(255), JBUI.scale(200))
+            minimumSize = Dimension(minW, JBUI.scale(140))
+            preferredSize = Dimension(JBUI.scale(255), JBUI.scale(190))
             add(header, BorderLayout.NORTH)
             add(JBScrollPane(listPanel), BorderLayout.CENTER)
         }
@@ -1084,16 +1381,17 @@ class JoinViewDialog(
     private fun adjustDialogSizeDynamically(initialOpen: Boolean) {
         val win = window ?: return
         val screen = ScreenUtil.getScreenRectangle(win)
-        val maxW = (screen.width * 0.85).toInt().coerceAtLeast(JBUI.scale(680))
-        val maxH = (screen.height * 0.85).toInt().coerceAtLeast(JBUI.scale(500))
+        val maxW = (screen.width * 0.85).toInt().coerceAtLeast(JBUI.scale(700))
+        val maxH = (screen.height * 0.85).toInt().coerceAtLeast(JBUI.scale(520))
 
         val desiredW = when {
-            targetDrafts.size <= 1 -> JBUI.scale(800)
+            targetDrafts.size <= 1 -> JBUI.scale(820)
             else -> JBUI.scale(1060)
         }.coerceAtMost(maxW)
 
-        val condExtraH = ((conditionRows.size - 1).coerceAtLeast(0) * JBUI.scale(32)).coerceAtMost(JBUI.scale(110))
-        val desiredH = (JBUI.scale(600) + condExtraH).coerceAtMost(maxH)
+        val keyExtraH = ((joinKeyRows.size - 1).coerceAtLeast(0) * JBUI.scale(34)).coerceAtMost(JBUI.scale(105))
+        val condExtraH = ((conditionRows.size - 1).coerceAtLeast(0) * JBUI.scale(32)).coerceAtMost(JBUI.scale(96))
+        val desiredH = (JBUI.scale(640) + keyExtraH + condExtraH).coerceAtMost(maxH)
 
         val targetW = if (initialOpen) desiredW else maxOf(win.width, desiredW).coerceAtMost(maxW)
         val targetH = if (initialOpen) desiredH else maxOf(win.height, desiredH).coerceAtMost(maxH)
@@ -1119,13 +1417,44 @@ class JoinViewDialog(
             add(multiUnwindWarningLabel, BorderLayout.SOUTH)
         }
 
-        // 2. Match Key Form
-        val matchForm = FormBuilder.createFormBuilder()
+        // 2. Target Collection + Dynamic Composite Join Keys Section
+        val targetSelectRow = FormBuilder.createFormBuilder()
             .addLabeledComponent(JBLabel(I18n.t("join.dialog.targetCollection")), targetCollectionCombo, 1, false)
-            .addLabeledComponent(JBLabel(I18n.t("join.dialog.sourceKeyLabel")), sourceKeyCombo, 1, false)
-            .addLabeledComponent(JBLabel(I18n.t("join.dialog.foreignField")), foreignFieldCombo, 1, false)
-            .addComponent(statusOrMismatchLabel, 2)
             .panel
+
+        val keysToolbar = JPanel(BorderLayout(6, 0)).apply {
+            border = JBUI.Borders.emptyBottom(4)
+            val leftBtns = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0)).apply {
+                isOpaque = false
+                add(addJoinKeyBtn)
+                add(autoMatchCommonKeysBtn)
+            }
+            add(leftBtns, BorderLayout.WEST)
+            add(JBLabel(I18n.t("join.dialog.keyMappingHint")).apply {
+                foreground = UiHelpers.BSON_NULL_COLOR
+                font = font.deriveFont(font.size2D - 1f)
+            }, BorderLayout.EAST)
+        }
+
+        val keysSection = JPanel(BorderLayout(0, 4)).apply {
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createTitledBorder(I18n.t("join.dialog.keysSection")),
+                JBUI.Borders.empty(4, 6)
+            )
+            add(keysToolbar, BorderLayout.NORTH)
+            add(joinKeysScrollPane, BorderLayout.CENTER)
+            val statusStack = JPanel(BorderLayout(0, 4)).apply {
+                isOpaque = false
+                add(statusOrMismatchLabel, BorderLayout.NORTH)
+                add(compositeKeyInfoLabel, BorderLayout.SOUTH)
+            }
+            add(statusStack, BorderLayout.SOUTH)
+        }
+
+        val matchStack = JPanel(BorderLayout(0, 4)).apply {
+            add(targetSelectRow, BorderLayout.NORTH)
+            add(keysSection, BorderLayout.CENTER)
+        }
 
         // 3. Match Strategy Radios + Result Limit selector
         val strategyRow = JPanel(BorderLayout(8, 0)).apply {
@@ -1164,7 +1493,7 @@ class JoinViewDialog(
 
         val upperConfigPane = JPanel(BorderLayout(0, 6)).apply {
             val midStack = JPanel(BorderLayout(0, 6)).apply {
-                add(matchForm, BorderLayout.NORTH)
+                add(matchStack, BorderLayout.CENTER)
                 add(strategyRow, BorderLayout.SOUTH)
             }
             add(topHeaderStack, BorderLayout.NORTH)
@@ -1181,7 +1510,7 @@ class JoinViewDialog(
             add(columnsScrollPane, BorderLayout.CENTER)
         }
 
-        val splitter = JBSplitter(true, 0.56f).apply {
+        val splitter = JBSplitter(true, 0.62f).apply {
             firstComponent = upperConfigPane
             secondComponent = lowerColumnsPane
         }
@@ -1189,8 +1518,8 @@ class JoinViewDialog(
         rootContainerPanel.apply {
             border = JBUI.Borders.empty(6)
             preferredSize = Dimension(
-                if (targetDrafts.size <= 1) JBUI.scale(780) else JBUI.scale(1020),
-                JBUI.scale(580)
+                if (targetDrafts.size <= 1) JBUI.scale(800) else JBUI.scale(1040),
+                JBUI.scale(640)
             )
             add(splitter, BorderLayout.CENTER)
         }
@@ -1204,14 +1533,31 @@ class JoinViewDialog(
             if (draft.targetCollection.isBlank()) {
                 return ValidationInfo(I18n.t("join.dialog.validationTargetRequired"), targetCollectionCombo)
             }
-            if (draft.localField.isBlank()) {
-                return ValidationInfo(I18n.t("join.dialog.validationFieldsRequired"), sourceKeyCombo)
+            if (draft.keyPairs.isEmpty()) {
+                return ValidationInfo(I18n.t("join.dialog.validationFieldsRequired"), joinKeysScrollPane)
             }
-            if (draft.foreignField.isBlank()) {
-                return ValidationInfo(
-                    "#${idx + 1}: ${I18n.t("join.dialog.validationForeignFieldRequired")}",
-                    foreignFieldCombo
-                )
+            val seenPairs = hashSetOf<Triple<JoinSourceRef, String, String>>()
+            draft.keyPairs.forEachIndexed { rowIdx, pair ->
+                val focusRow = if (idx == activeTargetIdx) joinKeyRows.getOrNull(rowIdx) else null
+                if (pair.localField.isBlank()) {
+                    return ValidationInfo(
+                        I18n.t("join.dialog.validationKeyRowLocalRequired", rowIdx + 1),
+                        focusRow?.sourceKeyCombo ?: joinKeysScrollPane
+                    )
+                }
+                if (pair.foreignField.isBlank()) {
+                    return ValidationInfo(
+                        I18n.t("join.dialog.validationKeyRowForeignRequired", rowIdx + 1),
+                        focusRow?.foreignFieldCombo ?: joinKeysScrollPane
+                    )
+                }
+                val triple = Triple(pair.sourceRef, pair.localField.trim(), pair.foreignField.trim())
+                if (!seenPairs.add(triple)) {
+                    return ValidationInfo(
+                        I18n.t("join.dialog.validationDuplicateKeyPair", pair.localField, pair.foreignField),
+                        focusRow?.foreignFieldCombo ?: joinKeysScrollPane
+                    )
+                }
             }
         }
 
@@ -1239,7 +1585,12 @@ class JoinViewDialog(
 
         val selectedLeft = leftFields.filter { it in selectedLeftSet }
         val builtTargets = targetDrafts.map { d ->
-            val allCols = (d.allColumns + d.selectedColumns + d.foreignField)
+            val cleanPairs = d.keyPairs
+                .map { it.copy(localField = it.localField.trim(), foreignField = it.foreignField.trim()) }
+                .filter { it.localField.isNotEmpty() && it.foreignField.isNotEmpty() }
+                .distinct()
+            val primaryPair = cleanPairs.firstOrNull() ?: JoinKeyPair(JoinSourceRef.Base, "_id", "_id")
+            val allCols = (d.allColumns + d.selectedColumns)
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
                 .distinct()
@@ -1247,14 +1598,15 @@ class JoinViewDialog(
             val cleanConds = d.conditions.filter {
                 it.field.isNotBlank() && (!it.operator.requiresValue || it.rawValue.isNotBlank())
             }
-            if (d.sourceRef is JoinSourceRef.Base) {
-                ReferenceJumpHelper.recordSelection(database, d.localField, d.targetCollection)
+            if (primaryPair.sourceRef is JoinSourceRef.Base) {
+                ReferenceJumpHelper.recordSelection(database, primaryPair.localField, d.targetCollection)
             }
             JoinTargetSpec(
                 targetCollection = d.targetCollection,
-                sourceRef = d.sourceRef,
-                localField = d.localField,
-                foreignField = d.foreignField,
+                sourceRef = primaryPair.sourceRef,
+                localField = primaryPair.localField,
+                foreignField = primaryPair.foreignField,
+                keyPairs = cleanPairs.ifEmpty { listOf(primaryPair) },
                 matchStrategy = d.matchStrategy,
                 allColumns = allCols,
                 selectedColumns = selectedCols,

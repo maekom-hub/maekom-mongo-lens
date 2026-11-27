@@ -15,6 +15,12 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>v0.2.5</h3>
+        <ul>
+            <li><b>Composite Join Keys (Multi-Key AND Matching) &amp; Auto-Match Common Keys:</b> Added dynamic 1..N join key mapping rows in <code>JoinViewDialog</code> with <code>[+ Add Join Condition]</code> and <code>[Auto-Match Common Keys]</code> (appends matching fields without overwriting existing rows).</li>
+            <li><b>Hybrid <code>$lookup</code> Pipeline &amp; Safety Guards:</b> Uses index-friendly <code>localField</code>/<code>foreignField</code> for single-key joins and automatically switches to MongoDB &amp; AWS DocumentDB (4.0/5.0) compatible <code>let</code> + <code>pipeline</code> (<code>local_k0..kN</code>, <code>null</code>/missing guard, dynamic <code>$cond($isArray)</code>, <code>LATEST_ONE</code> <code>$sort</code>/<code>$limit: 1</code> pushdown) for composite joins, guarded by <code>15,000ms maxTimeMS</code> and join-key summary badges.</li>
+            <li><b>Keyboard Navigation for Filter / Sort / Project Autocomplete:</b> Unified high-priority key interception (<code>↑</code>/<code>↓</code> wrap-around navigation, <code>Enter</code>/<code>Tab</code> context-aware apply without triggering query execution or newline, <code>Esc</code> dismiss, and one-shot reopen suppression until next typing).</li>
+        </ul>
         <h3>v0.2.4</h3>
         <ul>
             <li><b>Zero-Overhead Initial Collection Open:</b> Completely skips <code>explain()</code> and <code>listIndexes()</code> when opening a collection without Filter/Sort, displaying a neutral <code>No Filter (Preview)</code> badge (click to inspect indexes anytime).</li>

@@ -12,6 +12,8 @@ import com.intellij.openapi.fileTypes.PlainTextFileType
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.popup.JBPopup
 import com.intellij.openapi.ui.popup.JBPopupFactory
+import com.intellij.openapi.ui.popup.JBPopupListener
+import com.intellij.openapi.ui.popup.LightweightWindowEvent
 import com.intellij.openapi.util.text.StringUtil
 import com.intellij.ui.ColoredListCellRenderer
 import com.intellij.ui.EditorTextField
@@ -20,6 +22,8 @@ import com.intellij.ui.awt.RelativePoint
 import com.intellij.ui.components.JBList
 import com.intellij.util.ui.JBUI
 import java.awt.Dimension
+import java.awt.KeyEventDispatcher
+import java.awt.KeyboardFocusManager
 import java.awt.Point
 import java.awt.event.FocusAdapter
 import java.awt.event.FocusEvent
@@ -85,6 +89,9 @@ class MongoJsonEditor(
     }
 
     private var suppressAutoPopup = false
+    private var suppressReopenUntilNextTyping = false
+    private var swallowNextControlCharTyped = false
+    private var activePopupKeyDispatcher: KeyEventDispatcher? = null
     private val baseSingleLineHeight: Int = JBUI.scale(32)
     private var currentHeightPx: Int = baseSingleLineHeight
 
@@ -206,36 +213,19 @@ class MongoJsonEditor(
             }
         })
 
-        // Priority key listener: when completion popup is visible, intercept navigation & confirm keys FIRST
+        // Fallback key listener for shortcuts when popup is closed & auto-pair closing
         editor.contentComponent.addKeyListener(object : KeyAdapter() {
             override fun keyPressed(e: KeyEvent) {
-                val popup = activePopup
-                if (popup != null && popup.isVisible) {
-                    when (e.keyCode) {
-                        KeyEvent.VK_DOWN -> {
-                            e.consume()
-                            val next = (suggestionList.selectedIndex + 1).coerceAtMost(listModel.size() - 1)
-                            suggestionList.selectedIndex = next
-                            suggestionList.ensureIndexIsVisible(next)
-                            return
-                        }
-                        KeyEvent.VK_UP -> {
-                            e.consume()
-                            val prev = (suggestionList.selectedIndex - 1).coerceAtLeast(0)
-                            suggestionList.selectedIndex = prev
-                            suggestionList.ensureIndexIsVisible(prev)
-                            return
-                        }
-                        KeyEvent.VK_ENTER, KeyEvent.VK_TAB -> {
-                            e.consume()
-                            acceptSelectedCompletion(editor)
-                            return
-                        }
-                        KeyEvent.VK_ESCAPE -> {
-                            e.consume()
-                            dismissPopup()
-                            return
-                        }
+                if (isCompletionPopupActive()) {
+                    // Handled at KeyboardFocusManager level before Editor actions & Tab traversal
+                    if (e.keyCode == KeyEvent.VK_DOWN ||
+                        e.keyCode == KeyEvent.VK_UP ||
+                        e.keyCode == KeyEvent.VK_ENTER ||
+                        e.keyCode == KeyEvent.VK_TAB ||
+                        e.keyCode == KeyEvent.VK_ESCAPE
+                    ) {
+                        e.consume()
+                        return
                     }
                 }
 
@@ -248,6 +238,7 @@ class MongoJsonEditor(
                 }
                 if (isCtrlOrMeta && e.keyCode == KeyEvent.VK_SPACE) {
                     e.consume()
+                    suppressReopenUntilNextTyping = false
                     triggerCompletionPopup(editor, forceShow = true)
                     return
                 }
@@ -260,6 +251,10 @@ class MongoJsonEditor(
 
             override fun keyTyped(e: KeyEvent) {
                 val ch = e.keyChar
+                // Re-enable automatic completion once the user types the next actual character
+                if (ch != KeyEvent.CHAR_UNDEFINED && !ch.isISOControl()) {
+                    suppressReopenUntilNextTyping = false
+                }
                 when (ch) {
                     '{' -> autoClosePair(editor, '}')
                     '[' -> autoClosePair(editor, ']')
@@ -293,9 +288,13 @@ class MongoJsonEditor(
                         }
                     }
                 }
-                if (suppressAutoPopup || !editor.contentComponent.isFocusOwner) return
+                if (suppressAutoPopup || suppressReopenUntilNextTyping || !editor.contentComponent.isFocusOwner) return
                 ApplicationManager.getApplication().invokeLater {
-                    if (!editor.isDisposed && editor.contentComponent.isFocusOwner) {
+                    if (!editor.isDisposed &&
+                        editor.contentComponent.isFocusOwner &&
+                        !suppressAutoPopup &&
+                        !suppressReopenUntilNextTyping
+                    ) {
                         triggerCompletionPopup(editor, forceShow = false)
                     }
                 }
@@ -303,6 +302,99 @@ class MongoJsonEditor(
         })
 
         return editor
+    }
+
+    private fun isCompletionPopupActive(): Boolean {
+        val popup = activePopup ?: return false
+        return !popup.isDisposed && popup.isVisible && listModel.size() > 0
+    }
+
+    /**
+     * Installs a high-priority KeyEventDispatcher ONLY while the completion popup is visible.
+     * Intercepts Up/Down/Enter/Tab/Escape BEFORE IntelliJ Editor actions and Swing Tab focus traversal,
+     * and automatically detaches on popup close so normal shortcuts are 100% untouched when closed.
+     */
+    private fun installPopupKeyDispatcher(editor: EditorEx) {
+        removePopupKeyDispatcher()
+        val dispatcher = KeyEventDispatcher { e ->
+            if (editor.isDisposed || !editor.contentComponent.isFocusOwner || !isCompletionPopupActive()) {
+                return@KeyEventDispatcher false
+            }
+
+            if (e.id == KeyEvent.KEY_TYPED && swallowNextControlCharTyped) {
+                if (e.keyChar == '\n' || e.keyChar == '\r' || e.keyChar == '\t' || e.keyChar == '\u001B') {
+                    swallowNextControlCharTyped = false
+                    e.consume()
+                    return@KeyEventDispatcher true
+                }
+                swallowNextControlCharTyped = false
+                return@KeyEventDispatcher false
+            }
+
+            if (e.id != KeyEvent.KEY_PRESSED) {
+                return@KeyEventDispatcher false
+            }
+
+            val isCtrlOrMeta = (e.modifiersEx and (InputEvent.CTRL_DOWN_MASK or InputEvent.META_DOWN_MASK)) != 0
+            val count = listModel.size()
+            if (count <= 0) return@KeyEventDispatcher false
+
+            when (e.keyCode) {
+                KeyEvent.VK_DOWN -> {
+                    val cur = suggestionList.selectedIndex
+                    val next = if (cur < 0 || cur >= count - 1) 0 else cur + 1
+                    suggestionList.selectedIndex = next
+                    suggestionList.ensureIndexIsVisible(next)
+                    e.consume()
+                    true
+                }
+                KeyEvent.VK_UP -> {
+                    val cur = suggestionList.selectedIndex
+                    val prev = if (cur <= 0) count - 1 else cur - 1
+                    suggestionList.selectedIndex = prev
+                    suggestionList.ensureIndexIsVisible(prev)
+                    e.consume()
+                    true
+                }
+                KeyEvent.VK_ENTER -> {
+                    if (isCtrlOrMeta) {
+                        // Ctrl+Enter / Cmd+Enter still executes query directly
+                        dismissPopup()
+                        e.consume()
+                        onExecuteShortcut?.invoke()
+                        true
+                    } else {
+                        swallowNextControlCharTyped = true
+                        e.consume()
+                        acceptSelectedCompletion(editor)
+                        true
+                    }
+                }
+                KeyEvent.VK_TAB -> {
+                    swallowNextControlCharTyped = true
+                    e.consume()
+                    acceptSelectedCompletion(editor)
+                    true
+                }
+                KeyEvent.VK_ESCAPE -> {
+                    swallowNextControlCharTyped = true
+                    e.consume()
+                    dismissPopup()
+                    true
+                }
+                else -> false
+            }
+        }
+        activePopupKeyDispatcher = dispatcher
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(dispatcher)
+    }
+
+    private fun removePopupKeyDispatcher() {
+        activePopupKeyDispatcher?.let { disp ->
+            KeyboardFocusManager.getCurrentKeyboardFocusManager().removeKeyEventDispatcher(disp)
+        }
+        activePopupKeyDispatcher = null
+        swallowNextControlCharTyped = false
     }
 
     private fun updateAutoGrowHeight(editor: EditorEx) {
@@ -399,11 +491,15 @@ class MongoJsonEditor(
         listModel.clear()
         candidates.take(25).forEach { listModel.addElement(it) }
         suggestionList.selectedIndex = 0
+        suggestionList.ensureIndexIsVisible(0)
         suggestionList.visibleRowCount = candidates.size.coerceIn(1, 8)
 
         val current = activePopup
-        if (current != null && current.isVisible) {
+        if (current != null && !current.isDisposed && current.isVisible) {
             current.pack(true, true)
+            if (activePopupKeyDispatcher == null) {
+                installPopupKeyDispatcher(editor)
+            }
             return
         }
 
@@ -420,7 +516,17 @@ class MongoJsonEditor(
             .setResizable(false)
             .createPopup()
 
+        popup.addListener(object : JBPopupListener {
+            override fun onClosed(event: LightweightWindowEvent) {
+                if (activePopup === popup) {
+                    activePopup = null
+                }
+                removePopupKeyDispatcher()
+            }
+        })
+
         activePopup = popup
+        installPopupKeyDispatcher(editor)
         val caretPoint = editor.visualPositionToXY(editor.caretModel.visualPosition)
         val showPoint = Point(caretPoint.x, caretPoint.y + editor.lineHeight)
         popup.show(RelativePoint(editor.contentComponent, showPoint))
@@ -474,16 +580,36 @@ class MongoJsonEditor(
         val isQueryBarMode = completionMode == CompletionMode.FILTER ||
             completionMode == CompletionMode.SORT ||
             completionMode == CompletionMode.PROJECT
+        val isSortOrProject = completionMode == CompletionMode.SORT || completionMode == CompletionMode.PROJECT
         val needsOuterBraces = isQueryBarMode && !trimmedAll.startsWith("{")
 
+        // Suppress automatic popup reopen right after confirmation until the user types the next character
+        suppressReopenUntilNextTyping = true
+
         if (needsOuterBraces) {
-            val ins = "{ \"${selected.text}\":  }"
-            val caretIdx = ins.length - 2
+            val (ins, caretIdx, selStart, selEnd) = when {
+                isSortOrProject -> {
+                    val s = "{ \"${selected.text}\": 1 }"
+                    val oneStart = s.length - 3
+                    Quad(s, oneStart + 1, oneStart, oneStart + 1)
+                }
+                selected.kind == "operator" && selected.text in ARRAY_VALUE_OPERATORS -> {
+                    val s = "{ \"${selected.text}\": [] }"
+                    Quad(s, s.length - 3, -1, -1)
+                }
+                else -> {
+                    val s = "{ \"${selected.text}\":  }"
+                    Quad(s, s.length - 2, -1, -1)
+                }
+            }
             suppressAutoPopup = true
             try {
                 WriteCommandAction.runWriteCommandAction(projectRef) {
                     doc.replaceString(0, doc.textLength, ins)
                     editor.caretModel.moveToOffset(caretIdx)
+                    if (selStart >= 0 && selEnd > selStart) {
+                        editor.selectionModel.setSelection(selStart, selEnd)
+                    }
                 }
             } finally {
                 suppressAutoPopup = false
@@ -493,6 +619,14 @@ class MongoJsonEditor(
 
         val (insertion, caretDelta, selectStartDelta, selectEndDelta) = when {
             hasColonAfter -> Quad("\"${selected.text}\"", selected.text.length + 2, -1, -1)
+            isSortOrProject && selected.kind == "field" -> {
+                val ins = "\"${selected.text}\": 1"
+                Quad(ins, ins.length, ins.length - 1, ins.length)
+            }
+            selected.kind == "operator" && selected.text in ARRAY_VALUE_OPERATORS -> {
+                val ins = "\"${selected.text}\": []"
+                Quad(ins, ins.length - 1, -1, -1)
+            }
             isQueryBarMode && selected.kind == "field" -> {
                 val ins = "\"${selected.text}\": "
                 Quad(ins, ins.length, -1, -1)
@@ -546,10 +680,16 @@ class MongoJsonEditor(
     }
 
     fun dismissPopup() {
+        removePopupKeyDispatcher()
         activePopup?.let {
             if (!it.isDisposed) it.cancel()
         }
         activePopup = null
+    }
+
+    override fun removeNotify() {
+        dismissPopup()
+        super.removeNotify()
     }
 
     fun setPreferredSizeHeight(height: Int) {
@@ -562,6 +702,8 @@ class MongoJsonEditor(
             val jsonType = FileTypeManager.getInstance().getFileTypeByExtension("json")
             return if (jsonType.name == "UNKNOWN") PlainTextFileType.INSTANCE else jsonType
         }
+
+        private val ARRAY_VALUE_OPERATORS = setOf("\$in", "\$nin", "\$all", "\$and", "\$or", "\$nor")
 
         private val MONGO_OPERATORS = listOf(
             "\$eq", "\$ne", "\$in", "\$nin", "\$gt", "\$gte", "\$lt", "\$lte",

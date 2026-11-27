@@ -58,17 +58,35 @@ data class JoinCondition(
     val rawValue: String
 )
 
+data class JoinKeyPair(
+    val sourceRef: JoinSourceRef = JoinSourceRef.Base,
+    val localField: String,
+    val foreignField: String
+)
+
 data class JoinTargetSpec(
     val targetCollection: String,
     val sourceRef: JoinSourceRef = JoinSourceRef.Base,
     val localField: String,
     val foreignField: String,
+    val keyPairs: List<JoinKeyPair> = listOf(JoinKeyPair(sourceRef, localField, foreignField)),
     val matchStrategy: JoinMatchStrategy = JoinMatchStrategy.LATEST_ONE,
     val allColumns: List<String> = emptyList(),
     val selectedColumns: List<String> = emptyList(),
     val conditions: List<JoinCondition> = emptyList(),
     val excludeUnmatched: Boolean = true
-)
+) {
+    fun effectiveKeyPairs(): List<JoinKeyPair> {
+        val cleaned = keyPairs.filter { it.localField.isNotBlank() && it.foreignField.isNotBlank() }
+        return if (cleaned.isNotEmpty()) {
+            cleaned
+        } else {
+            listOf(JoinKeyPair(sourceRef, localField, foreignField))
+        }
+    }
+
+    fun isCompositeJoin(): Boolean = effectiveKeyPairs().size >= 2
+}
 
 data class ColumnOrigin(
     val resultFieldKey: String,
@@ -98,6 +116,25 @@ data class JoinSpec(
 
     fun compactTabKeySegment(): String {
         return "$leftCollection⋈${targets.joinToString("⋈") { it.targetCollection }}"
+    }
+
+    /**
+     * Human-readable join condition summary for the Join result tab header badge, e.g.:
+     * `a_hts.userid=b_hts.userid AND a_hts.stcd=b_hts.stcd`
+     */
+    fun joinKeysSummary(): String {
+        return targets.mapIndexed { idx, target ->
+            target.effectiveKeyPairs().joinToString(" AND ") { pair ->
+                val srcColl = when (val ref = pair.sourceRef) {
+                    is JoinSourceRef.Base -> leftCollection
+                    is JoinSourceRef.PreviousTarget -> {
+                        targets.getOrNull(ref.targetIndex.coerceIn(0, (idx - 1).coerceAtLeast(0)))?.targetCollection
+                            ?: leftCollection
+                    }
+                }
+                "$srcColl.${pair.localField}=${target.targetCollection}.${pair.foreignField}"
+            }
+        }.filter { it.isNotBlank() }.joinToString("  |  ")
     }
 
     /**
@@ -288,32 +325,126 @@ data class JoinSpec(
         }
         stages.add(BsonDocument("\$sort", effectiveSort))
 
-        // Stage 3: Sequential $lookup + per-target conditions + exclusion for each target[i]
+        // Stage 3: Sequential $lookup (hybrid single-key vs composite let+pipeline) + per-target conditions + exclusion
         targets.forEachIndexed { idx, target ->
             val joinAlias = "_joined_$idx"
-            val resolvedLocalField = when (val src = target.sourceRef) {
-                is JoinSourceRef.Base -> target.localField
+            val pairs = target.effectiveKeyPairs()
+            val isComposite = pairs.size >= 2
+
+            fun resolveSourceFieldPath(pair: JoinKeyPair): String = when (val src = pair.sourceRef) {
+                is JoinSourceRef.Base -> pair.localField.trim()
                 is JoinSourceRef.PreviousTarget -> {
                     val safeRef = src.targetIndex.coerceIn(0, (idx - 1).coerceAtLeast(0))
-                    "_joined_$safeRef.${target.localField}"
+                    "_joined_$safeRef.${pair.localField.trim()}"
                 }
             }
-
-            // Standard localField / foreignField $lookup (100% AWS DocumentDB compatible; natively traverses array-of-objects dot paths)
-            val lookupDoc = BsonDocument()
-                .append("from", BsonString(target.targetCollection))
-                .append("localField", BsonString(resolvedLocalField))
-                .append("foreignField", BsonString(target.foreignField))
-                .append("as", BsonString(joinAlias))
-            stages.add(BsonDocument("\$lookup", lookupDoc))
 
             val targetConds = target.conditions.filter {
                 it.field.isNotBlank() && (!it.operator.requiresValue || it.rawValue.isNotBlank())
             }
 
+            if (!isComposite) {
+                // Single key pair: standard index-friendly localField/foreignField $lookup
+                val single = pairs[0]
+                val lookupDoc = BsonDocument()
+                    .append("from", BsonString(target.targetCollection))
+                    .append("localField", BsonString(resolveSourceFieldPath(single)))
+                    .append("foreignField", BsonString(single.foreignField.trim()))
+                    .append("as", BsonString(joinAlias))
+                stages.add(BsonDocument("\$lookup", lookupDoc))
+            } else {
+                // Composite join keys (>= 2 AND keys): let + pipeline with safe local_k0..kN vars,
+                // null/missing guard (prevents null==null explosion), and $cond($isArray) dynamic array/scalar matching.
+                val letDoc = BsonDocument()
+                val exprAndList = BsonArray()
+
+                pairs.forEachIndexed { kIdx, pair ->
+                    val varName = "local_k$kIdx"
+                    val varRef = "\$\$$varName"
+                    val srcPath = resolveSourceFieldPath(pair)
+                    val foreignRef = "\$${pair.foreignField.trim()}"
+
+                    letDoc[varName] = BsonString("\$$srcPath")
+
+                    // Guard: { "$ne": [ { "$ifNull": [ "$$local_kN", null ] }, null ] }
+                    exprAndList.add(
+                        BsonDocument(
+                            "\$ne",
+                            BsonArray(
+                                listOf(
+                                    BsonDocument("\$ifNull", BsonArray(listOf(BsonString(varRef), BsonNull.VALUE))),
+                                    BsonNull.VALUE
+                                )
+                            )
+                        )
+                    )
+
+                    // Dynamic array/scalar match:
+                    // { "$cond": [ { "$isArray": "$$local_kN" }, { "$in": [ "$foreign", { "$ifNull": [ "$$local_kN", [] ] } ] }, { "$eq": [ "$foreign", "$$local_kN" ] } ] }
+                    exprAndList.add(
+                        BsonDocument(
+                            "\$cond",
+                            BsonArray(
+                                listOf(
+                                    BsonDocument("\$isArray", BsonString(varRef)),
+                                    BsonDocument(
+                                        "\$in",
+                                        BsonArray(
+                                            listOf(
+                                                BsonString(foreignRef),
+                                                BsonDocument("\$ifNull", BsonArray(listOf(BsonString(varRef), BsonArray())))
+                                            )
+                                        )
+                                    ),
+                                    BsonDocument("\$eq", BsonArray(listOf(BsonString(foreignRef), BsonString(varRef))))
+                                )
+                            )
+                        )
+                    )
+                }
+
+                val innerPipeline = BsonArray()
+                innerPipeline.add(
+                    BsonDocument(
+                        "\$match",
+                        BsonDocument("\$expr", BsonDocument("\$and", exprAndList))
+                    )
+                )
+
+                // Push down target conditions + { $sort: { _id: -1 } } + { $limit: 1 } for LATEST_ONE mode
+                if (target.matchStrategy == JoinMatchStrategy.LATEST_ONE) {
+                    if (targetConds.isNotEmpty()) {
+                        val condClauses = targetConds.map {
+                            buildStandardMatchClause(it.field.trim(), it.operator, it.rawValue)
+                        }
+                        val condMatch = if (condClauses.size == 1) {
+                            condClauses[0]
+                        } else {
+                            BsonDocument("\$and", BsonArray(condClauses))
+                        }
+                        innerPipeline.add(BsonDocument("\$match", condMatch))
+                    }
+                    innerPipeline.add(BsonDocument("\$sort", BsonDocument("_id", BsonInt32(-1))))
+                    innerPipeline.add(BsonDocument("\$limit", BsonInt32(1)))
+                }
+
+                val lookupDoc = BsonDocument()
+                    .append("from", BsonString(target.targetCollection))
+                    .append("let", letDoc)
+                    .append("pipeline", innerPipeline)
+                    .append("as", BsonString(joinAlias))
+                stages.add(BsonDocument("\$lookup", lookupDoc))
+            }
+
             when (target.matchStrategy) {
                 JoinMatchStrategy.LATEST_ONE -> {
-                    val thenExpr: BsonDocument = if (targetConds.isEmpty()) {
+                    val thenExpr: BsonDocument = if (isComposite) {
+                        // Already filtered + sorted ({ _id: -1 }) + limited (1) inside $lookup.pipeline
+                        BsonDocument(
+                            "\$arrayElemAt",
+                            BsonArray(listOf(BsonString("\$$joinAlias"), BsonInt32(0)))
+                        )
+                    } else if (targetConds.isEmpty()) {
                         BsonDocument(
                             "\$arrayElemAt",
                             BsonArray(listOf(BsonString("\$$joinAlias"), BsonInt32(-1)))

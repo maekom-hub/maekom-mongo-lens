@@ -418,7 +418,9 @@ class MongoConnectionManager(project: Project) : Disposable {
             pageSize = safePageSize,
             probeForNextPage = true
         )
-        val aggIterable = coll.aggregate(pipeline).allowDiskUse(true).maxTime(20, TimeUnit.SECONDS)
+        val aggIterable = coll.aggregate(pipeline)
+            .allowDiskUse(true)
+            .maxTime(15_000, TimeUnit.MILLISECONDS)
         val rawDocs = aggIterable.into(mutableListOf())
         val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs)
 

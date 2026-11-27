@@ -2337,7 +2337,8 @@ class ResultViewerPanel(
             }
             column.headerValue = displayHeader
             val headerWidth = fm.stringWidth(displayHeader) + JBUI.scale(32)
-            val baseMin = if (i == 0) 210 else 150
+            val baseMin = if (i == 0) JBUI.scale(210) else JBUI.scale(150)
+            column.minWidth = JBUI.scale(120)
             column.preferredWidth = maxOf(baseMin, headerWidth)
         }
         header.revalidate()

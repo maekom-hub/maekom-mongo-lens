@@ -154,6 +154,25 @@ class CollectionWorkspaceTab(
         isVisible = initialJoinSpec != null
     }
 
+    private val joinKeysSummaryBadge = UiHelpers.createBadgeLabel(
+        "",
+        UiHelpers.COLOR_GRAY_BG,
+        UiHelpers.COLOR_GRAY_FG
+    ).apply {
+        isVisible = false
+    }
+
+    private fun updateJoinKeysSummaryBadge(spec: JoinSpec?) {
+        val summary = spec?.joinKeysSummary()?.trim().orEmpty()
+        if (summary.isEmpty()) {
+            joinKeysSummaryBadge.isVisible = false
+            return
+        }
+        joinKeysSummaryBadge.text = if (summary.length > 56) "${summary.take(54)}…" else summary
+        joinKeysSummaryBadge.toolTipText = summary
+        joinKeysSummaryBadge.isVisible = true
+    }
+
     private val readOnlyBadge = UiHelpers.createBadgeLabel(
         I18n.t("tree.badge.readOnly"),
         UiHelpers.COLOR_RED_BG,
@@ -217,6 +236,7 @@ class CollectionWorkspaceTab(
         onJoinSpecUpdated = { updatedSpec ->
             val joinDisplay = updatedSpec.displayTitle()
             breadcrumbLabel.text = "${profile.displayName}  /  $database.$joinDisplay"
+            updateJoinKeysSummaryBadge(updatedSpec)
             onJoinTitleUpdated?.invoke(joinDisplay)
         }
     )
@@ -258,6 +278,7 @@ class CollectionWorkspaceTab(
             }
             val right = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 2)).apply {
                 add(joinModeBadge)
+                add(joinKeysSummaryBadge)
                 add(breadcrumbLabel)
                 add(readOnlyBadge)
             }
@@ -293,6 +314,7 @@ class CollectionWorkspaceTab(
         add(modeCardsPanel, BorderLayout.CENTER)
 
         updateReadOnlyBadge()
+        updateJoinKeysSummaryBadge(initialJoinSpec)
         switchMode(initialMode)
 
         // UI-First Zero-Overhead open:
