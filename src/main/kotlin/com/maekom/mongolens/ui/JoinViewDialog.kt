@@ -186,9 +186,11 @@ class JoinViewDialog(
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
         border = JBUI.Borders.empty(2, 4)
     }
+    private var currentKeysScrollHeightPx: Int = JBUI.scale(48)
+
     private val joinKeysScrollPane = JBScrollPane(joinKeysListPanel).apply {
-        preferredSize = Dimension(JBUI.scale(720), JBUI.scale(48))
-        minimumSize = Dimension(JBUI.scale(400), JBUI.scale(40))
+        preferredSize = Dimension(JBUI.scale(720), currentKeysScrollHeightPx)
+        minimumSize = Dimension(JBUI.scale(480), currentKeysScrollHeightPx)
     }
     private val joinKeyRows = mutableListOf<JoinKeyMappingRow>()
 
@@ -256,6 +258,7 @@ class JoinViewDialog(
     }
 
     private val rootContainerPanel = JPanel(BorderLayout(0, 6))
+    private var mainSplitter: JBSplitter? = null
 
     /**
      * Dynamic single join-key mapping row:
@@ -265,25 +268,27 @@ class JoinViewDialog(
         private val sourceModel = DefaultComboBoxModel<Any>()
         val sourceKeyCombo = ComboBox<Any>(sourceModel).apply {
             isEditable = true
-            preferredSize = Dimension(JBUI.scale(280), JBUI.scale(26))
+            minimumSize = Dimension(JBUI.scale(210), JBUI.scale(28))
+            preferredSize = Dimension(JBUI.scale(290), JBUI.scale(28))
         }
 
         private val equalsLabel = JBLabel("=").apply {
             font = font.deriveFont(Font.BOLD)
             horizontalAlignment = JBLabel.CENTER
-            preferredSize = Dimension(JBUI.scale(20), JBUI.scale(26))
+            preferredSize = Dimension(JBUI.scale(22), JBUI.scale(28))
         }
 
         private val foreignModel = DefaultComboBoxModel<String>()
         val foreignFieldCombo = ComboBox<String>(foreignModel).apply {
             isEditable = true
-            preferredSize = Dimension(JBUI.scale(280), JBUI.scale(26))
+            minimumSize = Dimension(JBUI.scale(210), JBUI.scale(28))
+            preferredSize = Dimension(JBUI.scale(290), JBUI.scale(28))
         }
 
         val removeBtn = JButton(AllIcons.General.Remove).apply {
             margin = JBUI.insets(1, 5)
             toolTipText = I18n.t("join.dialog.removeKeyPairTooltip")
-            preferredSize = Dimension(JBUI.scale(28), JBUI.scale(26))
+            preferredSize = Dimension(JBUI.scale(28), JBUI.scale(28))
         }
 
         private var rowSuppressEvents = false
@@ -918,14 +923,52 @@ class JoinViewDialog(
         joinKeysListPanel.revalidate()
         joinKeysListPanel.repaint()
 
+        // Expand up to 3 rows visibly; scroll internally for 4+ rows
+        val visibleRows = joinKeyRows.size.coerceIn(1, 3)
         val rowHeightPx = JBUI.scale(34)
-        val minH = JBUI.scale(42)
-        val maxH = JBUI.scale(136) // Scroll cleanly once 4+ rows are added
-        val desiredH = (joinKeyRows.size.coerceAtLeast(1) * rowHeightPx + JBUI.scale(8)).coerceIn(minH, maxH)
-        joinKeysScrollPane.preferredSize = Dimension(joinKeysScrollPane.preferredSize.width.coerceAtLeast(JBUI.scale(680)), desiredH)
+        val paddingPx = JBUI.scale(14)
+        val newScrollH = visibleRows * rowHeightPx + paddingPx
+        val prevScrollH = currentKeysScrollHeightPx
+        currentKeysScrollHeightPx = newScrollH
+
+        val w = joinKeysScrollPane.preferredSize.width.coerceAtLeast(JBUI.scale(680))
+        joinKeysScrollPane.preferredSize = Dimension(w, newScrollH)
+        joinKeysScrollPane.minimumSize = Dimension(JBUI.scale(480), newScrollH)
+        joinKeysScrollPane.maximumSize = Dimension(Int.MAX_VALUE, newScrollH)
         joinKeysScrollPane.revalidate()
         joinKeysScrollPane.repaint()
+
+        val deltaH = newScrollH - prevScrollH
         updateCompositeInfoBanner()
+
+        // Keep dialog width fixed while expanding/shrinking vertical height by deltaH so up to 3 rows are immediately visible
+        val win = window
+        if (win != null && deltaH != 0) {
+            val screen = ScreenUtil.getScreenRectangle(win)
+            val maxH = (screen.height * 0.88).toInt().coerceAtLeast(JBUI.scale(560))
+            val minH = JBUI.scale(580)
+            val targetH = (win.height + deltaH).coerceIn(minH, maxH)
+            if (targetH != win.height) {
+                win.setSize(win.width, targetH)
+            }
+            mainSplitter?.let { sp ->
+                val minProp = when (visibleRows) {
+                    1 -> 0.58f
+                    2 -> 0.64f
+                    else -> 0.68f
+                }
+                if (deltaH > 0 && sp.proportion < minProp) {
+                    sp.proportion = minProp
+                }
+            }
+            rootContainerPanel.revalidate()
+            rootContainerPanel.repaint()
+            win.revalidate()
+            win.repaint()
+        } else {
+            rootContainerPanel.revalidate()
+            rootContainerPanel.repaint()
+        }
     }
 
     private fun syncActiveRowsToDraftAndWarnings() {
@@ -1514,6 +1557,7 @@ class JoinViewDialog(
             firstComponent = upperConfigPane
             secondComponent = lowerColumnsPane
         }
+        mainSplitter = splitter
 
         rootContainerPanel.apply {
             border = JBUI.Borders.empty(6)

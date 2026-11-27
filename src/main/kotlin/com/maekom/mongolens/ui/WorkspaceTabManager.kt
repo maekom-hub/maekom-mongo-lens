@@ -235,6 +235,7 @@ class WorkspaceTabManager(
             setText(tabTitle)
             setTooltipText("${profile.displayName} / $database.$displayCollection$numberSuffix")
             setIcon(AllIcons.FileTypes.Json)
+            profile.colorTag.bgColor()?.let { setTabColor(it) }
         }
         tabInfoRef = tabInfo
 

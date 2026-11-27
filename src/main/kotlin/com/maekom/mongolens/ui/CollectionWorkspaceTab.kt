@@ -15,6 +15,7 @@ import java.awt.Color
 import java.awt.Graphics
 import java.awt.Graphics2D
 import java.awt.RenderingHints
+import com.maekom.mongolens.config.ConnectionColorTag
 import com.maekom.mongolens.config.MongoConnectionProfile
 import com.maekom.mongolens.config.SavedQueryStore
 import com.maekom.mongolens.config.VariableStore
@@ -173,6 +174,20 @@ class CollectionWorkspaceTab(
         joinKeysSummaryBadge.isVisible = true
     }
 
+    private val colorTagBadge = UiHelpers.createBadgeLabel(
+        "",
+        profile.colorTag.bgColor() ?: UiHelpers.COLOR_GRAY_BG,
+        profile.colorTag.fgColor() ?: UiHelpers.COLOR_GRAY_FG
+    ).apply {
+        val tag = profile.colorTag
+        if (tag != ConnectionColorTag.NONE) {
+            text = I18n.t(tag.i18nKey)
+            isVisible = true
+        } else {
+            isVisible = false
+        }
+    }
+
     private val readOnlyBadge = UiHelpers.createBadgeLabel(
         I18n.t("tree.badge.readOnly"),
         UiHelpers.COLOR_RED_BG,
@@ -279,6 +294,7 @@ class CollectionWorkspaceTab(
             val right = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 2)).apply {
                 add(joinModeBadge)
                 add(joinKeysSummaryBadge)
+                add(colorTagBadge)
                 add(breadcrumbLabel)
                 add(readOnlyBadge)
             }
@@ -423,6 +439,9 @@ class CollectionWorkspaceTab(
             findModeBtn.text = I18n.t("workspace.mode.find")
             aggModeBtn.text = I18n.t("workspace.mode.agg")
             shellModeBtn.text = I18n.t("workspace.mode.shell")
+            if (profile.colorTag != ConnectionColorTag.NONE) {
+                colorTagBadge.text = I18n.t(profile.colorTag.i18nKey)
+            }
             updateReadOnlyBadge()
         }
     }

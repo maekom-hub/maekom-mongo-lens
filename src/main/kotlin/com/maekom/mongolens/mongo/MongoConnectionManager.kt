@@ -85,8 +85,9 @@ class MongoConnectionManager(project: Project) : Disposable {
     private data class CachedCountEntry(val fetchedAtMs: Long, val count: Long)
     private data class ExplainOutcome(val scanType: IndexScanType, val indexName: String?, val errorMessage: String?)
 
+    private val projectBasePath: java.nio.file.Path? = project.basePath?.let { java.nio.file.Paths.get(it) }
     private val clients = ConcurrentHashMap<String, MongoClient>()
-    private val clientUris = ConcurrentHashMap<String, String>()
+    private val clientFingerprints = ConcurrentHashMap<String, String>()
     private val unlockedReadOnlyProfiles = ConcurrentHashMap.newKeySet<String>()
     private val indexCache = ConcurrentHashMap<String, CachedIndexEntry>()
     private val estimatedCountCache = ConcurrentHashMap<String, CachedCountEntry>()
@@ -114,27 +115,26 @@ class MongoConnectionManager(project: Project) : Disposable {
 
     fun getOrCreateClient(profile: MongoConnectionProfile): MongoClient {
         check(!disposed.get()) { "MongoConnectionManager is already disposed" }
-        val uri = profile.effectiveConnectionUri()
-        val existingUri = clientUris[profile.id]
+        val fingerprint = profile.connectionFingerprint()
+        val existingFingerprint = clientFingerprints[profile.id]
         val existingClient = clients[profile.id]
-        if (existingClient != null && existingUri == uri) {
+        if (existingClient != null && existingFingerprint == fingerprint) {
             return existingClient
         }
-        return reconnectInternal(profile, uri)
+        return reconnectInternal(profile, fingerprint)
     }
 
     fun reconnect(profile: MongoConnectionProfile): Long {
-        val uri = profile.effectiveConnectionUri()
-        reconnectInternal(profile, uri)
+        reconnectInternal(profile, profile.connectionFingerprint())
         return ping(profile)
     }
 
-    private fun reconnectInternal(profile: MongoConnectionProfile, uri: String): MongoClient {
+    private fun reconnectInternal(profile: MongoConnectionProfile, fingerprint: String): MongoClient {
         closeClient(profile.id)
-        val settings = buildClientSettings(uri)
+        val settings = buildClientSettings(profile)
         val newClient = MongoClients.create(settings)
         val prev = clients.put(profile.id, newClient)
-        clientUris[profile.id] = uri
+        clientFingerprints[profile.id] = fingerprint
         if (prev != null && prev !== newClient) {
             safeClose(prev)
         }
@@ -142,7 +142,7 @@ class MongoConnectionManager(project: Project) : Disposable {
     }
 
     fun closeClient(profileId: String) {
-        clientUris.remove(profileId)
+        clientFingerprints.remove(profileId)
         indexCache.keys.removeIf { it.startsWith("$profileId:") }
         estimatedCountCache.keys.removeIf { it.startsWith("$profileId:") }
         val old = clients.remove(profileId)
@@ -165,16 +165,29 @@ class MongoConnectionManager(project: Project) : Disposable {
         return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)
     }
 
-    fun testUriDirect(uri: String, defaultDb: String?): Long {
+    fun testProfileDirect(profile: MongoConnectionProfile): Long {
         val start = System.nanoTime()
-        val client = MongoClients.create(buildClientSettings(uri))
+        val settings = buildClientSettings(profile, testTimeoutMs = 5_000)
+        val client = MongoClients.create(settings)
         try {
-            val dbName = defaultDb?.takeIf { it.isNotBlank() } ?: "admin"
+            val dbName = profile.extractDefaultDatabase()?.takeIf { it.isNotBlank() } ?: "admin"
             client.getDatabase(dbName).runCommand(Document("ping", 1))
             return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)
         } finally {
             safeClose(client)
         }
+    }
+
+    fun testUriDirect(uri: String, defaultDb: String?): Long {
+        val tempProfile = MongoConnectionProfile(
+            id = "test:direct",
+            displayName = "Test",
+            profileName = "test",
+            source = com.maekom.mongolens.config.ProfileSource.CUSTOM,
+            uri = uri,
+            database = defaultDb
+        )
+        return testProfileDirect(tempProfile)
     }
 
     fun listDatabases(profile: MongoConnectionProfile): List<String> {
@@ -1074,18 +1087,58 @@ class MongoConnectionManager(project: Project) : Disposable {
         invalidateCollectionMetaCache(profile.id, database, collection)
     }
 
-    private fun buildClientSettings(uri: String): MongoClientSettings {
+    private fun buildClientSettings(
+        profile: MongoConnectionProfile,
+        testTimeoutMs: Int? = null
+    ): MongoClientSettings {
+        val uri = profile.effectiveConnectionUri()
         val connStr = ConnectionString(uri)
-        return MongoClientSettings.builder()
+        val clusterTimeoutMs = testTimeoutMs?.toLong() ?: (profile.connectTimeoutMs?.toLong()?.coerceIn(1000L, 60_000L) ?: 3000L)
+        val connectTimeout = testTimeoutMs ?: (profile.connectTimeoutMs?.coerceIn(1000, 60_000) ?: 3000)
+        val socketTimeout = testTimeoutMs ?: (profile.socketTimeoutMs?.coerceIn(1000, 120_000) ?: 15000)
+
+        val builder = MongoClientSettings.builder()
             .applyConnectionString(connStr)
-            .applyToClusterSettings { builder ->
-                builder.serverSelectionTimeout(3000, TimeUnit.MILLISECONDS)
+            .applyToClusterSettings { cluster ->
+                cluster.serverSelectionTimeout(clusterTimeoutMs, TimeUnit.MILLISECONDS)
             }
-            .applyToSocketSettings { builder ->
-                builder.connectTimeout(3000, TimeUnit.MILLISECONDS)
-                builder.readTimeout(15000, TimeUnit.MILLISECONDS)
+            .applyToSocketSettings { socket ->
+                socket.connectTimeout(connectTimeout.toLong(), TimeUnit.MILLISECONDS)
+                socket.readTimeout(socketTimeout.toLong(), TimeUnit.MILLISECONDS)
             }
-            .build()
+
+        val tlsActive = profile.effectiveTlsEnabled()
+        val allowInvalidHost = profile.effectiveAllowInvalidHostnames()
+        val allowInvalidCerts = profile.effectiveAllowInvalidCertificates()
+        val needsCustomSsl = MongoSslHelper.needsCustomSslContext(
+            caFilePath = profile.tlsCaFilePath,
+            clientCertFilePath = profile.tlsClientCertFilePath,
+            allowInvalidCerts = allowInvalidCerts
+        )
+
+        if (tlsActive || needsCustomSsl || allowInvalidHost) {
+            val customContext = if (needsCustomSsl) {
+                MongoSslHelper.buildSslContext(
+                    caFilePath = profile.tlsCaFilePath,
+                    clientCertFilePath = profile.tlsClientCertFilePath,
+                    allowInvalidCerts = allowInvalidCerts,
+                    projectBasePath = projectBasePath
+                )
+            } else {
+                null
+            }
+            builder.applyToSslSettings { ssl ->
+                ssl.enabled(true)
+                if (allowInvalidHost) {
+                    ssl.invalidHostNameAllowed(true)
+                }
+                if (customContext != null) {
+                    ssl.context(customContext)
+                }
+            }
+        }
+
+        return builder.build()
     }
 
     /**
@@ -1228,7 +1281,7 @@ class MongoConnectionManager(project: Project) : Disposable {
         if (!disposed.compareAndSet(false, true)) return
         val snapshot = clients.values.toList()
         clients.clear()
-        clientUris.clear()
+        clientFingerprints.clear()
         unlockedReadOnlyProfiles.clear()
         indexCache.clear()
         estimatedCountCache.clear()

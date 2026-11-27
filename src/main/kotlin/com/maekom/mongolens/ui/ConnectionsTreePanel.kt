@@ -19,7 +19,9 @@ import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.treeStructure.Tree
 import com.intellij.util.ui.JBUI
+import com.maekom.mongolens.config.ConnectionColorTag
 import com.maekom.mongolens.config.MongoConnectionProfile
+import com.maekom.mongolens.config.MongoUriHelper
 import com.maekom.mongolens.config.ProfileSource
 import com.maekom.mongolens.i18n.I18n
 import com.maekom.mongolens.mongo.MongoConnectionManager
@@ -30,6 +32,7 @@ import java.awt.event.KeyAdapter
 import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import java.nio.file.Path
 import javax.swing.BorderFactory
 import javax.swing.DefaultComboBoxModel
 import javax.swing.Icon
@@ -45,6 +48,7 @@ import javax.swing.tree.TreePath
 
 class ConnectionsTreePanel(
     private val project: Project,
+    private val projectBasePath: Path?,
     private val connectionManager: MongoConnectionManager,
     parentDisposable: Disposable,
     private val onStatusUpdate: (String, Boolean) -> Unit,
@@ -55,7 +59,7 @@ class ConnectionsTreePanel(
     private val onOpenAggTab: (MongoConnectionProfile, String, String) -> Unit,
     private val onOpenShellTab: (MongoConnectionProfile, String, String) -> Unit,
     private val onInspectIndexes: (MongoConnectionProfile, String, String) -> Unit,
-    private val onEditCustomProfile: (MongoConnectionProfile) -> Unit,
+    private val onOpenConnectionSettings: (MongoConnectionProfile) -> Unit,
     private val onDeleteCustomProfile: (MongoConnectionProfile) -> Unit
 ) : JPanel(BorderLayout()) {
 
@@ -134,9 +138,24 @@ class ConnectionsTreePanel(
                     is TreeNodeData.ProfileNode -> {
                         val p = data.profile
                         icon = if (p.source == ProfileSource.CUSTOM) AllIcons.Nodes.WebFolder else AllIcons.Nodes.DataTables
+                        val tagColor = p.colorTag.fgColor()
+                        if (p.colorTag != ConnectionColorTag.NONE && tagColor != null) {
+                            append("● ", SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, tagColor))
+                        }
                         append(p.displayName, SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)
                         val srcTag = if (p.source == ProfileSource.YAML) " [YAML]" else " [Custom]"
                         append(srcTag, SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                        if (p.colorTag != ConnectionColorTag.NONE && tagColor != null) {
+                            val shortEnv = when (p.colorTag) {
+                                ConnectionColorTag.GREEN -> "Dev"
+                                ConnectionColorTag.ORANGE -> "Stg"
+                                ConnectionColorTag.RED -> "Prod"
+                                ConnectionColorTag.NONE -> ""
+                            }
+                            if (shortEnv.isNotEmpty()) {
+                                append(" [$shortEnv]", SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, tagColor))
+                            }
+                        }
                         if (p.readOnly) {
                             if (connectionManager.isEffectivelyReadOnly(p)) {
                                 append(
@@ -517,7 +536,34 @@ class ConnectionsTreePanel(
             }
             is TreeNodeData.ProfileNode -> {
                 val profile = data.profile
+                // 1. Connection Settings / View URI (both YAML & Custom)
+                group.add(popupAction(I18n.t("tree.ctx.connectionSettings"), AllIcons.General.Settings) {
+                    onOpenConnectionSettings(profile)
+                })
+
+                // 2. Copy Connection String / CLI Submenu
+                val copyGroup = DefaultActionGroup(I18n.t("tree.ctx.copyUriMenu"), true).apply {
+                    templatePresentation.icon = AllIcons.Actions.Copy
+                    add(popupAction(I18n.t("tree.ctx.copyFullUri"), AllIcons.Actions.Copy) {
+                        UiHelpers.copyToClipboard(profile.effectiveConnectionUri())
+                        UiHelpers.notify(project, I18n.t("tree.ctx.copiedFullUri"))
+                    })
+                    add(popupAction(I18n.t("tree.ctx.copyMaskedUri"), AllIcons.Actions.ToggleVisibility) {
+                        UiHelpers.copyToClipboard(MongoUriHelper.maskPasswordInUri(profile.effectiveConnectionUri()))
+                        UiHelpers.notify(project, I18n.t("tree.ctx.copiedMaskedUri"))
+                    })
+                    add(popupAction(I18n.t("tree.ctx.copyMongoshCli"), AllIcons.Nodes.Console) {
+                        UiHelpers.copyToClipboard(profile.buildMongoshCliCommand(projectBasePath))
+                        UiHelpers.notify(project, I18n.t("tree.ctx.copiedMongoshCli"))
+                    })
+                }
+                group.add(copyGroup)
+
+                group.addSeparator()
+
+                // 3. Reconnect & Refresh (closes cached MongoClient immediately)
                 group.add(popupAction(I18n.t("tree.ctx.reconnect"), AllIcons.Actions.Refresh) {
+                    connectionManager.closeClient(profile.id)
                     data.loaded = false
                     node.removeAllChildren()
                     node.add(DefaultMutableTreeNode(TreeNodeData.PlaceholderNode(I18n.t("tree.loading"))))
@@ -525,6 +571,7 @@ class ConnectionsTreePanel(
                     loadDatabasesForProfile(node, data)
                     tree.expandPath(TreePath(node.path))
                 })
+
                 if (profile.readOnly) {
                     group.addSeparator()
                     if (connectionManager.isEffectivelyReadOnly(profile)) {
@@ -551,9 +598,6 @@ class ConnectionsTreePanel(
                 }
                 if (profile.source == ProfileSource.CUSTOM) {
                     group.addSeparator()
-                    group.add(popupAction(I18n.t("tree.ctx.editCustom"), AllIcons.Actions.Edit) {
-                        onEditCustomProfile(profile)
-                    })
                     group.add(popupAction(I18n.t("tree.ctx.deleteCustom"), AllIcons.General.Remove) {
                         val confirm = Messages.showYesNoDialog(
                             project,

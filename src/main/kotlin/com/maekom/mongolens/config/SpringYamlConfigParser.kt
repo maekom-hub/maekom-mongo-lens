@@ -20,10 +20,13 @@ class SpringYamlConfigParser {
         var database: String? = null,
         var username: String? = null,
         var password: String? = null,
-        var authDatabase: String? = null
+        var authDatabase: String? = null,
+        var sslEnabled: Boolean? = null,
+        var replicaSetName: String? = null
     ) {
         fun hasAny(): Boolean =
-            uri != null || host != null || database != null || username != null || password != null || port != null || authDatabase != null
+            uri != null || host != null || database != null || username != null || password != null ||
+                port != null || authDatabase != null || sslEnabled != null || replicaSetName != null
 
         fun hasConnectionTarget(): Boolean =
             !uri.isNullOrBlank() || !host.isNullOrBlank() || !database.isNullOrBlank()
@@ -36,7 +39,9 @@ class SpringYamlConfigParser {
                 database = override.database ?: this.database,
                 username = override.username ?: this.username,
                 password = override.password ?: this.password,
-                authDatabase = override.authDatabase ?: this.authDatabase
+                authDatabase = override.authDatabase ?: this.authDatabase,
+                sslEnabled = override.sslEnabled ?: this.sslEnabled,
+                replicaSetName = override.replicaSetName ?: this.replicaSetName
             )
         }
     }
@@ -154,7 +159,9 @@ class SpringYamlConfigParser {
             authDatabase = props.authDatabase,
             sourceFilePath = sourceFile.toAbsolutePath().toString(),
             moduleName = moduleName,
-            readOnly = MongoConnectionProfile.isProductionProfile(profileName, sourceFile.toString())
+            readOnly = MongoConnectionProfile.isProductionProfile(profileName, sourceFile.toString()),
+            tlsEnabled = props.sslEnabled == true,
+            replicaSet = props.replicaSetName
         )
     }
 
@@ -226,6 +233,9 @@ class SpringYamlConfigParser {
         val portStr = str("spring.data.mongodb.port")
         val portInt = portStr?.toIntOrNull()
 
+        val sslEnabledStr = str("spring.data.mongodb.ssl.enabled")
+        val sslEnabledBool = sslEnabledStr?.let { it.equals("true", ignoreCase = true) }
+
         return MongoProps(
             uri = str("spring.data.mongodb.uri"),
             host = str("spring.data.mongodb.host"),
@@ -236,6 +246,11 @@ class SpringYamlConfigParser {
             authDatabase = str(
                 "spring.data.mongodb.authentication-database",
                 "spring.data.mongodb.authenticationDatabase"
+            ),
+            sslEnabled = sslEnabledBool,
+            replicaSetName = str(
+                "spring.data.mongodb.replica-set-name",
+                "spring.data.mongodb.replicaSetName"
             )
         )
     }

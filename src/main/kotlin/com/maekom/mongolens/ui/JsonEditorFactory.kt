@@ -1,5 +1,8 @@
 package com.maekom.mongolens.ui
 
+import com.intellij.openapi.actionSystem.ActionUpdateThread
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.CustomShortcutSet
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.editor.EditorFactory
@@ -9,6 +12,7 @@ import com.intellij.openapi.editor.ex.EditorEx
 import com.intellij.openapi.fileTypes.FileType
 import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.fileTypes.PlainTextFileType
+import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.popup.JBPopup
 import com.intellij.openapi.ui.popup.JBPopupFactory
@@ -34,6 +38,7 @@ import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.DefaultListModel
 import javax.swing.JList
+import javax.swing.KeyStroke
 import javax.swing.ListSelectionModel
 import javax.swing.ScrollPaneConstants
 
@@ -91,7 +96,9 @@ class MongoJsonEditor(
     private var suppressAutoPopup = false
     private var suppressReopenUntilNextTyping = false
     private var swallowNextControlCharTyped = false
+    private var activePrefixStartOffset: Int = -1
     private var activePopupKeyDispatcher: KeyEventDispatcher? = null
+    private var savedFocusTraversalKeysEnabled: Boolean? = null
     private val baseSingleLineHeight: Int = JBUI.scale(32)
     private var currentHeightPx: Int = baseSingleLineHeight
 
@@ -213,6 +220,10 @@ class MongoJsonEditor(
             }
         })
 
+        // Register highest-priority component-scoped AnActions on editor.contentComponent so
+        // IdeKeyEventDispatcher intercepts Up/Down/Enter/Tab/Escape BEFORE EditorEnter/EditorTab/EditorUp/EditorDown!
+        registerPopupEditorActions(editor)
+
         // Fallback key listener for shortcuts when popup is closed & auto-pair closing
         editor.contentComponent.addKeyListener(object : KeyAdapter() {
             override fun keyPressed(e: KeyEvent) {
@@ -310,14 +321,66 @@ class MongoJsonEditor(
     }
 
     /**
-     * Installs a high-priority KeyEventDispatcher ONLY while the completion popup is visible.
-     * Intercepts Up/Down/Enter/Tab/Escape BEFORE IntelliJ Editor actions and Swing Tab focus traversal,
-     * and automatically detaches on popup close so normal shortcuts are 100% untouched when closed.
+     * Registers component-scoped DumbAwareActions on `editor.contentComponent`.
+     * Because IdeKeyEventDispatcher checks component shortcuts BEFORE global EditorEnter/EditorTab/EditorUp/EditorDown
+     * actions, pressing Enter or Tab when the popup is visible NEVER inserts a newline or tab first!
+     */
+    private fun registerPopupEditorActions(editor: EditorEx) {
+        fun registerKey(keyCode: Int, action: () -> Unit) {
+            val anAction = object : DumbAwareAction() {
+                override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+                override fun update(e: AnActionEvent) {
+                    e.presentation.isEnabled = !editor.isDisposed && isCompletionPopupActive()
+                }
+                override fun actionPerformed(e: AnActionEvent) {
+                    if (!editor.isDisposed && isCompletionPopupActive()) {
+                        action()
+                    }
+                }
+            }
+            anAction.registerCustomShortcutSet(CustomShortcutSet(KeyStroke.getKeyStroke(keyCode, 0)), editor.contentComponent)
+        }
+
+        registerKey(KeyEvent.VK_DOWN) { moveSelection(+1) }
+        registerKey(KeyEvent.VK_UP) { moveSelection(-1) }
+        registerKey(KeyEvent.VK_ENTER) {
+            swallowNextControlCharTyped = true
+            acceptSelectedCompletion(editor)
+        }
+        registerKey(KeyEvent.VK_TAB) {
+            swallowNextControlCharTyped = true
+            acceptSelectedCompletion(editor)
+        }
+        registerKey(KeyEvent.VK_ESCAPE) {
+            swallowNextControlCharTyped = true
+            dismissPopup()
+        }
+    }
+
+    private fun moveSelection(delta: Int) {
+        val count = listModel.size()
+        if (count <= 0) return
+        val cur = suggestionList.selectedIndex
+        val next = when {
+            delta > 0 -> if (cur < 0 || cur >= count - 1) 0 else cur + 1
+            else -> if (cur <= 0) count - 1 else cur - 1
+        }
+        suggestionList.selectedIndex = next
+        suggestionList.ensureIndexIsVisible(next)
+    }
+
+    /**
+     * Secondary guard attached ONLY while the completion popup is visible:
+     * prevents Swing's FocusManager from stealing Tab and swallows residual control KEY_TYPED events.
      */
     private fun installPopupKeyDispatcher(editor: EditorEx) {
         removePopupKeyDispatcher()
+        if (savedFocusTraversalKeysEnabled == null && !editor.isDisposed) {
+            savedFocusTraversalKeysEnabled = editor.contentComponent.focusTraversalKeysEnabled
+            editor.contentComponent.focusTraversalKeysEnabled = false
+        }
         val dispatcher = KeyEventDispatcher { e ->
-            if (editor.isDisposed || !editor.contentComponent.isFocusOwner || !isCompletionPopupActive()) {
+            if (editor.isDisposed || !editor.contentComponent.isFocusOwner) {
                 return@KeyEventDispatcher false
             }
 
@@ -331,34 +394,24 @@ class MongoJsonEditor(
                 return@KeyEventDispatcher false
             }
 
-            if (e.id != KeyEvent.KEY_PRESSED) {
+            if (!isCompletionPopupActive() || e.id != KeyEvent.KEY_PRESSED) {
                 return@KeyEventDispatcher false
             }
 
             val isCtrlOrMeta = (e.modifiersEx and (InputEvent.CTRL_DOWN_MASK or InputEvent.META_DOWN_MASK)) != 0
-            val count = listModel.size()
-            if (count <= 0) return@KeyEventDispatcher false
-
             when (e.keyCode) {
                 KeyEvent.VK_DOWN -> {
-                    val cur = suggestionList.selectedIndex
-                    val next = if (cur < 0 || cur >= count - 1) 0 else cur + 1
-                    suggestionList.selectedIndex = next
-                    suggestionList.ensureIndexIsVisible(next)
+                    moveSelection(+1)
                     e.consume()
                     true
                 }
                 KeyEvent.VK_UP -> {
-                    val cur = suggestionList.selectedIndex
-                    val prev = if (cur <= 0) count - 1 else cur - 1
-                    suggestionList.selectedIndex = prev
-                    suggestionList.ensureIndexIsVisible(prev)
+                    moveSelection(-1)
                     e.consume()
                     true
                 }
                 KeyEvent.VK_ENTER -> {
                     if (isCtrlOrMeta) {
-                        // Ctrl+Enter / Cmd+Enter still executes query directly
                         dismissPopup()
                         e.consume()
                         onExecuteShortcut?.invoke()
@@ -394,6 +447,10 @@ class MongoJsonEditor(
             KeyboardFocusManager.getCurrentKeyboardFocusManager().removeKeyEventDispatcher(disp)
         }
         activePopupKeyDispatcher = null
+        savedFocusTraversalKeysEnabled?.let { prev ->
+            (editor as? EditorEx)?.takeIf { !it.isDisposed }?.contentComponent?.focusTraversalKeysEnabled = prev
+        }
+        savedFocusTraversalKeysEnabled = null
         swallowNextControlCharTyped = false
     }
 
@@ -488,6 +545,13 @@ class MongoJsonEditor(
             return
         }
 
+        // Remember exact prefix start offset (including opening quote if present) for clean single-line replacement
+        var prefixStart = tokenInfo.tokenStart
+        if (prefixStart > 0 && text[prefixStart - 1] == '"') {
+            prefixStart--
+        }
+        activePrefixStartOffset = prefixStart
+
         listModel.clear()
         candidates.take(25).forEach { listModel.addElement(it) }
         suggestionList.selectedIndex = 0
@@ -557,6 +621,7 @@ class MongoJsonEditor(
 
     private fun acceptSelectedCompletion(editor: EditorEx) {
         val selected = suggestionList.selectedValue ?: return
+        val capturedPrefixStart = activePrefixStartOffset
         dismissPopup()
 
         if (projectRef.isDisposed || editor.isDisposed) return
@@ -570,6 +635,13 @@ class MongoJsonEditor(
 
         if (replaceStart > 0 && text[replaceStart - 1] == '"') {
             replaceStart--
+        }
+        // Prefer the captured prefixStartOffset when valid and on the same token span (e.g. `{cr}` -> `{"created_at": }`)
+        if (capturedPrefixStart in 0..offset) {
+            val spanBetween = text.substring(capturedPrefixStart, offset)
+            if (!spanBetween.contains('\n') && !spanBetween.contains('{') && !spanBetween.contains('}') && !spanBetween.contains(',')) {
+                replaceStart = minOf(replaceStart, capturedPrefixStart)
+            }
         }
         if (replaceEnd < text.length && text[replaceEnd] == '"') {
             replaceEnd++
@@ -681,6 +753,7 @@ class MongoJsonEditor(
 
     fun dismissPopup() {
         removePopupKeyDispatcher()
+        activePrefixStartOffset = -1
         activePopup?.let {
             if (!it.isDisposed) it.cancel()
         }

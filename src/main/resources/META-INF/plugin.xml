@@ -15,6 +15,12 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>v0.2.6</h3>
+        <ul>
+            <li><b>MongoDB Compass-Style 4-Tab Connection Settings &amp; Bidirectional URI Sync:</b> Redesigned connection configuration into 4 tabs (<code>General</code>, <code>Authentication</code>, <code>TLS/SSL</code>, <code>Advanced</code>) with live two-way MongoDB URI sync (RFC-3986 credential encoding, <code>mongodb+srv</code> rules, lossless extra query parameter table), IntelliJ <code>PasswordSafe</code> credential storage, AWS DocumentDB <code>global-bundle.pem</code> multi-CA &amp; client certificate SSLContext support, environment color tags (Dev/Stg/Prod), and non-blocking async <code>Test Connection</code>.</li>
+            <li><b>Enhanced Connections Tree Context Menu (YAML &amp; Custom):</b> Added IntelliJ New UI native actions for <code>Connection Settings / View URI...</code> (including read-only YAML inspection with <code>[Clone to Custom Connection &amp; Edit...]</code> and <code>[Open Source YAML File]</code>), <code>Copy Connection String / CLI</code> submenu (Full URI, Masked URI, ready-to-run <code>mongosh</code> CLI with TLS/DocumentDB flags), instant client invalidation on <code>Reconnect &amp; Refresh</code>, and visual environment color tags on both tree nodes and workspace tabs.</li>
+            <li><b>v0.2.5 UX Bug Fixes:</b> Fixed <code>JoinViewDialog</code> join-key list dynamically expanding dialog height up to 3 rows (scrolling for 4+) and removed duplicate <code>+</code> text prefixes on icon buttons; fixed <code>Filter</code>/<code>Sort</code>/<code>Project</code> autocomplete <code>Enter</code> completion leaving newline prefix residue (e.g. <code>{cr}</code>).</li>
+        </ul>
         <h3>v0.2.5</h3>
         <ul>
             <li><b>Composite Join Keys (Multi-Key AND Matching) &amp; Auto-Match Common Keys:</b> Added dynamic 1..N join key mapping rows in <code>JoinViewDialog</code> with <code>[+ Add Join Condition]</code> and <code>[Auto-Match Common Keys]</code> (appends matching fields without overwriting existing rows).</li>

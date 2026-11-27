@@ -110,6 +110,7 @@ class MongoLensMainPanel(
 
         connectionsTree = ConnectionsTreePanel(
             project = project,
+            projectBasePath = projectBasePath,
             connectionManager = connectionManager,
             parentDisposable = this,
             onStatusUpdate = { text, _ -> setStatus(text) },
@@ -120,7 +121,7 @@ class MongoLensMainPanel(
                     setStatus(I18n.t("header.status.readOnly"))
                 }
             },
-            onAddCustomUri = { openCustomUriDialog(null) },
+            onAddCustomUri = { openConnectionSettingsDialog(null) },
             onOpenFindTab = { profile, db, coll, forceNew ->
                 if (forceNew) {
                     tabManager.openNewClonedTab(profile, db, coll, CollectionWorkspaceTab.WorkspaceMode.FIND)
@@ -147,7 +148,7 @@ class MongoLensMainPanel(
                     }
                 ).show()
             },
-            onEditCustomProfile = { existing -> openCustomUriDialog(existing) },
+            onOpenConnectionSettings = { existing -> openConnectionSettingsDialog(existing) },
             onDeleteCustomProfile = { existing ->
                 connectionManager.closeClient(existing.id)
                 customStore.delete(existing.id)
@@ -191,7 +192,7 @@ class MongoLensMainPanel(
 
     /**
      * Simplified native ToolWindow title bar actions: ONLY 2 items:
-     * 1. Version & Connection Status ("v0.2.5 · 연결됨 (126ms)")
+     * 1. Version & Connection Status ("v0.2.6 · 연결됨 (126ms)")
      * 2. [⚙ 설정 / Settings] popup group (Decrypt Config, Check/Install Update, Language Switch)
      */
     fun createTitleActions(): List<AnAction> {
@@ -317,7 +318,18 @@ class MongoLensMainPanel(
     fun reloadProfilesAsync() {
         object : Task.Backgroundable(project, "Scanning Spring YAML MongoDB configs...", true) {
             override fun run(indicator: ProgressIndicator) {
-                val yamlProfiles = yamlParser.scanProject(projectBasePath)
+                val yamlMetaOverrides = customStore.loadYamlMetaOverrides()
+                val yamlProfiles = yamlParser.scanProject(projectBasePath).map { p ->
+                    val meta = yamlMetaOverrides[p.id]
+                    if (meta != null) {
+                        p.copy(
+                            colorTag = meta.colorTag,
+                            readOnly = meta.readOnlyOverride ?: p.readOnly
+                        )
+                    } else {
+                        p
+                    }
+                }
                 val customProfiles = customStore.loadAll()
                 val merged = yamlProfiles + customProfiles
 
@@ -335,13 +347,36 @@ class MongoLensMainPanel(
         }.queue()
     }
 
-    private fun openCustomUriDialog(existing: MongoConnectionProfile?) {
-        val dlg = CustomUriDialog(project, connectionManager, existing)
+    private fun openConnectionSettingsDialog(existing: MongoConnectionProfile?) {
+        val dlg = CustomUriDialog(
+            project = project,
+            projectBasePath = projectBasePath,
+            connectionManager = connectionManager,
+            existing = existing,
+            onCloneYamlToCustom = { cloned ->
+                customStore.upsert(cloned)
+                reloadProfilesAsync()
+                ApplicationManager.getApplication().invokeLater {
+                    if (!project.isDisposed) {
+                        openConnectionSettingsDialog(cloned)
+                    }
+                }
+            }
+        )
         if (dlg.showAndGet()) {
-            val saved = dlg.buildProfile()
-            customStore.upsert(saved)
-            connectionManager.closeClient(saved.id)
-            reloadProfilesAsync()
+            if (dlg.isYamlReadOnly && existing != null) {
+                customStore.saveYamlMetaOverride(
+                    profileId = existing.id,
+                    colorTag = dlg.selectedColorTag(),
+                    readOnlyOverride = dlg.selectedReadOnly()
+                )
+                reloadProfilesAsync()
+            } else {
+                val saved = dlg.buildProfile()
+                customStore.upsert(saved)
+                connectionManager.closeClient(saved.id)
+                reloadProfilesAsync()
+            }
         }
     }
 
