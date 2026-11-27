@@ -155,13 +155,86 @@ class JoinViewDialog(
     private val schemaRequestSeq = AtomicLong(0L)
     private var suppressEditorEvents = false
 
-    // Top bar: [ ① <target1> ] [ ② <target2> ] ... [+ 조인 추가]  |  [이 조인 삭제]
-    private val targetTabsPanel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
-    private val addJoinBtn = JButton(I18n.t("join.dialog.addJoinTarget"), AllIcons.General.Add).apply {
-        margin = JBUI.insets(2, 8)
+    // Top bar: [ ① <target1> (×) ] [ ② <target2> (×) ] ... (horizontal scroll)  [+]
+    private val targetTabsPanel = JPanel(FlowLayout(FlowLayout.LEFT, 5, 2)).apply {
+        isOpaque = false
     }
-    private val removeJoinBtn = JButton(I18n.t("join.dialog.removeJoinTarget"), AllIcons.General.Remove).apply {
-        margin = JBUI.insets(2, 8)
+    private val targetTabsScrollPane = JBScrollPane(
+        targetTabsPanel,
+        ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER,
+        ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED
+    ).apply {
+        border = JBUI.Borders.empty()
+        viewportBorder = JBUI.Borders.empty()
+        isOpaque = false
+        viewport.isOpaque = false
+        preferredSize = Dimension(JBUI.scale(680), JBUI.scale(34))
+        minimumSize = Dimension(JBUI.scale(260), JBUI.scale(34))
+    }
+
+    private val addJoinBtn = object : JButton() {
+        private var hovered = false
+        private var pressed = false
+
+        init {
+            isContentAreaFilled = false
+            isBorderPainted = false
+            isFocusPainted = false
+            isOpaque = false
+            cursor = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR)
+            toolTipText = I18n.t("join.dialog.addJoinTargetTooltip")
+            preferredSize = Dimension(JBUI.scale(28), JBUI.scale(26))
+            minimumSize = Dimension(JBUI.scale(28), JBUI.scale(26))
+            maximumSize = Dimension(JBUI.scale(28), JBUI.scale(26))
+            addMouseListener(object : java.awt.event.MouseAdapter() {
+                override fun mouseEntered(e: java.awt.event.MouseEvent?) {
+                    hovered = true
+                    repaint()
+                }
+                override fun mouseExited(e: java.awt.event.MouseEvent?) {
+                    hovered = false
+                    pressed = false
+                    repaint()
+                }
+                override fun mousePressed(e: java.awt.event.MouseEvent?) {
+                    pressed = true
+                    repaint()
+                }
+                override fun mouseReleased(e: java.awt.event.MouseEvent?) {
+                    pressed = false
+                    repaint()
+                }
+            })
+        }
+
+        override fun paintComponent(g: java.awt.Graphics) {
+            val g2 = g.create() as java.awt.Graphics2D
+            try {
+                g2.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING, java.awt.RenderingHints.VALUE_ANTIALIAS_ON)
+                g2.color = when {
+                    pressed -> JBColor(java.awt.Color(0x1B5E20), java.awt.Color(0x215526))
+                    hovered -> JBColor(java.awt.Color(0x388E3C), java.awt.Color(0x357A3B))
+                    else -> JBColor(java.awt.Color(0x2E7D32), java.awt.Color(0x2B6A30))
+                }
+                val arc = JBUI.scale(6)
+                g2.fillRoundRect(0, 0, width, height, arc, arc)
+
+                // Draw crisp white '+' vector
+                g2.color = java.awt.Color.WHITE
+                g2.stroke = java.awt.BasicStroke(
+                    JBUI.scale(2).toFloat().coerceAtLeast(1.8f),
+                    java.awt.BasicStroke.CAP_ROUND,
+                    java.awt.BasicStroke.JOIN_ROUND
+                )
+                val cx = width / 2
+                val cy = height / 2
+                val arm = JBUI.scale(5)
+                g2.drawLine(cx - arm, cy, cx + arm, cy)
+                g2.drawLine(cx, cy - arm, cx, cy + arm)
+            } finally {
+                g2.dispose()
+            }
+        }
     }
     private val multiUnwindWarningLabel = UiHelpers.createBadgeLabel(
         "⚠ ${I18n.t("join.dialog.multiUnwindWarning")}",
@@ -759,43 +832,6 @@ class JoinViewDialog(
             adjustDialogSizeDynamically(initialOpen = false)
         }
 
-        removeJoinBtn.addActionListener {
-            if (targetDrafts.size <= 1) return@addActionListener
-            flushActiveTargetToDraft()
-            val removedIdx = activeTargetIdx
-            targetDrafts.removeAt(removedIdx)
-
-            // Re-index any subsequent target referencing an earlier join target
-            for (i in removedIdx until targetDrafts.size) {
-                val d = targetDrafts[i]
-                d.keyPairs = d.keyPairs.map { pair ->
-                    val ref = pair.sourceRef
-                    if (ref is JoinSourceRef.PreviousTarget) {
-                        when {
-                            ref.targetIndex == removedIdx -> pair.copy(
-                                sourceRef = JoinSourceRef.Base,
-                                localField = leftFields.firstOrNull() ?: "_id"
-                            )
-                            ref.targetIndex > removedIdx -> pair.copy(
-                                sourceRef = JoinSourceRef.PreviousTarget(ref.targetIndex - 1)
-                            )
-                            else -> pair
-                        }
-                    } else {
-                        pair
-                    }
-                }.toMutableList()
-            }
-
-            activeTargetIdx = (removedIdx - 1).coerceAtLeast(0)
-            rebuildTargetTabsBar()
-            loadActiveDraftIntoEditor(triggerSchemaFetch = false)
-            rebuildAllColumnCheckboxPanels()
-            updateMultiUnwindWarning()
-            updateCompositeInfoBanner()
-            adjustDialogSizeDynamically(initialOpen = false)
-        }
-
         targetCollectionCombo.addActionListener {
             if (suppressEditorEvents) return@addActionListener
             val target = currentTargetCollectionName()
@@ -1006,34 +1042,151 @@ class JoinViewDialog(
         }
     }
 
-    private fun rebuildTargetTabsBar() {
-        targetTabsPanel.removeAll()
-        val circledNums = arrayOf("①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩")
-        targetDrafts.forEachIndexed { idx, draft ->
-            val num = circledNums.getOrElse(idx) { "#${idx + 1}" }
-            val btn = JToggleButton("$num ${draft.targetCollection}", idx == activeTargetIdx).apply {
-                margin = JBUI.insets(2, 8)
-                if (idx == activeTargetIdx) {
-                    font = font.deriveFont(Font.BOLD)
-                }
-                addActionListener {
-                    if (idx == activeTargetIdx) {
-                        isSelected = true
-                        return@addActionListener
+    private fun removeJoinTargetAt(removedIdx: Int) {
+        if (targetDrafts.size <= 1 || removedIdx !in targetDrafts.indices) return
+        flushActiveTargetToDraft()
+        targetDrafts.removeAt(removedIdx)
+
+        // Re-index any subsequent target referencing an earlier join target
+        for (i in removedIdx until targetDrafts.size) {
+            val d = targetDrafts[i]
+            d.keyPairs = d.keyPairs.map { pair ->
+                val ref = pair.sourceRef
+                if (ref is JoinSourceRef.PreviousTarget) {
+                    when {
+                        ref.targetIndex == removedIdx -> pair.copy(
+                            sourceRef = JoinSourceRef.Base,
+                            localField = leftFields.firstOrNull() ?: "_id"
+                        )
+                        ref.targetIndex > removedIdx -> pair.copy(
+                            sourceRef = JoinSourceRef.PreviousTarget(ref.targetIndex - 1)
+                        )
+                        else -> pair
                     }
+                } else {
+                    pair
+                }
+            }.toMutableList()
+        }
+
+        activeTargetIdx = when {
+            activeTargetIdx > removedIdx -> (activeTargetIdx - 1).coerceAtLeast(0)
+            activeTargetIdx >= targetDrafts.size -> (targetDrafts.size - 1).coerceAtLeast(0)
+            else -> activeTargetIdx
+        }
+
+        rebuildTargetTabsBar()
+        loadActiveDraftIntoEditor(triggerSchemaFetch = false)
+        rebuildAllColumnCheckboxPanels()
+        updateMultiUnwindWarning()
+        updateCompositeInfoBanner()
+        adjustDialogSizeDynamically(initialOpen = false)
+    }
+
+    private fun createTargetTabChip(idx: Int, labelText: String, isActive: Boolean, showClose: Boolean): JPanel {
+        val chip = object : JPanel(BorderLayout(4, 0)) {
+            private var hovered = false
+
+            init {
+                isOpaque = false
+                border = JBUI.Borders.empty(3, 9, 3, if (showClose) 5 else 9)
+            }
+
+            fun setHovered(h: Boolean) {
+                if (hovered != h) {
+                    hovered = h
+                    repaint()
+                }
+            }
+
+            override fun paintComponent(g: java.awt.Graphics) {
+                val g2 = g.create() as java.awt.Graphics2D
+                try {
+                    g2.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING, java.awt.RenderingHints.VALUE_ANTIALIAS_ON)
+                    val arc = JBUI.scale(7)
+                    g2.color = when {
+                        isActive -> JBColor(java.awt.Color(0xD8E8FC), java.awt.Color(0x2E436E))
+                        hovered -> JBColor(java.awt.Color(0xE8ECF2), java.awt.Color(0x41444A))
+                        else -> JBColor(java.awt.Color(0xF2F3F5), java.awt.Color(0x35373B))
+                    }
+                    g2.fillRoundRect(0, 0, width - 1, height - 1, arc, arc)
+
+                    g2.color = if (isActive) {
+                        JBUI.CurrentTheme.Focus.focusColor()
+                    } else {
+                        JBColor.border()
+                    }
+                    g2.stroke = java.awt.BasicStroke(if (isActive) 1.5f else 1f)
+                    g2.drawRoundRect(0, 0, width - 1, height - 1, arc, arc)
+                } finally {
+                    g2.dispose()
+                }
+                super.paintComponent(g)
+            }
+        }
+
+        val selectLabel = JBLabel(labelText).apply {
+            cursor = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR)
+            font = font.deriveFont(if (isActive) Font.BOLD else Font.PLAIN)
+            foreground = if (isActive) JBUI.CurrentTheme.Label.foreground() else JBUI.CurrentTheme.ContextHelp.FOREGROUND
+            addMouseListener(object : java.awt.event.MouseAdapter() {
+                override fun mouseEntered(e: java.awt.event.MouseEvent?) = chip.setHovered(true)
+                override fun mouseExited(e: java.awt.event.MouseEvent?) = chip.setHovered(false)
+                override fun mousePressed(e: java.awt.event.MouseEvent?) {
+                    if (!SwingUtilities.isLeftMouseButton(e)) return
+                    if (idx == activeTargetIdx) return
                     flushActiveTargetToDraft()
                     activeTargetIdx = idx
                     rebuildTargetTabsBar()
                     loadActiveDraftIntoEditor(triggerSchemaFetch = !targetDrafts[idx].schemaLoaded)
                     updateMultiUnwindWarning()
                 }
-            }
-            targetTabsPanel.add(btn)
+            })
         }
-        targetTabsPanel.add(addJoinBtn)
-        removeJoinBtn.isEnabled = targetDrafts.size > 1
+        chip.add(selectLabel, BorderLayout.CENTER)
+
+        val closeBtn = JButton(AllIcons.Actions.Close).apply {
+            rolloverIcon = AllIcons.Actions.CloseHovered
+            pressedIcon = AllIcons.Actions.CloseHovered
+            isContentAreaFilled = false
+            isBorderPainted = false
+            isFocusPainted = false
+            isOpaque = false
+            isVisible = showClose
+            cursor = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR)
+            toolTipText = I18n.t("join.dialog.removeJoinTarget")
+            preferredSize = Dimension(JBUI.scale(16), JBUI.scale(16))
+            minimumSize = Dimension(JBUI.scale(16), JBUI.scale(16))
+            margin = JBUI.emptyInsets()
+            addActionListener {
+                removeJoinTargetAt(idx)
+            }
+        }
+        if (showClose) {
+            chip.add(closeBtn, BorderLayout.EAST)
+        }
+        return chip
+    }
+
+    private fun rebuildTargetTabsBar() {
+        targetTabsPanel.removeAll()
+        val circledNums = arrayOf("①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩")
+        val showClose = targetDrafts.size > 1
+        targetDrafts.forEachIndexed { idx, draft ->
+            val num = circledNums.getOrElse(idx) { "#${idx + 1}" }
+            targetTabsPanel.add(
+                createTargetTabChip(
+                    idx = idx,
+                    labelText = "$num ${draft.targetCollection}",
+                    isActive = idx == activeTargetIdx,
+                    showClose = showClose
+                )
+            )
+        }
         targetTabsPanel.revalidate()
         targetTabsPanel.repaint()
+        targetTabsScrollPane.revalidate()
+        targetTabsScrollPane.repaint()
     }
 
     private fun loadActiveDraftIntoEditor(triggerSchemaFetch: Boolean) {
@@ -1450,10 +1603,14 @@ class JoinViewDialog(
     }
 
     override fun createCenterPanel(): JComponent {
-        // 1. Multi-Join Target Tab Bar + Remove button + Multi-1:N warning
+        // 1. Multi-Join Target Tab Bar (horizontally scrollable chips with conditional '×' + green '+' icon button)
+        val addBtnWrapper = JPanel(FlowLayout(FlowLayout.LEFT, 2, 4)).apply {
+            isOpaque = false
+            add(addJoinBtn)
+        }
         val tabBarRow = JPanel(BorderLayout(6, 0)).apply {
-            add(targetTabsPanel, BorderLayout.CENTER)
-            add(removeJoinBtn, BorderLayout.EAST)
+            add(targetTabsScrollPane, BorderLayout.CENTER)
+            add(addBtnWrapper, BorderLayout.EAST)
         }
         val topHeaderStack = JPanel(BorderLayout(0, 4)).apply {
             add(tabBarRow, BorderLayout.NORTH)

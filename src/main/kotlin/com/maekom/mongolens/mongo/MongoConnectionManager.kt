@@ -92,7 +92,24 @@ class MongoConnectionManager(project: Project) : Disposable {
     private val unlockedReadOnlyProfiles = ConcurrentHashMap.newKeySet<String>()
     private val indexCache = ConcurrentHashMap<String, CachedIndexEntry>()
     private val estimatedCountCache = ConcurrentHashMap<String, CachedCountEntry>()
+    private val runtimeDocumentDbProfileIds = ConcurrentHashMap.newKeySet<String>()
+    private val hybridJoinCache = HybridJoinSessionCache(maxEntries = 16)
     private val disposed = AtomicBoolean(false)
+
+    fun isDocumentDbHybridRequired(profile: MongoConnectionProfile): Boolean {
+        return JsonImportEngine.isDocumentDbProfile(profile) || profile.id in runtimeDocumentDbProfileIds
+    }
+
+    fun isError304MultipleJoin(t: Throwable): Boolean {
+        var cur: Throwable? = t
+        while (cur != null) {
+            if (cur is MongoCommandException && cur.errorCode == 304) return true
+            val msg = cur.message?.lowercase().orEmpty()
+            if (msg.contains("multiple join conditions") || msg.contains("error 304")) return true
+            cur = cur.cause
+        }
+        return false
+    }
 
     init {
         Disposer.register(project, this)
@@ -146,6 +163,7 @@ class MongoConnectionManager(project: Project) : Disposable {
         clientFingerprints.remove(profileId)
         indexCache.keys.removeIf { it.startsWith("$profileId:") }
         estimatedCountCache.keys.removeIf { it.startsWith("$profileId:") }
+        hybridJoinCache.invalidateByConnection(profileId)
         val old = clients.remove(profileId)
         if (old != null) {
             safeClose(old)
@@ -412,12 +430,27 @@ class MongoConnectionManager(project: Project) : Disposable {
         filterRaw: String?,
         sortRaw: String?,
         pageIndex: Int,
-        pageSize: Int?
+        pageSize: Int?,
+        forceRefresh: Boolean = false
     ): QueryExecutionResult {
         val safePage = pageIndex.coerceAtLeast(0)
         val safePageSize = pageSize?.coerceIn(1, JoinSpec.MAX_UNLIMITED_DOCS)
         val filter = MongoShellNormalizer.parseBsonDocument(filterRaw?.trim().orEmpty().ifEmpty { "{}" })
         val sort = MongoShellNormalizer.parseBsonDocument(sortRaw?.trim().orEmpty().ifEmpty { "{}" })
+
+        // AWS DocumentDB (detected statically or via prior Error 304) uses 2-phase hybrid join + session-cached slicing
+        if (joinSpec.hasCompositeJoin() && isDocumentDbHybridRequired(profile)) {
+            return executeJoinHybridDocumentDb(
+                profile = profile,
+                database = database,
+                joinSpec = joinSpec,
+                filter = filter,
+                sort = sort,
+                safePage = safePage,
+                safePageSize = safePageSize,
+                forceRefresh = forceRefresh
+            )
+        }
 
         val client = getOrCreateClient(profile)
         val db = client.getDatabase(database)
@@ -432,10 +465,28 @@ class MongoConnectionManager(project: Project) : Disposable {
             pageSize = safePageSize,
             probeForNextPage = true
         )
-        val aggIterable = coll.aggregate(pipeline)
-            .allowDiskUse(true)
-            .maxTime(15_000, TimeUnit.MILLISECONDS)
-        val rawDocs = aggIterable.into(mutableListOf())
+        val rawDocs = try {
+            val aggIterable = coll.aggregate(pipeline)
+                .allowDiskUse(true)
+                .maxTime(15_000, TimeUnit.MILLISECONDS)
+            aggIterable.into(mutableListOf())
+        } catch (t: Throwable) {
+            if (joinSpec.hasCompositeJoin() && isError304MultipleJoin(t)) {
+                // Record connection as DocumentDB-compatible at runtime and retry seamlessly via hybrid join
+                runtimeDocumentDbProfileIds.add(profile.id)
+                return executeJoinHybridDocumentDb(
+                    profile = profile,
+                    database = database,
+                    joinSpec = joinSpec,
+                    filter = filter,
+                    sort = sort,
+                    safePage = safePage,
+                    safePageSize = safePageSize,
+                    forceRefresh = true
+                )
+            }
+            throw t
+        }
         val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs)
 
         val hasNext: Boolean
@@ -478,6 +529,75 @@ class MongoConnectionManager(project: Project) : Disposable {
     }
 
     /**
+     * AWS DocumentDB 100%-compatible 2-phase Hybrid Composite Join:
+     * - Stage 1 (DB): Single-key standard `$lookup` (prioritizing unique ID keys) + `$slice(500)` 16MB guard,
+     *   no `$skip`, bounded `$limit: maxOf(pageSize * 20, 2000)`.
+     * - Stage 2 (Memory): `MultiKeyJoinFilterEngine.applyFullHybridJoinShaping(...)` + query-signature-isolated
+     *   `HybridJoinSessionCache` slicing so `Next`/`Prev` paging has 0 missing and 0 duplicate records.
+     */
+    private fun executeJoinHybridDocumentDb(
+        profile: MongoConnectionProfile,
+        database: String,
+        joinSpec: JoinSpec,
+        filter: BsonDocument,
+        sort: BsonDocument,
+        safePage: Int,
+        safePageSize: Int?,
+        forceRefresh: Boolean
+    ): QueryExecutionResult {
+        val startNs = System.nanoTime()
+        val signature = hybridJoinCache.buildSignature(
+            connectionId = profile.id,
+            database = database,
+            leftCollection = joinSpec.leftCollection,
+            filterJson = filter.toJson(),
+            sortJson = sort.toJson(),
+            joinSpecSignature = joinSpec.cacheSignatureSegment()
+        )
+
+        val slice = if (!forceRefresh) {
+            hybridJoinCache.getPage(signature, safePage, safePageSize)
+        } else {
+            null
+        } ?: run {
+            val client = getOrCreateClient(profile)
+            val db = client.getDatabase(database)
+            val coll = db.getCollection(joinSpec.leftCollection, BsonDocument::class.java)
+            val bufferLimit = if (safePageSize != null) {
+                maxOf(safePageSize * 20, MultiKeyJoinFilterEngine.MIN_HYBRID_BUFFER_LIMIT)
+            } else {
+                JoinSpec.MAX_UNLIMITED_DOCS
+            }
+            val hybridPipeline = joinSpec.buildHybridDocumentDbPipeline(filter, sort, bufferLimit)
+            val rawDbDocs = coll.aggregate(hybridPipeline)
+                .allowDiskUse(true)
+                .maxTime(15_000, TimeUnit.MILLISECONDS)
+                .into(mutableListOf())
+            val shapedDocs = MultiKeyJoinFilterEngine.applyFullHybridJoinShaping(rawDbDocs, joinSpec)
+            hybridJoinCache.putAndSlice(profile.id, signature, shapedDocs, safePage, safePageSize)
+        }
+
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs)
+        val capHit = safePageSize == null && slice.totalCount > JoinSpec.MAX_UNLIMITED_DOCS
+        val effectiveLeftFilter = joinSpec.buildEffectiveLeftFilter(filter)
+        val isUnfilteredPreview = effectiveLeftFilter.isEmpty() && sort.isEmpty()
+        val (sampledFields, sampledFieldTypes) = extractFieldSchema(slice.pageDocs.take(20))
+
+        return QueryExecutionResult(
+            documents = slice.pageDocs,
+            totalCount = slice.totalCount.toLong(),
+            isApproximateCount = false,
+            elapsedMs = elapsedMs,
+            scanType = if (isUnfilteredPreview) IndexScanType.NO_FILTER_PREVIEW else IndexScanType.UNKNOWN,
+            indexName = null,
+            sampledFields = sampledFields,
+            sampledFieldTypes = sampledFieldTypes,
+            hasNextPage = slice.hasNextPage,
+            unlimitedCapHit = capHit
+        )
+    }
+
+    /**
      * Phase 2 (Trailing Async Metadata) for Join View:
      * Skips `explain()` and `listIndexes()` completely when there is no base Filter and no Sort.
      */
@@ -510,13 +630,18 @@ class MongoConnectionManager(project: Project) : Disposable {
             )
         }
 
-        val pipeline = joinSpec.buildPipeline(
-            filter = filter,
-            sort = sort,
-            pageIndex = pageIndex.coerceAtLeast(0),
-            pageSize = pageSize?.coerceIn(1, JoinSpec.MAX_UNLIMITED_DOCS),
-            probeForNextPage = false
-        )
+        val pipeline = if (joinSpec.hasCompositeJoin() && isDocumentDbHybridRequired(profile)) {
+            val buf = if (pageSize != null) maxOf(pageSize * 20, MultiKeyJoinFilterEngine.MIN_HYBRID_BUFFER_LIMIT) else JoinSpec.MAX_UNLIMITED_DOCS
+            joinSpec.buildHybridDocumentDbPipeline(filter, sort, buf)
+        } else {
+            joinSpec.buildPipeline(
+                filter = filter,
+                sort = sort,
+                pageIndex = pageIndex.coerceAtLeast(0),
+                pageSize = pageSize?.coerceIn(1, JoinSpec.MAX_UNLIMITED_DOCS),
+                probeForNextPage = false
+            )
+        }
         val explainOutcome = runCatching {
             val client = getOrCreateClient(profile)
             val db = client.getDatabase(database)

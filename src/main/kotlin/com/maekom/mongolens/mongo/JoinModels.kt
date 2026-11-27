@@ -118,6 +118,27 @@ data class JoinSpec(
         return "$leftCollection⋈${targets.joinToString("⋈") { it.targetCollection }}"
     }
 
+    fun hasCompositeJoin(): Boolean = targets.any { it.isCompositeJoin() }
+
+    /**
+     * Stable deterministic signature covering all join parameters for session-cache isolation.
+     */
+    fun cacheSignatureSegment(): String {
+        val targetsSig = targets.joinToString("|") { t ->
+            val keysSig = t.effectiveKeyPairs().joinToString("&") { k ->
+                val refSig = when (val r = k.sourceRef) {
+                    is JoinSourceRef.Base -> "B"
+                    is JoinSourceRef.PreviousTarget -> "P${r.targetIndex}"
+                }
+                "$refSig:${k.localField.trim()}=${k.foreignField.trim()}"
+            }
+            val condsSig = t.conditions.joinToString(";") { "${it.field.trim()}${it.operator.name}${it.rawValue}" }
+            "${t.targetCollection}[$keysSig][${t.matchStrategy.name}][ex=${t.excludeUnmatched}][c=$condsSig][cols=${t.selectedColumns.joinToString(",")}]"
+        }
+        val baseCondSig = baseConditions.joinToString(";") { "${it.field.trim()}${it.operator.name}${it.rawValue}" }
+        return "$leftCollection|left=${selectedLeftFields.joinToString(",")}|bc=$baseCondSig|targets=$targetsSig"
+    }
+
     /**
      * Human-readable join condition summary for the Join result tab header badge, e.g.:
      * `a_hts.userid=b_hts.userid AND a_hts.stcd=b_hts.stcd`
@@ -580,11 +601,86 @@ data class JoinSpec(
         return stages
     }
 
+    /**
+     * Builds the AWS DocumentDB (3.6/4.0/5.0) 100%-compatible 1st-stage Hybrid Join Pipeline:
+     * - NEVER emits `$lookup` with `let`/`pipeline` (completely eliminates Error 304).
+     * - Prioritizes unique identifier keys (`_id`, `id`, `*_id`, `*Id`) as the single `$lookup` key pair.
+     * - Caps each joined array at `500` elements via `$addFields: { "<alias>": { "$slice": ["$<alias>", 500] } }`
+     *   to guard against the 16MB BSON single-document limit.
+     * - Omits `$skip` and fetches a bounded buffer (`$limit: bufferLimit`) for exact in-memory multi-key filtering & slicing.
+     */
+    fun buildHybridDocumentDbPipeline(
+        filter: BsonDocument,
+        sort: BsonDocument,
+        bufferLimit: Int = MultiKeyJoinFilterEngine.MIN_HYBRID_BUFFER_LIMIT
+    ): List<BsonDocument> {
+        val stages = mutableListOf<BsonDocument>()
+
+        // Stage 1: Base collection pre-filter
+        val effectiveLeftFilter = buildEffectiveLeftFilter(filter)
+        if (!effectiveLeftFilter.isEmpty()) {
+            stages.add(BsonDocument("\$match", effectiveLeftFilter))
+        }
+
+        // Stage 2: Deterministic $sort (always ensure _id tie-breaker)
+        val effectiveSort = BsonDocument()
+        if (sort.isEmpty()) {
+            effectiveSort["_id"] = BsonInt32(-1)
+        } else {
+            for ((k, v) in sort) {
+                effectiveSort[k] = v
+            }
+            if (!effectiveSort.containsKey("_id")) {
+                effectiveSort["_id"] = BsonInt32(1)
+            }
+        }
+        stages.add(BsonDocument("\$sort", effectiveSort))
+
+        // Stage 3: Safe upper-bound buffer (NO $skip!)
+        stages.add(BsonDocument("\$limit", BsonInt32(bufferLimit.coerceIn(1, MAX_UNLIMITED_DOCS))))
+
+        // Stage 4: Single-key standard $lookup (prioritizing unique ID key) + 500-element $slice guard
+        targets.forEachIndexed { idx, target ->
+            val joinAlias = "_joined_$idx"
+            val (primaryPair, _) = MultiKeyJoinFilterEngine.selectPrimaryAndRemainingPairs(target.effectiveKeyPairs())
+            val localPath = when (val src = primaryPair.sourceRef) {
+                is JoinSourceRef.Base -> primaryPair.localField.trim()
+                is JoinSourceRef.PreviousTarget -> {
+                    val safeRef = src.targetIndex.coerceIn(0, (idx - 1).coerceAtLeast(0))
+                    "_joined_$safeRef.${primaryPair.localField.trim()}"
+                }
+            }
+            val lookupDoc = BsonDocument()
+                .append("from", BsonString(target.targetCollection))
+                .append("localField", BsonString(localPath))
+                .append("foreignField", BsonString(primaryPair.foreignField.trim()))
+                .append("as", BsonString(joinAlias))
+            stages.add(BsonDocument("\$lookup", lookupDoc))
+
+            // 16MB BSON guard: cap each joined array at 500 elements immediately after $lookup
+            stages.add(
+                BsonDocument(
+                    "\$addFields",
+                    BsonDocument(
+                        joinAlias,
+                        BsonDocument(
+                            "\$slice",
+                            BsonArray(listOf(BsonString("\$$joinAlias"), BsonInt32(MultiKeyJoinFilterEngine.HYBRID_SLICE_LIMIT)))
+                        )
+                    )
+                )
+            )
+        }
+
+        return stages
+    }
+
     fun formatPipelineJsonArray(
         filterRaw: String?,
         sortRaw: String?,
         pageIndex: Int,
-        pageSize: Int?
+        pageSize: Int?,
+        useDocumentDbHybrid: Boolean = false
     ): String {
         val filterDoc = try {
             MongoShellNormalizer.parseBsonDocument(filterRaw?.trim().orEmpty().ifEmpty { "{}" })
@@ -596,7 +692,12 @@ data class JoinSpec(
         } catch (_: Throwable) {
             BsonDocument()
         }
-        val stages = buildPipeline(filterDoc, sortDoc, pageIndex, pageSize, probeForNextPage = false)
+        val stages = if (useDocumentDbHybrid && hasCompositeJoin()) {
+            val bufferLimit = if (pageSize != null) maxOf(pageSize * 20, MultiKeyJoinFilterEngine.MIN_HYBRID_BUFFER_LIMIT) else MAX_UNLIMITED_DOCS
+            buildHybridDocumentDbPipeline(filterDoc, sortDoc, bufferLimit)
+        } else {
+            buildPipeline(filterDoc, sortDoc, pageIndex, pageSize, probeForNextPage = false)
+        }
         return stages.joinToString(separator = ",\n", prefix = "[\n", postfix = "\n]") { stage ->
             MongoShellNormalizer.formatPrettyExtended(stage)
                 .lines()

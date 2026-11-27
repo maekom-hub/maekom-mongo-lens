@@ -713,7 +713,8 @@ class FindQueryPanel(
             filterRaw = filterEditor.safeText(),
             sortRaw = sortEditor.safeText(),
             pageIndex = joinCurrentPage,
-            pageSize = currentJoinPageSize()
+            pageSize = currentJoinPageSize(),
+            useDocumentDbHybrid = connectionManager.isDocumentDbHybridRequired(profile)
         )
         UiHelpers.copyToClipboard(jsonArray)
         UiHelpers.notify(project, I18n.t("join.tab.pipelineCopied"))
@@ -839,7 +840,8 @@ class FindQueryPanel(
                         filterRaw = filterRaw,
                         sortRaw = sortRaw,
                         pageIndex = joinPageSnapshot,
-                        pageSize = joinPageSizeSnapshot
+                        pageSize = joinPageSizeSnapshot,
+                        forceRefresh = forceMetaRefresh || resetJoinPage
                     )
                 } else {
                     connectionManager.executeFindPrimary(

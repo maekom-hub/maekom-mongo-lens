@@ -15,6 +15,12 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>v0.2.8</h3>
+        <ul>
+            <li><b>Join Target Tab Bar UI Refactoring (<code>JoinViewDialog</code>):</b> Removed the standalone right-side Remove button; each join target chip now features a conditional <code>×</code> close button (visible only when 2+ join targets exist), active-tab highlight, horizontal scrolling, and a compact textless green <code>+</code> icon button compatible with IntelliJ Darcula and New UI Dark/Light themes.</li>
+            <li><b>Bidirectional MongoDB &amp; AWS DocumentDB Multi-Key Join Engine + Exact Cached Pagination:</b> Keeps native multi-condition <code>$lookup</code> + server paging on standard MongoDB while automatically running a 2-phase hybrid join on AWS DocumentDB (or falling back seamlessly on runtime <code>Error 304</code>): prioritizes unique identifier keys (<code>_id</code>, <code>id</code>, <code>*_id</code>, <code>*Id</code>) for the 1st-stage single-key <code>$lookup</code> with a 500-item <code>$slice</code> 16MB guard, filters remaining keys precisely in memory via <code>MultiKeyJoinFilterEngine</code> (<code>Int32</code>/<code>Int64</code> cross-type equality, nested dot-paths, array flattening, <code>INNER</code>/<code>LEFT</code> semantics), and serves zero-gap, zero-duplicate <code>Next</code>/<code>Prev</code> pages from a query-signature-isolated session cache.</li>
+            <li><b>Automated JUnit 5 Verification:</b> Added <code>MultiKeyJoinFilterEngineTest</code> verifying 35-doc composite matching, trap record elimination, cross-type numeric/nested/array joins, <code>INNER</code>/<code>LEFT</code> semantics, and exact <code>Next</code>/<code>Prev</code> page slicing.</li>
+        </ul>
         <h3>v0.2.7</h3>
         <ul>
             <li><b>Strict BSON Type Preservation &amp; Real-Time Validation in Edit Data:</b> Added focused single-field BSON editor (<code>FieldEditDialog</code>) preserving original BSON types (<code>Int32</code>, <code>Int64</code>, <code>Double</code>, <code>Decimal128</code>, <code>String</code>, <code>Boolean</code>, <code>ObjectId</code>, <code>Date</code>, <code>Null</code>, <code>JSON</code>), real-time <code>DocumentListener</code> validation blocking invalid saves, <code>Date [Now]</code> + live UTC ISO preview, <code>Red (Prod)</code> warning banner, <code>_id</code> &amp; Join/Aggregation/Read-Only guards, and typed <code>$set</code> <code>updateOne</code> matching original <code>_id</code> type (compatible with MongoDB &amp; AWS DocumentDB).</li>

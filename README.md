@@ -1,6 +1,6 @@
 # Maekom Mongo Lens
 
-[![Version](https://img.shields.io/badge/version-v0.2.7-blue.svg)](https://github.com/maekom-hub/maekom-mongo-lens/releases)
+[![Version](https://img.shields.io/badge/version-v0.2.8-blue.svg)](https://github.com/maekom-hub/maekom-mongo-lens/releases)
 [![IntelliJ IDEA](https://img.shields.io/badge/IntelliJ%20IDEA-2024.2%2B-purple.svg)](https://www.jetbrains.com/idea/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](./LICENSE)
 
@@ -20,7 +20,7 @@
 
 | Item | Specification |
 | :--- | :--- |
-| **Version** | `0.2.7` |
+| **Version** | `0.2.8` |
 | **IntelliJ IDEA** | `2024.2+` (Community / Ultimate — matches `sinceBuild = "242"`) |
 | **Java Runtime (JBR)** | Minimum `JDK 17` / Recommended `JDK 21` |
 | **Database Support** | `MongoDB 4.4 ~ 8.0` (Standalone, Replica Set, Atlas `mongodb+srv`) & `AWS DocumentDB 3.6 / 4.0 / 5.0` |
@@ -49,7 +49,7 @@
 
 ### Installation
 
-1. Download **`maekom-mongo-lens-0.2.7.zip`** from [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases).
+1. Download **`maekom-mongo-lens-0.2.8.zip`** from [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases).
 2. In IntelliJ IDEA (`2024.2+`), go to **`Settings / Preferences` → `Plugins` → ⚙️ (Gear Icon) → `Install Plugin from Disk...`**.
 3. Select the downloaded `.zip` archive and restart the IDE.
 4. Open the **`Maekom Mongo Lens`** tool window at the bottom of the IDE.
@@ -70,6 +70,12 @@
 
 ---
 
+### Changelog (`v0.2.8`)
+
+- **Join Target Tab Bar UI Refactoring (`JoinViewDialog`)**: Removed the standalone right-side Remove button; each join target chip (`① collection ×`) displays a conditional `×` close button only when 2+ targets exist, highlights the active tab, scrolls horizontally when many targets are added, and pairs with a compact textless green `+` icon button rendered natively for Darcula and New UI Dark/Light themes.
+- **Bidirectional MongoDB & AWS DocumentDB Multi-Key Join Engine + Exact Cached Pagination**: Uses native multi-condition `$lookup` + server paging on standard MongoDB and automatically runs a 2-phase hybrid join on AWS DocumentDB (including seamless runtime fallback on `Error 304`): prioritizes unique identifier keys (`_id`, `id`, `*_id`, `*Id`) in 1st-stage single-key `$lookup` + 500-item `$slice` 16MB guard, filters remaining keys in memory via `MultiKeyJoinFilterEngine` (`Int32`/`Int64` cross-type equality, nested dot-paths, array flattening, `INNER`/`LEFT` semantics), and serves zero-gap, zero-duplicate `Next`/`Prev` pages from a signature-isolated session cache.
+- **Automated JUnit 5 Verification**: Added `MultiKeyJoinFilterEngineTest` verifying 35-document composite-key matching, trap record elimination, cross-type numeric/nested/array joins, `INNER`/`LEFT` behavior, and exact `Next`/`Prev` page slicing.
+
 ### Changelog (`v0.2.7`)
 
 - **Strict BSON Type Preservation & Real-Time Validation (`FieldEditDialog` / `BsonValueValidator`)**: Preserves original BSON types (`Int32`, `Int64`, `Double`, `Decimal128`, `String`, `Boolean`, `ObjectId`, `Date`, `Null`, `JSON`), adds live `DocumentListener` validation blocking `OK` on invalid inputs, `Date [Now]` button + live UTC ISO preview, `Red (Prod)` warning banner, Read-Only / Join / Aggregation / `_id` entry guards, and typed `$set` `updateOne` matching exact original `_id` type (`matchedCount == 0` check, AWS DocumentDB compatible).
@@ -84,7 +90,7 @@
 ./gradlew buildPlugin --no-daemon
 ```
 
-Generated archive: `build/distributions/maekom-mongo-lens-0.2.7.zip`
+Generated archive: `build/distributions/maekom-mongo-lens-0.2.8.zip`
 
 ---
 
@@ -102,7 +108,7 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.2.7.zip`
 
 | 항목 | 사양 |
 | :--- | :--- |
-| **Version** | `0.2.7` |
+| **Version** | `0.2.8` |
 | **IntelliJ IDEA** | `2024.2+` (Community / Ultimate — `build.gradle.kts` `sinceBuild = "242"` 기준) |
 | **Java Runtime (JBR)** | 최소 `JDK 17` / 권장 `JDK 21` |
 | **Database Support** | `MongoDB 4.4 ~ 8.0` (Standalone, Replica Set, Atlas `mongodb+srv`) & `AWS DocumentDB 3.6 / 4.0 / 5.0` |
@@ -131,7 +137,7 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.2.7.zip`
 
 ### 설치 방법
 
-1. [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases)에서 **`maekom-mongo-lens-0.2.7.zip`** 파일을 다운로드합니다.
+1. [GitHub Releases](https://github.com/maekom-hub/maekom-mongo-lens/releases)에서 **`maekom-mongo-lens-0.2.8.zip`** 파일을 다운로드합니다.
 2. IntelliJ IDEA (`2024.2+`)에서 **`Settings / Preferences` → `Plugins` → ⚙️(기어 아이콘) → `Install Plugin from Disk...`** 를 선택합니다.
 3. 다운로드한 `.zip` 파일을 선택하고 IDE를 재시작합니다.
 4. 하단 ToolWindow에서 **`Maekom Mongo Lens`** 탭을 엽니다.
@@ -152,6 +158,12 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.2.7.zip`
 
 ---
 
+### 릴리즈 노트 (`v0.2.8` Changelog)
+
+- **조인 설정 상단 탭 바 UI 리팩토링 (`JoinViewDialog`)**: 우측 단독 `[— 이 조인 삭제]` 버튼을 제거하고, 2개 이상 조인 대상이 있을 때만 각 탭 항목(`① collection ×`) 우측에 `×` 닫기 버튼을 조건부 노출합니다. 활성 탭 하이라이트, 가로 스크롤 컨테이너, Darcula/New UI 테마 대응 초록색 `+` 아이콘 전용 버튼을 적용했습니다.
+- **일반 MongoDB / AWS DocumentDB 양방향 다중 조인 엔진 & `다음`/`이전` 페이징 정합성 보장**: 일반 MongoDB에서는 네이티브 다중 조건 `$lookup` + 서버 페이징을 유지하고, AWS DocumentDB(및 런타임 `Error 304` 감지 시 자동 마킹·폴백)에서는 고유 키(`_id`/`id`/`*_id`/`*Id`) 우선 1차 단일 키 `$lookup` + `$slice(500)` 16MB 방어 후 순수 로직 엔진(`MultiKeyJoinFilterEngine`) 인메모리 정밀 필터링(`Int32`/`Int64` 교차 동등성, 중첩 경로/배열 평탄화, `INNER`/`LEFT JOIN`) 및 쿼리 시그니처 격리 세션 캐시 슬라이싱 페이징으로 누락·중복 0건을 보장합니다.
+- **JUnit 5 자동화 단위 테스트 추가 (`MultiKeyJoinFilterEngineTest`)**: 35건 복합키 매칭, 함정 데이터 탈락, `Int32`/`Int64` 교차 비교, 중첩·배열 경로, `INNER`/`LEFT JOIN`, `다음`/`이전` 페이지 슬라이싱 정합성을 검증합니다.
+
 ### 릴리즈 노트 (`v0.2.7` Changelog)
 
 - **"데이터 수정" 팝업 BSON 타입 보존 및 실시간 입력 검증 강화 (`FieldEditDialog` / `BsonValueValidator`)**: 원본 BSON 타입(`Int32`/`Int64`/`Double`/`Decimal128`/`String`/`Boolean`/`ObjectId`/`Date`/`Null`/`JSON`) 자동 감지·고정, `DocumentListener` 실시간 유효성 검증 및 오입력 시 `OK` 비활성화, `Date [현재 시각 (Now)]` 버튼 및 UTC ISO 미리보기, `Red (Prod)` 운영 경고 배너, `Read-Only`/조인/집계/`_id` 보호 가드, 원본 `_id` 타입 매칭(`matchedCount == 0` 알림) 및 AWS DocumentDB 호환 `$set` `updateOne` 구현.
@@ -166,7 +178,7 @@ Generated archive: `build/distributions/maekom-mongo-lens-0.2.7.zip`
 ./gradlew buildPlugin --no-daemon
 ```
 
-빌드 산출물: `build/distributions/maekom-mongo-lens-0.2.7.zip`
+빌드 산출물: `build/distributions/maekom-mongo-lens-0.2.8.zip`
 
 ---
 
